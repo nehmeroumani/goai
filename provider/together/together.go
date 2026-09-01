@@ -10,7 +10,7 @@ import (
 	"github.com/zendev-sh/goai/provider"
 )
 
-const defaultBaseURL = "https://api.together.xyz/v1"
+const defaultBaseURL = "https://api.together.ai/v1"
 
 // Option configures the together provider.
 type Option func(*options)
@@ -64,16 +64,19 @@ func Chat(modelID string, opts ...Option) provider.LanguageModel {
 		}
 	}
 	return openaicompat.NewChatModel(openaicompat.ChatModelConfig{
-		ProviderID:           "together",
-		ModelID:              modelID,
-		BaseURL:              o.baseURL,
-		TokenSource:          o.tokenSource,
-		TokenRequired:        true,
-		Headers:              o.headers,
-		HTTPClient:           o.httpClient,
-		Capabilities:         chatCaps,
-		IncludeStreamOptions: true,
-		WarnPromptCaching:    true,
+		ProviderID:        "together",
+		ModelID:           modelID,
+		BaseURL:           o.baseURL,
+		TokenSource:       o.tokenSource,
+		TokenRequired:     true,
+		Headers:           o.headers,
+		HTTPClient:        o.httpClient,
+		Capabilities:      chatCaps,
+		WarnPromptCaching: true,
+		RequestConfig: openaicompat.RequestConfig{
+			IncludeStreamOptions:    true,
+			IncludeReasoningContent: true,
+		},
 	})
 }
 

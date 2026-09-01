@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/zendev-sh/goai"
@@ -17,6 +18,15 @@ import (
 type fileUploader struct {
 	opts options
 }
+
+// maxFileErrorBytes bounds the size of an error response body read solely to
+// extract the error message.
+const maxFileErrorBytes = 1 << 20 // 1 MiB
+
+// maxFileResponseBytes bounds the size of a successful file-upload response
+// body decoded into the RemoteFileRef. A well-formed OpenAI response is tiny;
+// anything larger indicates a misbehaving or hostile server.
+const maxFileResponseBytes = 64 << 20 // 64 MiB
 
 func (u *fileUploader) UploadFile(ctx context.Context, upload provider.FileUpload) (*provider.RemoteFileRef, error) {
 	data, err := io.ReadAll(upload.Reader)
@@ -52,10 +62,12 @@ func (u *fileUploader) UploadFile(ctx context.Context, upload provider.FileUploa
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+token)
 	for k, v := range u.opts.headers {
 		req.Header.Set(k, v)
 	}
+	// Auth is applied last so a caller-supplied header named "Authorization"
+	// cannot override the real credential.
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	client := u.opts.httpClient
 	if client == nil {
@@ -68,7 +80,7 @@ func (u *fileUploader) UploadFile(ctx context.Context, upload provider.FileUploa
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxFileErrorBytes))
 		return nil, goai.ParseHTTPErrorWithHeaders("openai", resp.StatusCode, respBody, resp.Header)
 	}
 
@@ -79,7 +91,14 @@ func (u *fileUploader) UploadFile(ctx context.Context, upload provider.FileUploa
 		Filename  string `json:"filename"`
 		Purpose   string `json:"purpose"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxFileResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if len(respBody) > maxFileResponseBytes {
+		return nil, fmt.Errorf("openai: file upload response body exceeds %d bytes", maxFileResponseBytes)
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("decoding response: %w", err)
 	}
 
@@ -100,6 +119,13 @@ func (u *fileUploader) UploadFile(ctx context.Context, upload provider.FileUploa
 }
 
 func (u *fileUploader) DeleteFile(ctx context.Context, ref provider.RemoteFileRef) error {
+	// Guard against same-origin path traversal: ref.ID is server-controlled and
+	// interpolated into the URL path. Reject any ID that could climb out of the
+	// /files/ prefix (slashes, "..", or percent-encoded variants thereof).
+	if strings.ContainsAny(ref.ID, `/\`) || strings.Contains(ref.ID, "..") || strings.Contains(ref.ID, "%") {
+		return fmt.Errorf("openai: refusing to delete file with unsafe ID %q", ref.ID)
+	}
+
 	token, err := u.opts.tokenSource.Token(ctx)
 	if err != nil {
 		return fmt.Errorf("resolving auth token: %w", err)
@@ -109,10 +135,12 @@ func (u *fileUploader) DeleteFile(ctx context.Context, ref provider.RemoteFileRe
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 	for k, v := range u.opts.headers {
 		req.Header.Set(k, v)
 	}
+	// Auth is applied last so a caller-supplied header named "Authorization"
+	// cannot override the real credential.
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	client := u.opts.httpClient
 	if client == nil {
@@ -125,7 +153,7 @@ func (u *fileUploader) DeleteFile(ctx context.Context, ref provider.RemoteFileRe
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxFileErrorBytes))
 		return goai.ParseHTTPErrorWithHeaders("openai", resp.StatusCode, respBody, resp.Header)
 	}
 

@@ -3,6 +3,7 @@ package cohere
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/provider"
 )
 
@@ -951,6 +953,31 @@ func TestEmbedding_WithHeaders(t *testing.T) {
 	}
 }
 
+func TestEmbedding_AuthHeaderWinsOverWithHeaders(t *testing.T) {
+	// A caller-supplied WithHeaders header named like the auth header must
+	// NOT override the real credential on the DoEmbed path.
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"embeddings":{"float":[[0.1]]},"meta":{"billed_units":{"input_tokens":1}}}`)
+	}))
+	defer server.Close()
+
+	model := Embedding("embed-v4.0",
+		WithAPIKey("real-key"),
+		WithBaseURL(server.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer spoofed-key"}),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer real-key" {
+		t.Errorf("Authorization = %q, want %q (credential must win over WithHeaders)", gotAuth, "Bearer real-key")
+	}
+}
+
 func TestWithHeaders(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Custom") != "val" {
@@ -1088,7 +1115,7 @@ func TestBuildChatRequest_Thinking(t *testing.T) {
 		},
 		ProviderOptions: map[string]any{
 			"thinking": map[string]any{
-				"type":        "enabled",
+				"type":         "enabled",
 				"budgetTokens": 4096,
 			},
 		},
@@ -1586,12 +1613,19 @@ func TestBuildChatRequest_ResponseFormatWithSchema(t *testing.T) {
 	if rf["type"] != "json_object" {
 		t.Errorf("type = %v, want json_object", rf["type"])
 	}
+	// json_schema must be the raw JSON-schema object, NOT a {name, schema} wrapper.
 	js, ok := rf["json_schema"].(map[string]any)
 	if !ok {
-		t.Fatal("json_schema not set")
+		t.Fatalf("json_schema = %T, want raw schema object", rf["json_schema"])
 	}
-	if js["name"] != "person" {
-		t.Errorf("name = %v, want person", js["name"])
+	if js["type"] != "object" {
+		t.Errorf("json_schema.type = %v, want object", js["type"])
+	}
+	if _, hasName := js["name"]; hasName {
+		t.Error("json_schema should not contain a name key (no {name,schema} wrapper)")
+	}
+	if _, hasSchema := js["schema"]; hasSchema {
+		t.Error("json_schema should not contain a nested schema key (no {name,schema} wrapper)")
 	}
 }
 
@@ -1826,6 +1860,11 @@ func TestParseChatStream_ContextCancel_AllBranches(t *testing.T) {
 			input: "data: {\"type\":\"content-delta\",\"delta\":{\"message\":{\"content\":{\"text\":\"hello\"}}}}\n",
 		},
 		{
+			// tool-plan-delta (line 874)
+			name:  "tool_plan_delta",
+			input: "data: {\"type\":\"tool-plan-delta\",\"delta\":{\"message\":{\"content\":{\"text\":\"plan\"}}}}\n",
+		},
+		{
 			// tool-call-start (line 691)
 			name:  "tool_call_start",
 			input: "data: {\"type\":\"tool-call-start\",\"delta\":{\"message\":{\"tool_calls\":{\"id\":\"t1\",\"function\":{\"name\":\"fn\"}}}}}\n",
@@ -1928,12 +1967,14 @@ func TestBuildChatRequest_ToolChoiceRequired(t *testing.T) {
 		ToolChoice: "required",
 	}
 	body := buildChatRequest(params, "command-r-plus", false)
-	if body["tool_choice"] != "required" {
-		t.Errorf("tool_choice = %v, want %q", body["tool_choice"], "required")
+	if body["tool_choice"] != "REQUIRED" {
+		t.Errorf("tool_choice = %v, want %q", body["tool_choice"], "REQUIRED")
 	}
 }
 
 func TestBuildChatRequest_ToolChoiceSpecificTool(t *testing.T) {
+	// Selecting a specific tool by name is unsupported by Cohere v2, so
+	// tool_choice must be omitted entirely (falls back to provider default).
 	params := provider.GenerateParams{
 		Messages: []provider.Message{
 			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
@@ -1941,19 +1982,35 @@ func TestBuildChatRequest_ToolChoiceSpecificTool(t *testing.T) {
 		ToolChoice: "my_func",
 	}
 	body := buildChatRequest(params, "command-r-plus", false)
-	tc, ok := body["tool_choice"].(map[string]any)
-	if !ok {
-		t.Fatalf("tool_choice is not a map, got %T: %v", body["tool_choice"], body["tool_choice"])
+	if _, ok := body["tool_choice"]; ok {
+		t.Errorf("tool_choice should be omitted for a specific tool name, got %v", body["tool_choice"])
 	}
-	if tc["type"] != "function" {
-		t.Errorf("tool_choice.type = %v, want function", tc["type"])
+}
+
+func TestBuildChatRequest_ToolChoiceNone(t *testing.T) {
+	params := provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		ToolChoice: "none",
 	}
-	fn, ok := tc["function"].(map[string]any)
-	if !ok {
-		t.Fatal("missing function in tool_choice")
+	body := buildChatRequest(params, "command-r-plus", false)
+	if body["tool_choice"] != "NONE" {
+		t.Errorf("tool_choice = %v, want %q", body["tool_choice"], "NONE")
 	}
-	if fn["name"] != "my_func" {
-		t.Errorf("tool_choice.function.name = %v, want my_func", fn["name"])
+}
+
+func TestBuildChatRequest_ToolChoiceAuto(t *testing.T) {
+	// "auto" is the Cohere default, so tool_choice is omitted.
+	params := provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		ToolChoice: "auto",
+	}
+	body := buildChatRequest(params, "command-r-plus", false)
+	if _, ok := body["tool_choice"]; ok {
+		t.Errorf("tool_choice should be omitted for auto, got %v", body["tool_choice"])
 	}
 }
 
@@ -2088,4 +2145,558 @@ func TestChat_PromptCachingIgnored(t *testing.T) {
 	if len(texts) != 1 || texts[0] != "ok" {
 		t.Errorf("DoStream texts = %v, want [ok]", texts)
 	}
+}
+
+// --- #40: k / seed / frequency_penalty / presence_penalty ---
+
+func TestBuildChatRequest_SamplingParams(t *testing.T) {
+	topK := 40
+	seed := 12345
+	freq := 0.5
+	presence := 0.2
+	params := provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		TopK:             &topK,
+		Seed:             &seed,
+		FrequencyPenalty: &freq,
+		PresencePenalty:  &presence,
+	}
+	body := buildChatRequest(params, "command-r-plus", false)
+	if body["k"] != 40 {
+		t.Errorf("k = %v, want 40", body["k"])
+	}
+	if body["seed"] != 12345 {
+		t.Errorf("seed = %v, want 12345", body["seed"])
+	}
+	if body["frequency_penalty"] != 0.5 {
+		t.Errorf("frequency_penalty = %v, want 0.5", body["frequency_penalty"])
+	}
+	if body["presence_penalty"] != 0.2 {
+		t.Errorf("presence_penalty = %v, want 0.2", body["presence_penalty"])
+	}
+}
+
+func TestBuildChatRequest_SamplingParamsUnset(t *testing.T) {
+	body := buildChatRequest(provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	}, "command-r-plus", false)
+	for _, key := range []string{"k", "seed", "frequency_penalty", "presence_penalty"} {
+		if _, ok := body[key]; ok {
+			t.Errorf("%s should not be set when nil", key)
+		}
+	}
+}
+
+// --- #41: tool_plan ---
+
+func TestGenerate_ToolPlan(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"123","message":{"role":"assistant","tool_plan":"First I will look up the weather.","content":[],"tool_calls":[{"id":"tc1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":"TOOL_CALL","usage":{"tokens":{"input_tokens":10,"output_tokens":20}}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("command-r-plus", WithAPIKey("k"), WithBaseURL(server.URL))
+	result, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "weather"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProviderMetadata == nil {
+		t.Fatal("ProviderMetadata is nil")
+	}
+	md := result.ProviderMetadata["cohere"]
+	if md == nil {
+		t.Fatal("ProviderMetadata['cohere'] is nil")
+	}
+	if got, _ := md["tool_plan"].(string); got != "First I will look up the weather." {
+		t.Errorf("tool_plan = %q", got)
+	}
+}
+
+func TestGenerate_NoToolPlan(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"123","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]},"finish_reason":"COMPLETE","usage":{"tokens":{"input_tokens":5,"output_tokens":2}}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("command-r-plus", WithAPIKey("k"), WithBaseURL(server.URL))
+	result, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProviderMetadata != nil {
+		if md := result.ProviderMetadata["cohere"]; md != nil {
+			if _, ok := md["tool_plan"]; ok {
+				t.Error("tool_plan should not be set when absent")
+			}
+		}
+	}
+}
+
+func TestStream_ToolPlanDelta(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"tool-plan-delta\",\"index\":0,\"delta\":{\"message\":{\"content\":{\"text\":\"I will check the \"}}}}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"tool-plan-delta\",\"index\":0,\"delta\":{\"message\":{\"content\":{\"text\":\"weather first.\"}}}}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"message-end\",\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n")
+	}))
+	defer server.Close()
+
+	model := Chat("command-r-plus", WithAPIKey("k"), WithBaseURL(server.URL))
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "weather"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var texts []string
+	for chunk := range result.Stream {
+		if chunk.Type == provider.ChunkText {
+			texts = append(texts, chunk.Text)
+		}
+	}
+	if len(texts) != 2 || texts[0] != "I will check the " || texts[1] != "weather first." {
+		t.Errorf("texts = %v, want [I will check the  weather first.]", texts)
+	}
+}
+
+// --- #42: STOP_SEQUENCE / TIMEOUT finish reasons ---
+
+func TestMapFinishReason_STOP_SEQUENCE(t *testing.T) {
+	if got := mapFinishReason("STOP_SEQUENCE"); got != provider.FinishStop {
+		t.Errorf("mapFinishReason(STOP_SEQUENCE) = %q, want %q", got, provider.FinishStop)
+	}
+}
+
+func TestMapFinishReason_TIMEOUT(t *testing.T) {
+	if got := mapFinishReason("TIMEOUT"); got != provider.FinishOther {
+		t.Errorf("mapFinishReason(TIMEOUT) = %q, want %q", got, provider.FinishOther)
+	}
+}
+
+func TestGenerate_StopSequenceFinishReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"123","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"finish_reason":"STOP_SEQUENCE","usage":{"tokens":{"input_tokens":5,"output_tokens":2}}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("command-r-plus", WithAPIKey("k"), WithBaseURL(server.URL))
+	result, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinishReason != provider.FinishStop {
+		t.Errorf("FinishReason = %q, want %q", result.FinishReason, provider.FinishStop)
+	}
+}
+
+func TestStream_TimeoutFinishReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"message-end\",\"finish_reason\":\"TIMEOUT\",\"usage\":{\"tokens\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n")
+	}))
+	defer server.Close()
+
+	model := Chat("command-r-plus", WithAPIKey("k"), WithBaseURL(server.URL))
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var gotFinish bool
+	for chunk := range result.Stream {
+		if chunk.Type == provider.ChunkFinish {
+			gotFinish = true
+			if chunk.FinishReason != provider.FinishOther {
+				t.Errorf("FinishReason = %q, want %q", chunk.FinishReason, provider.FinishOther)
+			}
+		}
+	}
+	if !gotFinish {
+		t.Error("no finish chunk")
+	}
+}
+
+// --- #43: embed output_dimension / embedding_types ---
+
+func TestEmbedding_OutputDimension(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		if req["output_dimension"] != float64(512) {
+			t.Errorf("output_dimension = %v, want 512", req["output_dimension"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"embeddings":{"float":[[0.1,0.2]]},"meta":{"billed_units":{"input_tokens":1}}}`)
+	}))
+	defer server.Close()
+
+	model := Embedding("embed-v4.0", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{
+		ProviderOptions: map[string]any{
+			"output_dimension": 512,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEmbedding_EmbeddingTypes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		types, ok := req["embedding_types"].([]any)
+		if !ok || len(types) != 2 || types[0] != "float" || types[1] != "binary" {
+			t.Errorf("embedding_types = %v, want [float binary]", req["embedding_types"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"embeddings":{"float":[[0.1,0.2]]},"meta":{"billed_units":{"input_tokens":1}}}`)
+	}))
+	defer server.Close()
+
+	model := Embedding("embed-v4.0", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{
+		ProviderOptions: map[string]any{
+			"embedding_types": []string{"float", "binary"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEmbedding_NoOutputParamsByDefault(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		if _, ok := req["output_dimension"]; ok {
+			t.Error("output_dimension should not be set by default")
+		}
+		if _, ok := req["embedding_types"]; ok {
+			t.Error("embedding_types should not be set by default")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"embeddings":{"float":[[0.1]]},"meta":{"billed_units":{"input_tokens":1}}}`)
+	}))
+	defer server.Close()
+
+	model := Embedding("embed-v4.0", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// --- Golden full-body contract tests (#38, #39, #40, #43) ---
+//
+// These capture the outgoing request body through the full DoGenerate/DoEmbed
+// HTTP path (httptest server) and compare the relevant subtree against the
+// latest Cohere v2 schema, rather than asserting individual fields in
+// buildChatRequest.
+
+// #38: tool_choice is serialized as uppercase REQUIRED/NONE in the outgoing
+// /chat request body; "auto" (the provider default) is omitted.
+func TestChat_Generate_ToolChoice_GoldenBody(t *testing.T) {
+	tests := []struct {
+		name       string
+		toolChoice string
+		want       string // golden JSON subtree, or "" meaning "must be omitted"
+	}{
+		{name: "required", toolChoice: "required", want: `{"tool_choice":"REQUIRED"}`},
+		{name: "none", toolChoice: "none", want: `{"tool_choice":"NONE"}`},
+		{name: "auto-omitted", toolChoice: "auto", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotBody []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"id":"123","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"finish_reason":"COMPLETE","usage":{"tokens":{"input_tokens":5,"output_tokens":2}}}`)
+			}))
+			defer server.Close()
+
+			model := Chat("command-r-plus", WithAPIKey("k"), WithBaseURL(server.URL))
+			_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+				Messages: []provider.Message{
+					{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+				},
+				Tools: []provider.ToolDefinition{
+					{Name: "my_tool", Description: "desc", InputSchema: json.RawMessage(`{"type":"object"}`)},
+				},
+				ToolChoice: tt.toolChoice,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var req map[string]any
+			if err := json.Unmarshal(gotBody, &req); err != nil {
+				t.Fatalf("unmarshal request body: %v", err)
+			}
+			if tt.want == "" {
+				if _, ok := req["tool_choice"]; ok {
+					t.Errorf("tool_choice = %v, want omitted", req["tool_choice"])
+				}
+				return
+			}
+			got, _ := json.Marshal(map[string]any{"tool_choice": req["tool_choice"]})
+			if string(got) != tt.want {
+				t.Errorf("tool_choice subtree = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+// #39: response_format.json_schema carries the raw JSON-schema object directly
+// (no {name, schema} wrapper) under type=json_object.
+func TestChat_Generate_ResponseFormat_GoldenBody(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"123","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"finish_reason":"COMPLETE","usage":{"tokens":{"input_tokens":5,"output_tokens":2}}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("command-r-plus", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		ResponseFormat: &provider.ResponseFormat{
+			Name:   "person",
+			Schema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}}}`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var req map[string]any
+	if err := json.Unmarshal(gotBody, &req); err != nil {
+		t.Fatalf("unmarshal request body: %v", err)
+	}
+	want := map[string]any{
+		"type": "json_object",
+		"json_schema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name": map[string]any{"type": "string"},
+			},
+		},
+	}
+	got, _ := json.Marshal(req["response_format"])
+	wantJSON, _ := json.Marshal(want)
+	if string(got) != string(wantJSON) {
+		t.Errorf("response_format subtree = %s, want %s", got, wantJSON)
+	}
+}
+
+// #40: k/seed/frequency_penalty/presence_penalty are mapped onto the outgoing
+// /chat request body.
+func TestChat_Generate_SamplingParams_GoldenBody(t *testing.T) {
+	topK := 40
+	seed := 98765
+	freq := 0.5
+	presence := 0.2
+
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"123","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"finish_reason":"COMPLETE","usage":{"tokens":{"input_tokens":5,"output_tokens":2}}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("command-r-plus", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		TopK:             &topK,
+		Seed:             &seed,
+		FrequencyPenalty: &freq,
+		PresencePenalty:  &presence,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var req map[string]any
+	if err := json.Unmarshal(gotBody, &req); err != nil {
+		t.Fatalf("unmarshal request body: %v", err)
+	}
+	keys := []string{"k", "seed", "frequency_penalty", "presence_penalty"}
+	got := map[string]any{}
+	for _, k := range keys {
+		if v, ok := req[k]; ok {
+			got[k] = v
+		}
+	}
+	want := map[string]any{
+		"k":                 float64(40),
+		"seed":              float64(98765),
+		"frequency_penalty": float64(0.5),
+		"presence_penalty":  float64(0.2),
+	}
+	gotJSON, _ := json.Marshal(got)
+	wantJSON, _ := json.Marshal(want)
+	if string(gotJSON) != string(wantJSON) {
+		t.Errorf("sampling subtree = %s, want %s", gotJSON, wantJSON)
+	}
+}
+
+// #43: embed output_dimension and embedding_types are carried on the outgoing
+// /embed request body alongside the standard fields.
+func TestEmbedding_OutputParams_GoldenBody(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"embeddings":{"float":[[0.1,0.2]]},"meta":{"billed_units":{"input_tokens":1}}}`)
+	}))
+	defer server.Close()
+
+	model := Embedding("embed-v4.0", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{
+		ProviderOptions: map[string]any{
+			"output_dimension": 512,
+			"embedding_types":  []string{"float", "binary"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var req map[string]any
+	if err := json.Unmarshal(gotBody, &req); err != nil {
+		t.Fatalf("unmarshal request body: %v", err)
+	}
+	want := map[string]any{
+		"model":            "embed-v4.0",
+		"texts":            []any{"hello"},
+		"input_type":       "search_document",
+		"output_dimension": float64(512),
+		"embedding_types":  []any{"float", "binary"},
+	}
+	gotJSON, _ := json.Marshal(req)
+	wantJSON, _ := json.Marshal(want)
+	if string(gotJSON) != string(wantJSON) {
+		t.Errorf("embed body = %s, want %s", gotJSON, wantJSON)
+	}
+}
+
+// TestChat_ResponseBodyOverCap verifies the success-path bounded read in
+// DoGenerate: a response body larger than maxCohereResponseBytes is rejected.
+func TestChat_ResponseBodyOverCap(t *testing.T) {
+	transport := &fixedBodyTransport{body: io.NopCloser(io.LimitReader(zeroReader{}, int64(maxCohereResponseBytes+2)))}
+	model := Chat("command-r-plus", WithAPIKey("k"), WithBaseURL("http://fake"), WithHTTPClient(&http.Client{Transport: transport}))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for oversized response body")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want an 'exceeds' over-cap error", err)
+	}
+}
+
+// TestEmbedding_ResponseBodyOverCap verifies the success-path bounded read in
+// DoEmbed.
+func TestEmbedding_ResponseBodyOverCap(t *testing.T) {
+	transport := &fixedBodyTransport{body: io.NopCloser(io.LimitReader(zeroReader{}, int64(maxCohereResponseBytes+2)))}
+	model := Embedding("embed-v4.0", WithAPIKey("k"), WithBaseURL("http://fake"), WithHTTPClient(&http.Client{Transport: transport}))
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err == nil {
+		t.Fatal("expected error for oversized response body")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want an 'exceeds' over-cap error", err)
+	}
+}
+
+// TestEmbedding_ErrorBodyBounded verifies the error-path bounded read in
+// DoEmbed: an error response body larger than maxCohereErrorBytes is truncated,
+// so the tail marker never reaches the extracted error message.
+func TestEmbedding_ErrorBodyBounded(t *testing.T) {
+	const tailMarker = "TAIL-MARKER-SHOULD-NOT-APPEAR"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.Copy(w, io.MultiReader(
+			strings.NewReader(`{"message":"`),
+			io.LimitReader(zeroReader{}, int64(maxCohereErrorBytes+len(tailMarker))),
+			strings.NewReader(tailMarker),
+		))
+	}))
+	defer server.Close()
+
+	model := Embedding("embed-v4.0", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *goai.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *goai.APIError", err)
+	}
+	if strings.Contains(apiErr.Message, tailMarker) {
+		t.Errorf("error message contains tail marker; error body was not bounded: %q", apiErr.Message)
+	}
+}
+
+// zeroReader yields an endless stream of bytes without allocating.
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
+}
+
+// fixedBodyTransport returns a canned 200 response with the given body.
+type fixedBodyTransport struct {
+	body io.ReadCloser
+}
+
+func (t *fixedBodyTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       t.body,
+		Header:     make(http.Header),
+	}, nil
 }

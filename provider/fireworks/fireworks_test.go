@@ -348,6 +348,45 @@ func TestChat_EnvVarNotOverrideExplicit(t *testing.T) {
 	}
 }
 
+// Item 44: Fireworks structured output must be sent as
+// {"type":"json_object","schema":{...}} (not json_schema).
+func TestChat_StructuredOutputUsesJsonObject(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("accounts/fireworks/models/llama-v3p3-70b-instruct", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ResponseFormat: &provider.ResponseFormat{
+			Name:   "test_schema",
+			Schema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}}}`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rf, ok := gotBody["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("response_format missing or wrong type: %v", gotBody["response_format"])
+	}
+	if rf["type"] != "json_object" {
+		t.Errorf("response_format.type = %v, want json_object", rf["type"])
+	}
+	if _, ok := rf["schema"].(map[string]any); !ok {
+		t.Errorf("response_format.schema missing or wrong type: %v", rf["schema"])
+	}
+	if _, ok := rf["json_schema"]; ok {
+		t.Error("json_schema must not be emitted for Fireworks")
+	}
+}
+
 func TestChat_PromptCachingIgnored(t *testing.T) {
 	// DoGenerate with JSON server
 	genServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -386,5 +425,42 @@ func TestChat_PromptCachingIgnored(t *testing.T) {
 		t.Fatalf("DoStream unexpected error: %v", err)
 	}
 	for range streamResult.Stream {
+	}
+}
+
+// Item 47: fireworks opts into IncludeReasoningContent, so an assistant message
+// carrying a reasoning part must serialize reasoning_content on the outgoing
+// request body.
+func TestChat_RoundTripsReasoningContent(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("accounts/fireworks/models/llama-v3p3-70b-instruct", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{
+			Role: provider.RoleAssistant,
+			Content: []provider.Part{
+				{Type: provider.PartReasoning, Text: "let me think"},
+				{Type: provider.PartText, Text: "answer"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, ok := gotBody["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("messages = %v", gotBody["messages"])
+	}
+	assistant := msgs[0].(map[string]any)
+	if assistant["reasoning_content"] != "let me think" {
+		t.Errorf("reasoning_content = %v, want 'let me think'", assistant["reasoning_content"])
 	}
 }

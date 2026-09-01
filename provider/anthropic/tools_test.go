@@ -140,6 +140,33 @@ func TestTools_WebSearch20260209(t *testing.T) {
 	}
 }
 
+func TestTools_WebSearch20260318(t *testing.T) {
+	tool := Tools.WebSearch_20260318(WithResponseInclusion("low"))
+	if tool.ProviderDefinedType != "web_search_20260318" {
+		t.Errorf("ProviderDefinedType = %q, want web_search_20260318", tool.ProviderDefinedType)
+	}
+	if tool.ProviderDefinedOptions["response_inclusion"] != "low" {
+		t.Errorf("response_inclusion = %v, want low", tool.ProviderDefinedOptions["response_inclusion"])
+	}
+}
+
+func TestTools_WebSearch20260318_NoResponseInclusion(t *testing.T) {
+	tool := Tools.WebSearch_20260318()
+	if _, ok := tool.ProviderDefinedOptions["response_inclusion"]; ok {
+		t.Error("response_inclusion should be absent when not set")
+	}
+}
+
+func TestTools_CodeExecution20250522(t *testing.T) {
+	tool := Tools.CodeExecution_20250522()
+	if tool.Name != "code_execution" {
+		t.Errorf("Name = %q, want code_execution", tool.Name)
+	}
+	if tool.ProviderDefinedType != "code_execution_20250522" {
+		t.Errorf("ProviderDefinedType = %q, want code_execution_20250522", tool.ProviderDefinedType)
+	}
+}
+
 func TestTools_WebSearchWithUserLocation(t *testing.T) {
 	tool := Tools.WebSearch(WithWebSearchUserLocation(WebSearchLocation{
 		Type:     "approximate",
@@ -242,8 +269,10 @@ func TestBetaForTool(t *testing.T) {
 		{"text_editor_20250728", ""},
 		{"code_execution_20250825", "code-execution-2025-08-25"},
 		{"code_execution_20260120", ""},
+		{"code_execution_20250522", ""},
 		{"web_search_20260209", "code-execution-web-tools-2026-02-09"},
 		{"web_fetch_20260209", "code-execution-web-tools-2026-02-09"},
+		{"web_search_20260318", "code-execution-web-tools-2026-03-18"},
 		{"tool_search_tool_regex_20251119", ""}, // GA, no beta header
 		{"tool_search_tool_bm25_20251119", ""},  // GA, no beta header
 		{"unknown_tool", ""},

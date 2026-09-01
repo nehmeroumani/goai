@@ -70,31 +70,30 @@ func Chat(modelID string, opts ...Option) provider.LanguageModel {
 		}
 	}
 	return openaicompat.NewChatModel(openaicompat.ChatModelConfig{
-		ProviderID:           "requesty",
-		ModelID:              modelID,
-		BaseURL:              o.baseURL,
-		TokenSource:          o.tokenSource,
-		TokenRequired:        true,
-		Headers:              mergeHeaders(o.headers),
-		HTTPClient:           o.httpClient,
-		Capabilities:         chatCaps,
-		IncludeStreamOptions: true,
-		WarnPromptCaching:    true,
-		ExtraBody:            map[string]any{"usage": map[string]any{"include": true}},
+		ProviderID:        "requesty",
+		ModelID:           modelID,
+		BaseURL:           o.baseURL,
+		TokenSource:       o.tokenSource,
+		TokenRequired:     true,
+		Headers:           openaicompat.MergeHeaders(o.headers, requestyFixedHeaders),
+		HTTPClient:        o.httpClient,
+		Capabilities:      chatCaps,
+		WarnPromptCaching: true,
+		RequestConfig: openaicompat.RequestConfig{
+			IncludeStreamOptions: true,
+			// Requesty uses flat {"type":"input_file","file_data":...} (item 59).
+			FlatInputFile: true,
+			ExtraBody:     map[string]any{"usage": map[string]any{"include": true}},
+		},
 	})
 }
 
-// mergeHeaders returns user-provided headers with Requesty-specific headers added.
-// These optional analytics headers are documented at https://docs.requesty.ai.
-func mergeHeaders(user map[string]string) map[string]string {
-	merged := map[string]string{
-		"HTTP-Referer": "https://github.com/zendev-sh/goai",
-		"X-Title":      "goai",
-	}
-	for k, v := range user {
-		merged[k] = v
-	}
-	return merged
+// requestyFixedHeaders are the analytics headers Requesty recommends sending on
+// every request (https://docs.requesty.ai), merged with user headers via
+// openaicompat.MergeHeaders.
+var requestyFixedHeaders = map[string]string{
+	"HTTP-Referer": "https://github.com/zendev-sh/goai",
+	"X-Title":      "goai",
 }
 
 var chatCaps = provider.ModelCapabilities{

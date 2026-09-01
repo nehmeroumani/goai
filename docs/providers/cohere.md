@@ -103,4 +103,5 @@ for _, source := range result.Sources {
 - Uses Cohere's native API format, not OpenAI-compatible. Request/response mapping is handled internally.
 - Max embedding batch size: 96 values per call.
 - Streaming uses Cohere-specific SSE event types (`content-delta`, `tool-call-start`, `tool-call-delta`, `tool-call-end`, `message-end`, `citation-start`).
+- **Tool plans**: when a response includes a `tool_plan`, it is surfaced in `Result.ProviderMetadata["cohere"]["tool_plan"]` (available in both generate and stream paths).
 - Environment variable `COHERE_BASE_URL` can override the default endpoint.

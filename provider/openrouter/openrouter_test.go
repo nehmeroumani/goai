@@ -317,6 +317,121 @@ func TestChat_EnvVarNotOverrideExplicit(t *testing.T) {
 	}
 }
 
+func TestChat_MaxCompletionTokens(t *testing.T) {
+	var gotBody map[string]any
+	tr := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		return okResponse(), nil
+	})
+	m := Chat("anthropic/claude-sonnet-4", WithAPIKey("k"), WithUseMaxCompletionTokens(true), WithHTTPClient(&http.Client{Transport: tr}))
+	_, err := m.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages:        []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		MaxOutputTokens: 256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotBody["max_completion_tokens"] != float64(256) {
+		t.Errorf("max_completion_tokens = %v, want 256", gotBody["max_completion_tokens"])
+	}
+	if _, ok := gotBody["max_tokens"]; ok {
+		t.Error("deprecated max_tokens should not be present")
+	}
+}
+
+// TestChat_DefaultUsesMaxTokens: OpenRouter is a router to many upstreams, some
+// of which only accept max_tokens. It must NOT force max_completion_tokens by
+// default; a non-reasoning model keeps max_tokens unless the caller opts in.
+func TestChat_DefaultUsesMaxTokens(t *testing.T) {
+	var gotBody map[string]any
+	tr := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		return okResponse(), nil
+	})
+	m := Chat("anthropic/claude-sonnet-4", WithAPIKey("k"), WithHTTPClient(&http.Client{Transport: tr}))
+	_, err := m.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages:        []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		MaxOutputTokens: 256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotBody["max_tokens"] != float64(256) {
+		t.Errorf("max_tokens = %v, want 256", gotBody["max_tokens"])
+	}
+	if _, ok := gotBody["max_completion_tokens"]; ok {
+		t.Error("max_completion_tokens must not be forced by default for OpenRouter")
+	}
+}
+
+func TestChat_TypedOptions(t *testing.T) {
+	var gotBody map[string]any
+	tr := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		return okResponse(), nil
+	})
+	m := Chat("anthropic/claude-sonnet-4",
+		WithAPIKey("k"),
+		WithHTTPClient(&http.Client{Transport: tr}),
+		WithProviderRouting("Anthropic", "Auto"),
+		WithRoute("fallback"),
+		WithSessionID("abc-123"),
+	)
+	_, err := m.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prov, _ := gotBody["provider"].(map[string]any)
+	if prov == nil {
+		t.Fatalf("provider routing missing, body=%v", gotBody)
+	}
+	order, _ := prov["order"].([]any)
+	if len(order) != 2 || order[0] != "Anthropic" || order[1] != "Auto" {
+		t.Errorf("provider.order = %v", prov["order"])
+	}
+	if prov["allow_fallbacks"] != false {
+		t.Errorf("provider.allow_fallbacks = %v, want false", prov["allow_fallbacks"])
+	}
+	if gotBody["route"] != "fallback" {
+		t.Errorf("route = %v, want fallback", gotBody["route"])
+	}
+	if gotBody["session_id"] != "abc-123" {
+		t.Errorf("session_id = %v, want abc-123", gotBody["session_id"])
+	}
+}
+
+func TestChat_TypedOptions_Empty(t *testing.T) {
+	// Without the typed options, provider/route/session_id must be absent.
+	var gotBody map[string]any
+	tr := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		return okResponse(), nil
+	})
+	m := Chat("anthropic/claude-sonnet-4", WithAPIKey("k"), WithHTTPClient(&http.Client{Transport: tr}))
+	_, err := m.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := gotBody["provider"]; ok {
+		t.Error("provider should be absent when no routing prefs set")
+	}
+	if _, ok := gotBody["route"]; ok {
+		t.Error("route should be absent when not set")
+	}
+	if _, ok := gotBody["session_id"]; ok {
+		t.Error("session_id should be absent when not set")
+	}
+}
+
 func TestChat_PromptCachingIgnored(t *testing.T) {
 	// DoGenerate with JSON server
 	genServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -19,6 +19,39 @@ import (
 // Compile-time interface compliance check.
 var _ provider.ImageModel = (*imageModel)(nil)
 
+const (
+	// maxImageResponseBytes bounds the size of a successful image generation
+	// response body to defend against a malicious/misbehaving server returning
+	// an unbounded payload.
+	maxImageResponseBytes = 64 << 20 // 64 MiB
+	// maxImageErrorBytes bounds the size of an error response body read solely
+	// to extract the error message.
+	maxImageErrorBytes = 1 << 20 // 1 MiB
+)
+
+// OutputFormat specifies the image output format for image generation models.
+// Only gpt-image-1 and later models support it; dall-e-3 ignores it.
+type OutputFormat string
+
+const (
+	// OutputFormatPNG requests PNG output.
+	OutputFormatPNG OutputFormat = "png"
+	// OutputFormatJPEG requests JPEG output.
+	OutputFormatJPEG OutputFormat = "jpeg"
+	// OutputFormatWebP requests WebP output.
+	OutputFormatWebP OutputFormat = "webp"
+)
+
+// WithImageOutputFormat sets the output format for image generation via the
+// Images API (Image model). Valid values are png, jpeg, and webp (see
+// OutputFormat constants). Distinct from tools.WithOutputFormat, which targets
+// the Responses API image-generation tool.
+func WithImageOutputFormat(format OutputFormat) Option {
+	return func(o *options) {
+		o.outputFormat = string(format)
+	}
+}
+
 // Image creates an OpenAI image model (DALL-E 3, gpt-image-1, etc.).
 func Image(modelID string, opts ...Option) provider.ImageModel {
 	o := options{baseURL: defaultBaseURL}
@@ -56,7 +89,11 @@ func (m *imageModel) DoGenerate(ctx context.Context, params provider.ImageParams
 	body := map[string]any{
 		"model":  m.id,
 		"prompt": params.Prompt,
-		"n":      params.N,
+	}
+	// Item 2: only send "n" when explicitly requested. The zero-value 0
+	// violates the API's minimum:1 constraint and is rejected by the server.
+	if params.N > 0 {
+		body["n"] = params.N
 	}
 	// gpt-image-1/1.5 default to b64_json; older models (dall-e-3) need it explicit.
 	// Matches Vercel AI SDK's hasDefaultResponseFormat set.
@@ -65,6 +102,12 @@ func (m *imageModel) DoGenerate(ctx context.Context, params provider.ImageParams
 	}
 	if params.Size != "" {
 		body["size"] = params.Size
+	}
+
+	// Item 3: expose output_format via a typed option instead of relying on the
+	// undocumented ProviderOptions passthrough key.
+	if m.opts.outputFormat != "" {
+		body["output_format"] = m.opts.outputFormat
 	}
 
 	// Note: params.AspectRatio is not mapped because OpenAI's image API uses
@@ -79,11 +122,14 @@ func (m *imageModel) DoGenerate(ctx context.Context, params provider.ImageParams
 	jsonBody := httpc.MustMarshalJSON(body)
 	req := httpc.MustNewRequest(ctx, "POST", m.opts.baseURL+"/images/generations", jsonBody)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
 
 	for k, v := range m.opts.headers {
 		req.Header.Set(k, v)
 	}
+
+	// Auth is applied last so a caller-supplied header named "Authorization"
+	// cannot override the real credential.
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := m.httpClient().Do(req)
 	if err != nil {
@@ -92,13 +138,16 @@ func (m *imageModel) DoGenerate(ctx context.Context, params provider.ImageParams
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxImageErrorBytes))
 		return nil, goai.ParseHTTPErrorWithHeaders("openai", resp.StatusCode, respBody, resp.Header)
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxImageResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if len(respBody) > maxImageResponseBytes {
+		return nil, fmt.Errorf("openai: image response body exceeds %d bytes", maxImageResponseBytes)
 	}
 
 	var result struct {
@@ -162,8 +211,6 @@ func detectMediaType(outputFormat string, _ string) string {
 		return "image/jpeg"
 	case "webp":
 		return "image/webp"
-	case "gif":
-		return "image/gif"
 	default:
 		// Default to PNG for backwards compat when format not specified.
 		return "image/png"
@@ -175,7 +222,8 @@ func detectMediaType(outputFormat string, _ string) string {
 // Matches Vercel AI SDK's hasDefaultResponseFormat set.
 func hasDefaultResponseFormat(modelID string) bool {
 	switch modelID {
-	case "gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5":
+	case "gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5",
+		"gpt-image-2", "gpt-image-2-2026-04-21":
 		return true
 	default:
 		return false

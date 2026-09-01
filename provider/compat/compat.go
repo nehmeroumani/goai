@@ -84,18 +84,20 @@ func resolveOptions(opts []Option) options {
 func Chat(modelID string, opts ...Option) provider.LanguageModel {
 	o := resolveOptions(opts)
 	return openaicompat.NewChatModel(openaicompat.ChatModelConfig{
-		ProviderID:             o.providerID,
-		ModelID:                modelID,
-		BaseURL:                o.baseURL,
-		BaseURLRequired:        true,
-		TokenSource:            o.tokenSource,
-		TokenRequired:          false,
-		Headers:                o.headers,
-		HTTPClient:             o.httpClient,
-		Capabilities:           chatCaps,
-		IncludeStreamOptions:   true,
-		WarnPromptCaching:      true,
-		UseMaxCompletionTokens: o.useMaxCompletionTokens,
+		ProviderID:        o.providerID,
+		ModelID:           modelID,
+		BaseURL:           o.baseURL,
+		BaseURLRequired:   true,
+		TokenSource:       o.tokenSource,
+		TokenRequired:     false,
+		Headers:           o.headers,
+		HTTPClient:        o.httpClient,
+		Capabilities:      chatCaps,
+		WarnPromptCaching: true,
+		RequestConfig: openaicompat.RequestConfig{
+			IncludeStreamOptions:   true,
+			UseMaxCompletionTokens: o.useMaxCompletionTokens,
+		},
 	})
 }
 

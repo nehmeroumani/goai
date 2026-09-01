@@ -3,12 +3,22 @@ package llamacpp
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/zendev-sh/goai/provider"
 )
+
+// roundTripFunc adapts a function to the http.RoundTripper interface so tests
+// can intercept and stub outgoing requests without binding a network listener.
+type roundTripFunc func(r *http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
 
 func TestChat_Generate(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -71,6 +81,71 @@ func TestChat_DefaultBaseURL(t *testing.T) {
 	model := Chat("llama3")
 	if model.ModelID() != "llama3" {
 		t.Errorf("ModelID() = %q", model.ModelID())
+	}
+	// The default server exposes the OpenAI-compatible API under /v1, so the
+	// default base URL must include the /v1 prefix for chat + embeddings to hit
+	// the correct path (/v1/chat/completions, /v1/embeddings).
+	if defaultBaseURL != "http://localhost:8080/v1" {
+		t.Errorf("defaultBaseURL = %q, want %q", defaultBaseURL, "http://localhost:8080/v1")
+	}
+}
+
+// TestChat_DefaultBaseURL_HitsV1Path is a REQUEST-direction contract test for
+// audit item #52: llama.cpp's default server exposes the OpenAI-compatible API
+// under /v1, so with no WithBaseURL the outgoing request must hit
+// http://localhost:8080/v1/chat/completions (the /v1 prefix is required for
+// chat + embeddings to reach the correct handler). A custom RoundTripper
+// captures the real request URL without binding a network listener.
+func TestChat_DefaultBaseURL_HitsV1Path(t *testing.T) {
+	var gotURL string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		gotURL = r.URL.String()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"x","model":"llama3","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)),
+		}, nil
+	})}
+
+	// No WithBaseURL -> the default base URL is used.
+	model := Chat("llama3", WithHTTPClient(client))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "http://localhost:8080/v1/chat/completions"
+	if gotURL != want {
+		t.Errorf("request URL = %q, want %q", gotURL, want)
+	}
+}
+
+// TestEmbedding_DefaultBaseURL_HitsV1Path is the embedding-side counterpart of
+// the #52 contract: the default base URL must place embeddings under /v1 too
+// (/v1/embeddings), not at the server root.
+func TestEmbedding_DefaultBaseURL_HitsV1Path(t *testing.T) {
+	var gotURL string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		gotURL = r.URL.String()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"data":[{"embedding":[0.1,0.2],"index":0}],"usage":{"prompt_tokens":3,"total_tokens":3}}`)),
+		}, nil
+	})}
+
+	model := Embedding("nomic-embed-text", WithHTTPClient(client))
+	if _, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{}); err != nil {
+		t.Fatal(err)
+	}
+	want := "http://localhost:8080/v1/embeddings"
+	if gotURL != want {
+		t.Errorf("request URL = %q, want %q", gotURL, want)
 	}
 }
 

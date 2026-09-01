@@ -21,7 +21,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/internal/httpc"
@@ -137,6 +136,16 @@ func (m *chatModel) Capabilities() provider.ModelCapabilities {
 	}
 }
 
+const (
+	// maxCohereResponseBytes bounds the size of a successful response body to
+	// defend against a malicious/misbehaving server returning an unbounded
+	// payload.
+	maxCohereResponseBytes = 64 << 20 // 64 MiB
+	// maxCohereErrorBytes bounds the size of an error response body read solely
+	// to extract the error message.
+	maxCohereErrorBytes = 1 << 20 // 1 MiB
+)
+
 func (m *chatModel) DoGenerate(ctx context.Context, params provider.GenerateParams) (*provider.GenerateResult, error) {
 	if params.PromptCaching {
 		fmt.Fprintf(os.Stderr, "goai: cohere: WithPromptCaching is not supported and will be ignored\n")
@@ -149,9 +158,12 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxCohereResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if len(respBody) > maxCohereResponseBytes {
+		return nil, fmt.Errorf("cohere: chat response body exceeds %d bytes", maxCohereResponseBytes)
 	}
 
 	return parseChatResponse(respBody)
@@ -170,26 +182,9 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 	// Keep resp.Request and its serialized request body out of the stream closure.
 	responseBody := resp.Body
 
-	out := make(chan provider.StreamChunk, 64)
-	go func() {
-		var closeOnce sync.Once
-		closeBody := func() { closeOnce.Do(func() { _ = responseBody.Close() }) }
-		defer closeBody()
-		// Close body on context cancellation to unblock parseChatStream.
-		// Without this, the goroutine leaks if the server stalls mid-stream.
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			select {
-			case <-ctx.Done():
-				closeBody()
-			case <-done:
-			}
-		}()
-		parseChatStream(ctx, responseBody, out)
-	}()
-
-	return &provider.StreamResult{Stream: out}, nil
+	return provider.RunStream(ctx, responseBody, func(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk) {
+		parseChatStream(ctx, body, out)
+	}), nil
 }
 
 func (m *chatModel) doHTTP(ctx context.Context, path string, body map[string]any) (*http.Response, error) {
@@ -253,14 +248,25 @@ func (m *embeddingModel) DoEmbed(ctx context.Context, values []string, params pr
 		}
 	}
 
+	// Optional output_dimension (int) and embedding_types ([]string) params,
+	// mirroring the Bedrock embed path.
+	if v, ok := params.ProviderOptions["output_dimension"]; ok {
+		body["output_dimension"] = v
+	}
+	if v, ok := params.ProviderOptions["embedding_types"]; ok {
+		body["embedding_types"] = v
+	}
+
 	jsonBody := httpc.MustMarshalJSON(body)
 	req := httpc.MustNewRequest(ctx, "POST", m.opts.baseURL+"/embed", jsonBody)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
 
 	for k, v := range m.opts.headers {
 		req.Header.Set(k, v)
 	}
+	// Set the credential last so it wins over any caller-supplied header
+	// named like the auth header.
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := m.httpClient().Do(req)
 	if err != nil {
@@ -269,13 +275,16 @@ func (m *embeddingModel) DoEmbed(ctx context.Context, values []string, params pr
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxCohereErrorBytes))
 		return nil, goai.ParseHTTPErrorWithHeaders("cohere", resp.StatusCode, respBody, resp.Header)
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxCohereResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if len(respBody) > maxCohereResponseBytes {
+		return nil, fmt.Errorf("cohere: embedding response body exceeds %d bytes", maxCohereResponseBytes)
 	}
 
 	var result struct {
@@ -400,19 +409,16 @@ func buildChatRequest(params provider.GenerateParams, modelID string, streaming 
 		body["tools"] = tools
 	}
 
-	// Tool choice mapping (Cohere v2 uses OpenAI-compatible tool_choice).
+	// Tool choice mapping (Cohere v2 expects uppercase enum values).
+	// "auto" is the default and is therefore omitted. Selecting a specific
+	// tool by name is not supported by Cohere v2, so it is also omitted
+	// (falls back to the provider default).
 	if params.ToolChoice != "" {
 		switch params.ToolChoice {
-		case "auto", "none", "required":
-			body["tool_choice"] = params.ToolChoice
-		default:
-			// Specific tool name.
-			body["tool_choice"] = map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name": params.ToolChoice,
-				},
-			}
+		case "none":
+			body["tool_choice"] = "NONE"
+		case "required":
+			body["tool_choice"] = "REQUIRED"
 		}
 	}
 
@@ -428,6 +434,18 @@ func buildChatRequest(params provider.GenerateParams, modelID string, streaming 
 	}
 	if params.TopP != nil {
 		body["p"] = *params.TopP
+	}
+	if params.TopK != nil {
+		body["k"] = *params.TopK
+	}
+	if params.Seed != nil {
+		body["seed"] = *params.Seed
+	}
+	if params.FrequencyPenalty != nil {
+		body["frequency_penalty"] = *params.FrequencyPenalty
+	}
+	if params.PresencePenalty != nil {
+		body["presence_penalty"] = *params.PresencePenalty
 	}
 
 	// Thinking / reasoning support for command-a-reasoning models.
@@ -449,16 +467,15 @@ func buildChatRequest(params provider.GenerateParams, modelID string, streaming 
 	}
 
 	// Response format (structured output / JSON mode).
+	// Cohere v2 expects the raw JSON-schema object directly under
+	// "json_schema" (not wrapped in a {name, schema} envelope).
 	if params.ResponseFormat != nil {
 		if len(params.ResponseFormat.Schema) > 0 {
 			var schema any
 			if err := json.Unmarshal(params.ResponseFormat.Schema, &schema); err == nil {
 				body["response_format"] = map[string]any{
-					"type": "json_object",
-					"json_schema": map[string]any{
-						"name":   params.ResponseFormat.Name,
-						"schema": schema,
-					},
+					"type":        "json_object",
+					"json_schema": schema,
 				}
 			}
 		} else {
@@ -493,8 +510,9 @@ func parseChatResponse(body []byte) (*provider.GenerateResult, error) {
 		ID      string `json:"id"`
 		Model   string `json:"model"`
 		Message struct {
-			Role    string `json:"role"`
-			Content []struct {
+			Role     string `json:"role"`
+			ToolPlan string `json:"tool_plan"`
+			Content  []struct {
 				Type     string `json:"type"`
 				Text     string `json:"text"`
 				Thinking string `json:"thinking"`
@@ -553,6 +571,19 @@ func parseChatResponse(body []byte) (*provider.GenerateResult, error) {
 		result.ProviderMetadata = map[string]map[string]any{
 			"cohere": {"reasoning": joined},
 		}
+	}
+
+	// Surface the tool plan (the model's stated plan before it invokes tools).
+	if resp.Message.ToolPlan != "" {
+		if result.ProviderMetadata == nil {
+			result.ProviderMetadata = map[string]map[string]any{}
+		}
+		md := result.ProviderMetadata["cohere"]
+		if md == nil {
+			md = map[string]any{}
+			result.ProviderMetadata["cohere"] = md
+		}
+		md["tool_plan"] = resp.Message.ToolPlan
 	}
 
 	// Extract tool calls.
@@ -735,6 +766,21 @@ func parseChatStream(ctx context.Context, body io.Reader, out chan<- provider.St
 				isReasoning = false
 			}
 
+		case "tool-plan-delta":
+			// The model's stated plan before it invokes tools. Emitted as text
+			// deltas; render them as ChunkText so consumers see the plan.
+			var tp struct {
+				Text string `json:"text"`
+			}
+			if json.Unmarshal(event.Delta.Message.Content, &tp) == nil && tp.Text != "" {
+				if !provider.TrySend(ctx, out, provider.StreamChunk{
+					Type: provider.ChunkText,
+					Text: tp.Text,
+				}) {
+					return
+				}
+			}
+
 		case "tool-call-start":
 			pending = &pendingToolCall{
 				id:   event.Delta.Message.ToolCalls.ID,
@@ -857,7 +903,7 @@ func parseChatStream(ctx context.Context, body io.Reader, out chan<- provider.St
 
 func mapFinishReason(reason string) provider.FinishReason {
 	switch reason {
-	case "COMPLETE", "END_TURN":
+	case "COMPLETE", "END_TURN", "STOP_SEQUENCE":
 		return provider.FinishStop
 	case "TOOL_CALL":
 		return provider.FinishToolCalls
@@ -865,6 +911,8 @@ func mapFinishReason(reason string) provider.FinishReason {
 		return provider.FinishLength
 	case "ERROR":
 		return provider.FinishError
+	case "TIMEOUT":
+		return provider.FinishOther
 	case "":
 		return ""
 	default:

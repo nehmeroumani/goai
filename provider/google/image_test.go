@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -140,6 +141,34 @@ func TestImagenModel_CustomHeaders(t *testing.T) {
 	_, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "x", N: 1})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestImagenModel_AuthHeaderWinsOverWithHeaders(t *testing.T) {
+	// A caller-supplied WithHeaders header named like the auth header must
+	// NOT override the real credential on the Imagen :predict path.
+	var gotKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("x-goog-api-key")
+		imgData := base64.StdEncoding.EncodeToString([]byte("ok"))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"predictions": []map[string]any{{"bytesBase64Encoded": imgData}},
+		})
+	}))
+	defer srv.Close()
+
+	model := Image("imagen-4.0-fast-generate-001",
+		WithAPIKey("real-key"),
+		WithBaseURL(srv.URL),
+		WithHeaders(map[string]string{"x-goog-api-key": "spoofed-key"}),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "x", N: 1})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotKey != "real-key" {
+		t.Errorf("x-goog-api-key = %q, want real-key (credential must win over WithHeaders)", gotKey)
 	}
 }
 
@@ -591,6 +620,38 @@ func TestGeminiImage_CustomHeaders(t *testing.T) {
 	}
 }
 
+func TestGeminiImage_AuthHeaderWinsOverWithHeaders(t *testing.T) {
+	// A caller-supplied WithHeaders header named like the auth header must
+	// NOT override the real credential on the Gemini generateContent path.
+	var gotKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("x-goog-api-key")
+		imgData := base64.StdEncoding.EncodeToString([]byte("ok"))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []map[string]any{
+				{"content": map[string]any{"parts": []map[string]any{
+					{"inlineData": map[string]any{"mimeType": "image/png", "data": imgData}},
+				}}},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	model := Image("gemini-2.5-flash-image",
+		WithAPIKey("real-key"),
+		WithBaseURL(srv.URL),
+		WithHeaders(map[string]string{"x-goog-api-key": "spoofed-key"}),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "x", N: 1})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotKey != "real-key" {
+		t.Errorf("x-goog-api-key = %q, want real-key (credential must win over WithHeaders)", gotKey)
+	}
+}
+
 func TestGeminiImage_ReadBodyError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", "100")
@@ -645,6 +706,149 @@ func TestImage_RoutesToGemini(t *testing.T) {
 	}
 	if model.ModelID() != "gemini-2.5-flash-image" {
 		t.Errorf("modelID = %s", model.ModelID())
+	}
+}
+
+func TestImagen_DeprecationWarning(t *testing.T) {
+	// Imagen is deprecated on the Gemini API (shutdown 2026-08-17). Constructing
+	// an Imagen model must surface a warning recommending the Gemini path, while
+	// still returning a functional imagenModel.
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	model := Image("imagen-4.0-generate-001", WithAPIKey("k"))
+
+	_ = w.Close()
+	os.Stderr = oldStderr
+	out, _ := io.ReadAll(r)
+	_ = r.Close()
+
+	if _, ok := model.(*imagenModel); !ok {
+		t.Fatalf("expected *imagenModel, got %T", model)
+	}
+	str := string(out)
+	if !strings.Contains(str, "deprecated") || !strings.Contains(str, "2026-08-17") {
+		t.Errorf("expected deprecation warning mentioning shutdown date, got %q", str)
+	}
+	if !strings.Contains(str, "gemini-2.5-flash-image") {
+		t.Errorf("expected warning to recommend the Gemini image path, got %q", str)
+	}
+}
+
+func TestGeminiImage_NumberOfImagesTopLevel(t *testing.T) {
+	// numberOfImages must be a top-level GenerationConfig field (not nested
+	// anywhere), and only set when N > 1.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		gc := req["generationConfig"].(map[string]any)
+		if gc["numberOfImages"] != float64(3) {
+			t.Errorf("numberOfImages = %v, want 3 at top level", gc["numberOfImages"])
+		}
+		if _, hasIC := gc["imageConfig"]; hasIC {
+			t.Error("imageConfig should not be set for plain N")
+		}
+		imgData := base64.StdEncoding.EncodeToString([]byte("ok"))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []map[string]any{
+				{"content": map[string]any{"parts": []map[string]any{
+					{"inlineData": map[string]any{"mimeType": "image/png", "data": imgData}},
+				}}},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	model := Image("gemini-2.5-flash-image", WithAPIKey("k"), WithBaseURL(srv.URL))
+	if _, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "x", N: 3}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGeminiImage_ImageSizeTopLevel(t *testing.T) {
+	// imageSize may be passed as a TOP-LEVEL provider option (not nested under
+	// imageConfig); it must land in generationConfig.imageSize (image.go:247-249).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		gc := req["generationConfig"].(map[string]any)
+		if gc["imageSize"] != "2K" {
+			t.Errorf("imageSize = %v, want 2K at top level", gc["imageSize"])
+		}
+		if _, hasIC := gc["imageConfig"]; hasIC {
+			t.Error("imageConfig should not be set for a top-level imageSize")
+		}
+		imgData := base64.StdEncoding.EncodeToString([]byte("ok"))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []map[string]any{
+				{"content": map[string]any{"parts": []map[string]any{
+					{"inlineData": map[string]any{"mimeType": "image/png", "data": imgData}},
+				}}},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	model := Image("gemini-2.5-flash-image", WithAPIKey("k"), WithBaseURL(srv.URL))
+	_, err := model.DoGenerate(t.Context(), provider.ImageParams{
+		Prompt: "x",
+		N:      1,
+		ProviderOptions: map[string]any{
+			"google": map[string]any{
+				"imageSize": "2K",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGeminiImage_ImageSizeHoisted(t *testing.T) {
+	// imageSize is not an official ImageConfig field; it must be hoisted to the
+	// top-level generationConfig, not nested under imageConfig.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		gc := req["generationConfig"].(map[string]any)
+		if gc["imageSize"] != "1K" {
+			t.Errorf("imageSize = %v, want 1K at top level", gc["imageSize"])
+		}
+		if ic, ok := gc["imageConfig"].(map[string]any); ok {
+			if _, hasSize := ic["imageSize"]; hasSize {
+				t.Error("imageSize should not remain nested under imageConfig")
+			}
+		}
+		imgData := base64.StdEncoding.EncodeToString([]byte("ok"))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []map[string]any{
+				{"content": map[string]any{"parts": []map[string]any{
+					{"inlineData": map[string]any{"mimeType": "image/png", "data": imgData}},
+				}}},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	model := Image("gemini-2.5-flash-image", WithAPIKey("k"), WithBaseURL(srv.URL))
+	_, err := model.DoGenerate(t.Context(), provider.ImageParams{
+		Prompt: "x",
+		N:      1,
+		ProviderOptions: map[string]any{
+			"google": map[string]any{
+				"imageConfig": map[string]any{"aspectRatio": "16:9", "imageSize": "1K"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

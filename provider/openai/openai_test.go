@@ -911,6 +911,70 @@ func TestChat_ChatCompletions_RequestBody(t *testing.T) {
 	}
 }
 
+func TestChat_WithUseMaxCompletionTokens_Generate(t *testing.T) {
+	var capturedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	// gpt-4o is not a reasoning model, so without the option it would use
+	// max_tokens. The option alone must drive the rename to max_completion_tokens.
+	model := Chat("gpt-4o", WithAPIKey("key"), WithBaseURL(server.URL), WithUseMaxCompletionTokens(true))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		MaxOutputTokens: 100,
+		ProviderOptions: chatCompletionsOpts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := capturedBody["max_tokens"]; ok {
+		t.Error("max_tokens must be renamed to max_completion_tokens")
+	}
+	if capturedBody["max_completion_tokens"] != float64(100) {
+		t.Errorf("max_completion_tokens = %v, want 100", capturedBody["max_completion_tokens"])
+	}
+}
+
+func TestChat_WithUseMaxCompletionTokens_Stream(t *testing.T) {
+	var capturedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &capturedBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("key"), WithBaseURL(server.URL), WithUseMaxCompletionTokens(true))
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		MaxOutputTokens: 50,
+		ProviderOptions: chatCompletionsOpts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range result.Stream {
+	}
+	if _, ok := capturedBody["max_tokens"]; ok {
+		t.Error("max_tokens must be renamed to max_completion_tokens")
+	}
+	if capturedBody["max_completion_tokens"] != float64(50) {
+		t.Errorf("max_completion_tokens = %v, want 50", capturedBody["max_completion_tokens"])
+	}
+}
+
 func TestChat_Responses_RequestBody(t *testing.T) {
 	var capturedBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1427,6 +1491,29 @@ func TestFileUploader_DeleteFile_HTTPError(t *testing.T) {
 	}
 }
 
+func TestFileUploader_DeleteFile_RejectsTraversal(t *testing.T) {
+	model := Chat("gpt-4o", WithAPIKey("test-key"))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	// A server-controlled ID must not be able to climb out of the /files/
+	// prefix via path traversal, including percent-encoded variants.
+	for _, id := range []string{
+		"../../etc/passwd", "../other-file", "a/b", `a\b`, "..",
+		// percent-encoded traversal bypasses
+		"..%2f", "..%2F", "..%5c", "..%5C",
+		"%2e%2e%2f", "%2E%2E%2F", "%2e%2e", "%2e%2e%5c",
+		"..%2fetc%2fpasswd", "%2fetc%2fpasswd", "file%2f..%2f..",
+	} {
+		err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: id})
+		if err == nil {
+			t.Errorf("DeleteFile(%q): expected traversal rejection, got nil", id)
+		}
+		if !strings.Contains(err.Error(), "unsafe ID") {
+			t.Errorf("DeleteFile(%q): error = %q, want 'unsafe ID'", id, err)
+		}
+	}
+}
+
 func TestFileUploader_UploadFile_EmptyMediaType(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1543,6 +1630,32 @@ func TestFileUploader_UploadFile_Headers(t *testing.T) {
 	}
 }
 
+// A caller-supplied header named "Authorization" must NOT override the real
+// credential on the upload path: auth is applied last, so it wins.
+func TestFileUploader_UploadFile_AuthHeaderCannotBeOverridden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Errorf("Authorization = %q, want %q (caller header must not win)", got, "Bearer test-key")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"file-auth","bytes":3,"created_at":1234567890,"filename":"test.txt","purpose":"assistants"}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer attacker"}))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	_, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:    strings.NewReader("abc"),
+		Filename:  "test.txt",
+		MediaType: "text/plain",
+	})
+	if err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+}
+
 func TestFileUploader_UploadFile_HTTPClientError(t *testing.T) {
 	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL("http://127.0.0.1:1"))
 	uploader := model.(provider.FileUploadCapableModel).FileUploader()
@@ -1564,6 +1677,26 @@ func TestFileUploader_DeleteFile_TokenError(t *testing.T) {
 	err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "file-xyz"})
 	if err == nil {
 		t.Fatal("expected error for token failure")
+	}
+}
+
+// A caller-supplied header named "Authorization" must NOT override the real
+// credential on the delete path: auth is applied last, so it wins.
+func TestFileUploader_DeleteFile_AuthHeaderCannotBeOverridden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Errorf("Authorization = %q, want %q (caller header must not win)", got, "Bearer test-key")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer attacker"}))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	if err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "file-to-delete"}); err != nil {
+		t.Fatalf("DeleteFile error: %v", err)
 	}
 }
 
@@ -4043,9 +4176,10 @@ func TestBF13_ErrorTypes(t *testing.T) {
 // --- 100% coverage gap tests ---
 
 func TestDetectMediaType_GifAndJpg(t *testing.T) {
-	// Covers image.go:147-148 (gif case) and jpg alias.
-	if got := detectMediaType("gif", ""); got != "image/gif" {
-		t.Errorf("detectMediaType(gif) = %q, want image/gif", got)
+	// gif is not in the official output_format enum (png|jpeg|webp); it must
+	// fall back to png. jpg is an alias for jpeg.
+	if got := detectMediaType("gif", ""); got != "image/png" {
+		t.Errorf("detectMediaType(gif) = %q, want image/png", got)
 	}
 	if got := detectMediaType("jpg", ""); got != "image/jpeg" {
 		t.Errorf("detectMediaType(jpg) = %q, want image/jpeg", got)

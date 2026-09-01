@@ -37,6 +37,27 @@ import (
 	_ "github.com/zendev-sh/goai/provider/google"
 )
 
+// Bounds for reading untrusted HTTP response bodies. Success responses are
+// capped at 64 MiB; error bodies (used only to surface an error message) are
+// capped at 1 MiB to prevent a malicious server from exhausting memory.
+const (
+	maxVertexSuccessBodyBytes int64 = 64 << 20
+	maxVertexErrorBodyBytes   int64 = 1 << 20
+)
+
+// readSuccessBody reads a success response body, bounding it to
+// maxVertexSuccessBodyBytes and returning a clear error if the cap is exceeded.
+func readSuccessBody(reader io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, maxVertexSuccessBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxVertexSuccessBodyBytes {
+		return nil, fmt.Errorf("response body exceeds %d byte limit", maxVertexSuccessBodyBytes)
+	}
+	return data, nil
+}
+
 // Compile-time interface compliance checks.
 var (
 	_ provider.LanguageModel = (*chatModel)(nil)
@@ -366,7 +387,7 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readSuccessBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -428,17 +449,19 @@ func (m *chatModel) doHTTP(ctx context.Context, body map[string]any) (*http.Resp
 	req := httpc.MustNewRequest(ctx, "POST", url, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
 
-	if m.opts.tokenSource != nil {
-		if err := setAuth(ctx, req, m.opts.tokenSource); err != nil {
-			return nil, err
-		}
-	}
-
 	for k, v := range m.opts.headers {
 		req.Header.Set(k, v)
 	}
 	for k, v := range reqHeaders {
 		req.Header.Set(k, v)
+	}
+
+	// Set the credential last so it wins over any caller-supplied header
+	// named like the auth header.
+	if m.opts.tokenSource != nil {
+		if err := setAuth(ctx, req, m.opts.tokenSource); err != nil {
+			return nil, err
+		}
 	}
 
 	resp, err := m.httpClient().Do(req)
@@ -447,7 +470,7 @@ func (m *chatModel) doHTTP(ctx context.Context, body map[string]any) (*http.Resp
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxVertexErrorBodyBytes))
 		_ = resp.Body.Close()
 		return nil, goai.ParseHTTPErrorWithHeaders("vertex", resp.StatusCode, respBody, resp.Header)
 	}
@@ -493,15 +516,79 @@ func (m *chatModel) httpClient() *http.Client {
 // not understood by the OpenAI-compatible endpoint. These options (thinkingConfig,
 // etc.) are set by consumers for the native Google API but would cause 400 errors
 // when passed through to the OpenAI-compat wire format.
+//
+// thinkingConfig is translated to the OpenAI-compat reasoning_effort knob
+// (item #29) instead of being dropped, preserving the caller's intent to enable
+// reasoning at a given intensity.
 func stripGeminiProviderOptions(params *provider.GenerateParams) {
 	if params.ProviderOptions == nil {
 		return
 	}
 	// Copy to avoid mutating the caller's map.
 	params.ProviderOptions = maps.Clone(params.ProviderOptions)
-	// thinkingConfig is a Gemini-native concept -- the OpenAI-compat endpoint
-	// uses reasoning_effort instead (if supported).
-	delete(params.ProviderOptions, "thinkingConfig")
+	if tc, ok := params.ProviderOptions["thinkingConfig"]; ok {
+		delete(params.ProviderOptions, "thinkingConfig")
+		if budget, enabled, isDefault := thinkingBudget(tc); enabled {
+			if isDefault {
+				// Enabled with the model's default budget -- a meaningful
+				// reasoning level, not minimal.
+				params.ProviderOptions["reasoning_effort"] = "medium"
+			} else {
+				params.ProviderOptions["reasoning_effort"] = effortForBudget(budget)
+			}
+		}
+	}
+}
+
+// thinkingBudget extracts the numeric thinking budget from a Gemini
+// thinkingConfig value. enabled is false when thinking is explicitly disabled
+// (thinkingConfig: false) or the value is not a usable budget, in which case no
+// reasoning_effort is emitted. isDefault is true when thinking is enabled
+// without an explicit budget (thinkingConfig: true, or a map with no
+// thinkingBudget key).
+func thinkingBudget(tc any) (budget int, enabled, isDefault bool) {
+	switch v := tc.(type) {
+	case bool:
+		// true → enable with the model default budget; false → disabled.
+		return 0, v, true
+	case map[string]any:
+		b, ok := v["thinkingBudget"]
+		if !ok {
+			// Enabled with the model default budget.
+			return 0, true, true
+		}
+		switch n := b.(type) {
+		case float64:
+			return int(n), true, false
+		case int:
+			return n, true, false
+		case json.Number:
+			i, err := n.Int64()
+			if err != nil {
+				return 0, true, true
+			}
+			return int(i), true, false
+		}
+		return 0, true, true
+	default:
+		return 0, false, false
+	}
+}
+
+// effortForBudget maps a Gemini thinking budget (a token budget, typically in
+// the hundreds-to-thousands range) onto the closest OpenAI reasoning_effort
+// level. Tiny budgets (a few hundred tokens) mean minimal reasoning → "low";
+// Gemini 2.5 models default to an 8192-token budget, so budgets at or above
+// that are treated as "high".
+func effortForBudget(budget int) string {
+	switch {
+	case budget < 1024:
+		return "low"
+	case budget < 8192:
+		return "medium"
+	default:
+		return "high"
+	}
 }
 
 // jsonMarshalFunc is swappable for testing error paths.

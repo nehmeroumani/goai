@@ -55,6 +55,9 @@ fmt.Println(result.Text)
 | `WithBaseURL(url)` | `string` | Override the default `https://openrouter.ai/api/v1` endpoint |
 | `WithHeaders(h)` | `map[string]string` | Set additional HTTP headers |
 | `WithHTTPClient(c)` | `*http.Client` | Set a custom `*http.Client` |
+| `WithProviderRouting(prefs...)` | `...string` | Set provider routing preferences (e.g. `"Anthropic"`, `"Auto"`). Sent as the body `provider` field with the given order and fallbacks disabled. |
+| `WithRoute(route)` | `string` | Pin the request to a specific OpenRouter route (e.g. `"fallback"`). Sent as the body `route` field. |
+| `WithSessionID(id)` | `string` | Attach a session identifier for session-based pricing and analytics. Sent as the body `session_id` field. |
 
 ## Notes
 

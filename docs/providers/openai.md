@@ -145,6 +145,14 @@ if err != nil {
 fmt.Printf("Generated %d bytes\n", len(result.Images[0].Data))
 ```
 
+To request a specific output format (only `gpt-image-1` and later models):
+
+```go
+model := openai.Image("gpt-image-2",
+    openai.WithImageOutputFormat(openai.OutputFormatJPEG),
+)
+```
+
 ## API Routing
 
 All models use the Responses API (`/v1/responses`) by default. To force Chat Completions:
@@ -174,6 +182,8 @@ result, err := goai.GenerateText(ctx, model,
 | `WithHTTPClient(c)` | `*http.Client` | Custom HTTP client for proxies, logging, URL rewriting. |
 | `WithResponsesStreamIdleTimeout(d)` | `time.Duration` | Maximum wait for a complete Responses stream event. Default: `5m`; `0` disables the watchdog. |
 | `WithResponsesStreamDoneCompatibility(b)` | `bool` | Allow only a non-standard bare `[DONE]` terminal sentinel; event schema validation remains strict. Default: `false`. |
+| `WithImageOutputFormat(f)` | `openai.OutputFormat` | Set the image output format for the Images API (`png`, `jpeg`, or `webp`). Only `gpt-image-1` and later support it; `dall-e-3` ignores it. |
+| `WithUseMaxCompletionTokens(use)` | `bool` | Force `max_completion_tokens` instead of `max_tokens`. Needed when the wire model id is not the model id (e.g. Azure deployments); `nil` keeps the model-id heuristic. |
 
 ### Responses Stream Reliability
 
@@ -348,7 +358,7 @@ This pattern supports Copilot (URL rewrite + OAuth token swap) and Codex (URL re
 ## Notes
 
 - The embedding model supports up to 2048 values per batch call via `MaxValuesPerCall()`. `goai.EmbedMany` auto-chunks larger batches.
-- Image models `gpt-image-1`, `gpt-image-1-mini`, and `gpt-image-1.5` default to `b64_json` response format and reject an explicit `response_format` parameter. For older models like `dall-e-3`, the provider automatically sets `response_format` to `b64_json`.
+- Image models `gpt-image-1`, `gpt-image-1-mini`, `gpt-image-1.5`, `gpt-image-2`, and `gpt-image-2-2026-04-21` default to `b64_json` response format and reject an explicit `response_format` parameter. For older models like `dall-e-3`, the provider automatically sets `response_format` to `b64_json`.
 - Structured output uses `response_format` with `json_schema` for both APIs. The Responses API places it under `text.format`.
 - Per-request headers can be injected via `goai.WithHeaders(map[string]string{...})` for features like Codex session tracking.
 - **File upload**: OpenAI supports remote file upload via the Files API. Use `model.FileUploader()` to get a `provider.FileUploader` for uploading and deleting files. Uploaded files are referenced via `Part.RemoteRef` in messages. Compat providers map file parts to native OpenAI shapes (`file` for PDFs, `input_audio` for audio).

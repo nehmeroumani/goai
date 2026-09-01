@@ -39,15 +39,17 @@ func DoJSONRequest(ctx context.Context, cfg RequestConfig, parseError ErrorParse
 	req := MustNewRequest(ctx, "POST", cfg.URL, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
 
-	if cfg.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.Token)
-	}
-
 	for k, v := range cfg.Headers {
 		req.Header.Set(k, v)
 	}
 	for k, v := range reqHeaders {
 		req.Header.Set(k, v)
+	}
+
+	// Apply the configured credential LAST so neither cfg.Headers (WithHeaders)
+	// nor per-request _headers can override the Authorization header.
+	if cfg.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	}
 
 	client := cfg.HTTPClient
@@ -61,7 +63,7 @@ func DoJSONRequest(ctx context.Context, cfg RequestConfig, parseError ErrorParse
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 		return nil, parseError(cfg.ProviderID, resp.StatusCode, respBody, resp.Header)
 	}

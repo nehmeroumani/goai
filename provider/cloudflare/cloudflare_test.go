@@ -204,8 +204,13 @@ func TestWithHTTPClient(t *testing.T) {
 func TestCapabilities(t *testing.T) {
 	m := Chat("m", WithAPIKey("k"), WithAccountID("a"))
 	caps := provider.ModelCapabilitiesOf(m)
-	if !caps.Temperature || !caps.ToolCall {
+	if !caps.Temperature {
 		t.Error("unexpected capabilities")
+	}
+	// Workers AI tool-calling/json_schema support is model-dependent and not
+	// reliable, so ToolCall is advertised as false (item 50).
+	if caps.ToolCall {
+		t.Error("ToolCall should be false for Cloudflare Workers AI")
 	}
 }
 
