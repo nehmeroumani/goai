@@ -245,3 +245,4 @@ Embeddings use the InvokeModel API (not Converse) and share the same credentials
 - **Prompt caching**: When enabled, a `cachePoint` block is appended to the system prompt.
 - **Document handling**: PDF and other file attachments are sent as Bedrock document blocks. Filenames are sanitized to match AWS requirements (alphanumeric, hyphens, parentheses, brackets only; max 200 chars).
 - **Thinking + maxTokens**: When thinking is enabled for Anthropic models, the provider automatically adds `budgetTokens` to `maxTokens` (Bedrock requires `maxTokens >= budget_tokens`) and removes `temperature`, `topP`, and `topK` from the inference config.
+- **Guardrails & prompt variables**: `guardrailConfig` and `promptVariables` are forwarded as top-level Converse request fields via `goai.WithProviderOptions` (e.g. `map[string]any{"guardrailConfig": {...}, "promptVariables": {...}}`).

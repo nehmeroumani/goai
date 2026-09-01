@@ -137,6 +137,7 @@ result, err := goai.Embed(ctx, model, "Hello world",
     goai.WithEmbeddingProviderOptions(map[string]any{
         "google": map[string]any{
             "taskType":             "RETRIEVAL_DOCUMENT",
+            "title":                "My document title", // only valid for RETRIEVAL_DOCUMENT
             "outputDimensionality": 256,
         },
     }),
@@ -218,7 +219,6 @@ Google-specific options are nested under the `"google"` key:
 | `google.responseModalities` | `[]string` | Output modalities (e.g., `["TEXT", "IMAGE"]`). |
 | `google.mediaResolution` | `string` | Media resolution for input images/videos. |
 | `google.audioTimestamp` | `bool` | Enable audio timestamps in response. |
-| `google.labels` | `map[string]any` | Request labels for tracking. |
 | `google.imageConfig` | `map[string]any` | Gemini image config: `{aspectRatio, imageSize}`. |
 | `google.retrievalConfig` | `map[string]any` | Retrieval configuration for tool config. |
 | `google.toolConfig.includeServerSideToolInvocations` | `bool` | Include Gemini server-side tool calls/responses; other raw `toolConfig` fields are ignored. |
@@ -226,7 +226,7 @@ Google-specific options are nested under the `"google"` key:
 
 ## Provider Tools
 
-Four built-in tools are available via `google.Tools`.
+Five built-in tools are available via `google.Tools`.
 
 | Tool | Description | Execution |
 |------|-------------|-----------|
@@ -234,6 +234,7 @@ Four built-in tools are available via `google.Tools`.
 | `google.Tools.URLContext()` | Fetch and process URL content | Server-side |
 | `google.Tools.CodeExecution()` | Execute Python code in sandbox | Server-side |
 | `google.Tools.ComputerUse(opts...)` | Computer use with configurable environment/excluded functions | Server-side |
+| `google.Tools.FileSearch(opts...)` | File-based grounding (Vertex AI Search / uploaded files) | Server-side |
 
 ### GoogleSearch
 
@@ -287,6 +288,19 @@ result, err := goai.GenerateText(ctx, model,
 
 No configuration options. The model generates Python code, executes it server-side, and uses the output in its response.
 
+### FileSearch
+
+Grounds responses on a retrieval corpus (Vertex AI Search) or uploaded files.
+
+```go
+def := google.Tools.FileSearch(
+    google.WithDynamicThreshold(0.6),
+    google.WithCorpus("projects/.../corpora/my-corpus"),
+)
+```
+
+Options: `WithDynamicThreshold(t)` (0.0–1.0) and `WithCorpus(id)`.
+
 ## Notes
 
 - **Thinking/Reasoning**: Enabled by default for Gemini 2.5+ and 3.x models. Gemini 3.x models default to `thinkingLevel: "high"`. Gemma and Gemini 1.5/2.0 models do not support thinking. Set `google.thinkingConfig` to `false` in provider options to disable.
@@ -296,4 +310,4 @@ No configuration options. The model generates Python code, executes it server-si
 - **Role mapping**: `assistant` is mapped to `model`, and `tool` is mapped to `user` for function responses.
 - **Embedding batch limit**: 100 values per call via `batchEmbedContents`. `goai.EmbedMany` auto-chunks larger batches.
 - **Difference from Vertex**: This provider uses Google AI (`generativelanguage.googleapis.com`) with API-key auth. `vertex.Chat` uses Vertex's OpenAI-compatible transport by default and can opt into native Gemini `generateContent` with `vertex.WithNativeGemini()` plus OAuth/ADC. Native Vertex chat intentionally does not expose the Gemini Developer API file uploader.
-- **File upload**: Google Gemini supports remote file upload via the Files API. Use `model.FileUploader()` to get a `provider.FileUploader` for uploading and deleting files. Uploaded files are referenced via `Part.RemoteRef` in messages. Compat providers map file parts to native OpenAI shapes (`file` for PDFs, `input_audio` for audio).
+- **File upload**: Google Gemini supports remote file upload via the Files API, using the two-phase resumable upload protocol (`X-Goog-Upload-*`). Use `model.FileUploader()` to get a `provider.FileUploader` for uploading and deleting files. Uploaded files are referenced via `Part.RemoteRef` in messages. Compat providers map file parts to native OpenAI shapes (`file` for PDFs, `input_audio` for audio).

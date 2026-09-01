@@ -165,6 +165,6 @@ Image provider options (pass under the `"vertex"` key in `ImageParams.ProviderOp
 - With ADC or an explicit token source, `Chat` uses the Vertex AI OpenAI-compatible endpoint by default. `WithNativeGemini()` selects native `generateContent`; API keys are rejected in that mode. API-key fallback without native mode routes chat to `generativelanguage.googleapis.com`. Embeddings and image generation use native `:predict` endpoints (or the Gemini API equivalent with an API key).
 - `WithNativeGemini` and `WithNativeChatBaseURL` are Chat-only and are rejected by `Embedding`, `Image`, and `AnthropicChat`.
 - Tool schemas are automatically sanitized to comply with Gemini schema restrictions (no `additionalProperties`, enum values must be strings, etc.).
-- Gemini-native provider options like `thinkingConfig` are stripped before sending to the OpenAI-compatible endpoint.
+- Gemini-native provider options like `thinkingConfig` are translated to the OpenAI-compatible `reasoning_effort` knob (rather than dropped) before sending to the OpenAI-compatible endpoint.
 - The `ADCTokenSource(ctx context.Context, scopes ...string)` function is exported for direct use with other providers that need GCP credentials. It takes a `context.Context` and optional OAuth scopes, and returns `(provider.TokenSource, error)`.
 - Max embedding batch size: 250 values per call.

@@ -29,8 +29,8 @@ Environment variables (or pass the equivalent `With*` options):
 
 | Region   | Base URL                        |
 | -------- | ------------------------------- |
-| `global` | `https://mkp-api.fptcloud.com/v1` |
-| `jp`     | `https://mkp-api.fptcloud.jp/v1`  |
+| `global` | `https://mkp-api.fptcloud.com` |
+| `jp`     | `https://mkp-api.fptcloud.jp`  |
 
 Each region has its own model catalog — some models are only available in specific regions. Select the region that matches where you created your API key.
 

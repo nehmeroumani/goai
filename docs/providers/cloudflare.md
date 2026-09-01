@@ -89,4 +89,4 @@ Cloudflare Workers AI includes **10,000 Neurons/day free** (resets at 00:00 UTC)
 
 - The provider automatically constructs the URL `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions` (and `/embeddings`) from `CLOUDFLARE_ACCOUNT_ID`.
 - To route through [AI Gateway](https://developers.cloudflare.com/ai-gateway/), set `CLOUDFLARE_BASE_URL` or use `WithBaseURL`.
-- Tool calling is supported by most chat models; the provider forwards tools in the OpenAI-compatible format.
+- Tool calling and `json_schema` support are model-dependent on Workers AI, so the provider does not advertise tool-calling capability by default.
