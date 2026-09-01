@@ -173,8 +173,12 @@ func TestWithTokenSource(t *testing.T) {
 func TestCapabilities(t *testing.T) {
 	model := Chat("m", WithAPIKey("k"))
 	caps := provider.ModelCapabilitiesOf(model)
-	if !caps.Temperature || !caps.ToolCall {
+	if !caps.Temperature {
 		t.Error("unexpected capabilities")
+	}
+	// Sonar Chat Completions has no function calling, so ToolCall is false (item 56).
+	if caps.ToolCall {
+		t.Error("ToolCall should be false for Perplexity Sonar")
 	}
 }
 
@@ -382,5 +386,69 @@ func TestChat_PromptCachingIgnored(t *testing.T) {
 		t.Fatalf("DoStream unexpected error: %v", err)
 	}
 	for range streamResult.Stream {
+	}
+}
+
+// Item 55: Perplexity Sonar only accepts text/json_schema, so schema-less JSON
+// mode must be sent as a generic {"type":"json_schema","json_schema":{...}}.
+func TestChat_SchemaLessJSONModeUsesJsonSchema(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("sonar-pro", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages:       []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ResponseFormat: &provider.ResponseFormat{Name: "my_format"}, // no schema
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rf, ok := gotBody["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("response_format missing or wrong type: %v", gotBody["response_format"])
+	}
+	if rf["type"] != "json_schema" {
+		t.Errorf("response_format.type = %v, want json_schema", rf["type"])
+	}
+	if _, ok := rf["json_schema"].(map[string]any); !ok {
+		t.Errorf("json_schema missing or wrong type: %v", rf["json_schema"])
+	}
+}
+
+// Item 62: Perplexity web_search_options must be forwarded from ProviderOptions.
+func TestChat_ForwardsWebSearchOptions(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("sonar-pro", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ProviderOptions: map[string]any{
+			"web_search_options": map[string]any{"search_context_size": "high"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wso, ok := gotBody["web_search_options"].(map[string]any)
+	if !ok {
+		t.Fatalf("web_search_options missing or wrong type: %v", gotBody["web_search_options"])
+	}
+	if wso["search_context_size"] != "high" {
+		t.Errorf("search_context_size = %v, want high", wso["search_context_size"])
 	}
 }

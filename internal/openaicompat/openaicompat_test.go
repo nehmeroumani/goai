@@ -186,7 +186,7 @@ func TestConvertMessages_SystemAndUser(t *testing.T) {
 	msgs := []provider.Message{
 		{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hello"}}},
 	}
-	result := ConvertMessages(msgs, "You are helpful.")
+	result := ConvertMessagesWithConfig(msgs, "You are helpful.", MessagesConfig{})
 
 	if len(result) != 2 {
 		t.Fatalf("got %d messages, want 2", len(result))
@@ -211,7 +211,7 @@ func TestConvertMessages_ToolResults(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -234,7 +234,7 @@ func TestConvertMessages_AssistantWithToolCalls(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -259,7 +259,7 @@ func TestConvertMessages_UserWithImage(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -289,7 +289,7 @@ func TestConvertMessages_UserWithFile_InlineURL(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -334,7 +334,7 @@ func TestConvertMessages_UserWithFile_RemoteRef(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -386,7 +386,7 @@ func TestConvertMessages_UserWithFile_AudioFormats(t *testing.T) {
 				},
 			},
 		}
-		result := ConvertMessages(msgs, "")
+		result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{IncludeReasoningContent: true})
 		content, ok := result[0]["content"].([]map[string]any)
 		if !ok || len(content) != 1 {
 			t.Fatalf("%s: unexpected content %v", tc.mediaType, result[0]["content"])
@@ -416,7 +416,7 @@ func TestConvertMessages_UserWithFile_RemoteRefNoData(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
 	}
@@ -435,7 +435,7 @@ func TestConvertMessages_UserWithFile_NonDataURL(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
 	}
@@ -454,7 +454,7 @@ func TestConvertMessages_UserWithFile_PDFByURL(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	content, ok := result[0]["content"].([]map[string]any)
 	if !ok || len(content) != 1 {
 		t.Fatalf("unexpected content: %v", result[0]["content"])
@@ -481,7 +481,7 @@ func TestConvertMessages_UserWithFile_EmptyURL(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
 	}
@@ -502,7 +502,7 @@ func TestConvertMessages_UserWithFileAndImage(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -545,7 +545,7 @@ func TestConvertMessages_UserWithFileOnly(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
 	}
@@ -570,7 +570,7 @@ func TestConvertMessages_FileWithAssistantRole(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
 	}
@@ -585,7 +585,7 @@ func TestConvertMessages_FileWithSystemRole(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
 	}
@@ -600,7 +600,7 @@ func TestConvertMessages_FileWithToolRole(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
 	}
@@ -1229,7 +1229,7 @@ func TestConvertMessages_SystemInMessages(t *testing.T) {
 		{Role: provider.RoleSystem, Content: []provider.Part{{Type: provider.PartText, Text: "Be concise."}}},
 		{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hello"}}},
 	}
-	result := ConvertMessages(msgs, "You are helpful.")
+	result := ConvertMessagesWithConfig(msgs, "You are helpful.", MessagesConfig{})
 
 	// Should have: system (from param), system (from messages), user
 	if len(result) != 3 {
@@ -1250,7 +1250,7 @@ func TestConvertMessages_AssistantTextOnly(t *testing.T) {
 			{Type: provider.PartText, Text: "World"},
 		}},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if result[0]["content"] != "Hello\nWorld" {
 		t.Errorf("content = %v, want 'Hello\\nWorld'", result[0]["content"])
 	}
@@ -1526,7 +1526,7 @@ func TestConvertMessages_AssistantToolCallsNoText(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -1585,7 +1585,7 @@ func TestBF13_ImageURLDetail(t *testing.T) {
 			{Type: provider.PartImage, URL: "data:image/png;base64,abc", Detail: "high"},
 		}},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if len(result) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(result))
 	}
@@ -1614,7 +1614,7 @@ func TestBF13_ImageURLNoDetail(t *testing.T) {
 			{Type: provider.PartImage, URL: "data:image/png;base64,abc"},
 		}},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	content, ok := result[0]["content"].([]map[string]any)
 	if !ok {
 		t.Fatalf("content not array, got %T", result[0]["content"])
@@ -2799,7 +2799,7 @@ func TestConvertMessages_MultipleToolResults(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 2 {
 		t.Fatalf("got %d wire messages, want 2 (one per ToolResult part)", len(result))
@@ -2833,7 +2833,7 @@ func TestConvertMessages_EmptyContent(t *testing.T) {
 	msgs := []provider.Message{
 		{Role: provider.RoleUser, Content: []provider.Part{}},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	// A message with no parts still produces one wire message.
 	if len(result) != 1 {
@@ -2863,7 +2863,7 @@ func TestConvertMessages_ImageOnlyUser(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d wire messages, want 1", len(result))
@@ -2966,7 +2966,7 @@ func TestConvertMessages_ToolCallsNoText(t *testing.T) {
 		},
 	}
 
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if len(result) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(result))
 	}
@@ -3015,7 +3015,7 @@ func TestConvertMessages_AssistantReasoningRoundtrip(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{IncludeReasoningContent: true})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -3041,12 +3041,271 @@ func TestConvertMessages_AssistantReasoningRoundtrip(t *testing.T) {
 }
 
 func TestConvertMessages_ReasoningPolicyCanOmitNonStandardField(t *testing.T) {
-	result := ConvertMessages([]provider.Message{{
+	result := ConvertMessagesWithConfig([]provider.Message{{
 		Role:    provider.RoleAssistant,
 		Content: []provider.Part{{Type: provider.PartReasoning, Text: "think"}},
-	}}, "", false)
+	}}, "", MessagesConfig{IncludeReasoningContent: false})
 
 	if _, ok := result[0]["reasoning_content"]; ok {
 		t.Fatalf("reasoning_content = %v, want omitted", result[0]["reasoning_content"])
+	}
+}
+
+// Item 44: Fireworks emits {"type":"json_object","schema":{...}} instead of
+// {"type":"json_schema","json_schema":{...}}.
+func TestBuildRequest_JsonSchemaAsJsonObject(t *testing.T) {
+	params := provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ResponseFormat: &provider.ResponseFormat{
+			Name:   "test_schema",
+			Schema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}}}`),
+		},
+	}
+	body := BuildRequest(params, "gpt-4o", false, RequestConfig{JsonSchemaAsJsonObject: true})
+
+	rf, ok := body["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("response_format not set or wrong type: %T", body["response_format"])
+	}
+	if rf["type"] != "json_object" {
+		t.Errorf("response_format.type = %v, want json_object", rf["type"])
+	}
+	if _, ok := rf["schema"].(map[string]any); !ok {
+		t.Errorf("response_format.schema missing or wrong type: %v", rf["schema"])
+	}
+	if _, ok := rf["json_schema"]; ok {
+		t.Error("json_schema must not be emitted when JsonSchemaAsJsonObject is set")
+	}
+}
+
+// Item 55: Perplexity Sonar only accepts text/json_schema, so schema-less JSON
+// mode becomes a generic {"type":"json_schema","json_schema":{...}} object.
+func TestBuildRequest_JsonObjectAsJsonSchema(t *testing.T) {
+	params := provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		// No schema: would normally fall back to json_object.
+		ResponseFormat: &provider.ResponseFormat{Name: "my_format"},
+	}
+	body := BuildRequest(params, "gpt-4o", false, RequestConfig{JsonObjectAsJsonSchema: true})
+
+	rf, ok := body["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("response_format not set or wrong type: %T", body["response_format"])
+	}
+	if rf["type"] != "json_schema" {
+		t.Errorf("response_format.type = %v, want json_schema", rf["type"])
+	}
+	js, ok := rf["json_schema"].(map[string]any)
+	if !ok {
+		t.Fatalf("json_schema not set or wrong type: %T", rf["json_schema"])
+	}
+	if js["name"] != "my_format" {
+		t.Errorf("json_schema.name = %v, want my_format", js["name"])
+	}
+	if _, ok := js["schema"].(map[string]any); !ok {
+		t.Errorf("json_schema.schema missing or wrong type: %v", js["schema"])
+	}
+}
+
+// TestBuildRequest_JsonObjectAsJsonSchema_DefaultName verifies that when
+// JsonObjectAsJsonSchema is set and ResponseFormat.Name is empty, the emitted
+// json_schema name defaults to "json_schema" (openaicompat.go lines 244-246).
+func TestBuildRequest_JsonObjectAsJsonSchema_DefaultName(t *testing.T) {
+	params := provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		// Empty Name on purpose: exercises the default-name branch.
+		ResponseFormat: &provider.ResponseFormat{},
+	}
+	body := BuildRequest(params, "gpt-4o", false, RequestConfig{JsonObjectAsJsonSchema: true})
+
+	rf, ok := body["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("response_format not set or wrong type: %T", body["response_format"])
+	}
+	if rf["type"] != "json_schema" {
+		t.Errorf("response_format.type = %v, want json_schema", rf["type"])
+	}
+	js, ok := rf["json_schema"].(map[string]any)
+	if !ok {
+		t.Fatalf("json_schema not set or wrong type: %T", rf["json_schema"])
+	}
+	if js["name"] != "json_schema" {
+		t.Errorf("json_schema.name = %v, want default json_schema", js["name"])
+	}
+	if _, ok := js["schema"].(map[string]any); !ok {
+		t.Errorf("json_schema.schema missing or wrong type: %v", js["schema"])
+	}
+}
+
+// Item 57: the seed wire key is configurable (Mistral uses random_seed).
+func TestBuildRequest_SeedKey(t *testing.T) {
+	seed := 42
+	params := provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		Seed:     &seed,
+	}
+
+	// Default key is "seed".
+	defBody := BuildRequest(params, "gpt-4o", false, RequestConfig{})
+	if defBody["seed"] != 42 {
+		t.Errorf("seed = %v, want 42", defBody["seed"])
+	}
+
+	// Mistral overrides to "random_seed".
+	mistralBody := BuildRequest(params, "gpt-4o", false, RequestConfig{SeedKey: "random_seed"})
+	if mistralBody["random_seed"] != 42 {
+		t.Errorf("random_seed = %v, want 42", mistralBody["random_seed"])
+	}
+	if _, ok := mistralBody["seed"]; ok {
+		t.Error("seed must not be set when SeedKey is random_seed")
+	}
+}
+
+// Item 59: FlatInputFile makes PDF parts serialize as the flat
+// {"type":"input_file","file_data":...} shape (Requesty).
+func TestConvertMessages_FlatInputFile(t *testing.T) {
+	msgs := []provider.Message{{
+		Role: provider.RoleUser,
+		Content: []provider.Part{
+			{Type: provider.PartFile, URL: "data:application/pdf;base64,JVBERi0=", Filename: "doc.pdf", MediaType: "application/pdf"},
+		},
+	}}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{FlatInputFile: true})
+
+	content, ok := result[0]["content"].([]map[string]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("unexpected content: %v", result[0]["content"])
+	}
+	if content[0]["type"] != "input_file" {
+		t.Fatalf("part type = %v, want input_file", content[0]["type"])
+	}
+	if content[0]["file_data"] != "data:application/pdf;base64,JVBERi0=" {
+		t.Errorf("file_data = %v", content[0]["file_data"])
+	}
+	if _, ok := content[0]["file"]; ok {
+		t.Error("nested file object must not be emitted when FlatInputFile is set")
+	}
+}
+
+// Item 46: top-level prompt_cache_hit_tokens (Together/DeepInfra/DeepSeek) is
+// parsed into CacheReadTokens when prompt_tokens_details.cached_tokens is absent.
+func TestParseStream_TopLevelCacheHitTokens(t *testing.T) {
+	input := `data: {"choices":[{"delta":{"content":"hi"},"index":0}]}
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_cache_hit_tokens":60,"prompt_cache_miss_tokens":40}}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+	go ParseStream(t.Context(), scanner, out)
+
+	var finishChunk provider.StreamChunk
+	for chunk := range out {
+		if chunk.Type == provider.ChunkFinish {
+			finishChunk = chunk
+		}
+	}
+	if finishChunk.Usage.CacheReadTokens != 60 {
+		t.Errorf("CacheReadTokens = %d, want 60", finishChunk.Usage.CacheReadTokens)
+	}
+	if finishChunk.Usage.InputTokens != 40 {
+		t.Errorf("InputTokens = %d, want 40 (100-60)", finishChunk.Usage.InputTokens)
+	}
+}
+
+// Item 46: OpenRouter's top-level cached_tokens is parsed into CacheReadTokens.
+func TestParseStream_OpenRouterCachedTokens(t *testing.T) {
+	input := `data: {"choices":[{"delta":{"content":"hi"},"index":0}]}
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":90,"completion_tokens":10,"cached_tokens":50}}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+	go ParseStream(t.Context(), scanner, out)
+
+	var finishChunk provider.StreamChunk
+	for chunk := range out {
+		if chunk.Type == provider.ChunkFinish {
+			finishChunk = chunk
+		}
+	}
+	if finishChunk.Usage.CacheReadTokens != 50 {
+		t.Errorf("CacheReadTokens = %d, want 50", finishChunk.Usage.CacheReadTokens)
+	}
+	if finishChunk.Usage.InputTokens != 40 {
+		t.Errorf("InputTokens = %d, want 40 (90-50)", finishChunk.Usage.InputTokens)
+	}
+}
+
+// Item 46: non-streaming response top-level cache counters (DeepSeek).
+func TestParseResponse_TopLevelCacheHitTokens(t *testing.T) {
+	body := []byte(`{
+		"id": "x", "model": "deepseek-chat",
+		"choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+		"usage": {"prompt_tokens": 100, "completion_tokens": 10, "prompt_cache_hit_tokens": 70, "prompt_cache_miss_tokens": 30}
+	}`)
+	result, err := ParseResponse(body)
+	if err != nil {
+		t.Fatalf("ParseResponse error: %v", err)
+	}
+	if result.Usage.CacheReadTokens != 70 {
+		t.Errorf("CacheReadTokens = %d, want 70", result.Usage.CacheReadTokens)
+	}
+	if result.Usage.InputTokens != 30 {
+		t.Errorf("InputTokens = %d, want 30 (100-70)", result.Usage.InputTokens)
+	}
+}
+
+// Item 4: a complete JSON fragment arriving early must not finalize the tool
+// call. Only ONE ChunkToolCall is emitted, at the finish reason, with the full
+// accumulated arguments.
+func TestParseStream_NoPrematureToolCallFinalize(t *testing.T) {
+	input := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"main.go\"}"}}]},"index":0}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":",\"mode\":\"fast\"}"}}]},"index":0}]}
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+	go ParseStream(t.Context(), scanner, out)
+
+	var toolCalls []provider.StreamChunk
+	for chunk := range out {
+		if chunk.Type == provider.ChunkToolCall {
+			toolCalls = append(toolCalls, chunk)
+		}
+	}
+
+	if len(toolCalls) != 1 {
+		t.Fatalf("got %d ChunkToolCall chunks, want exactly 1 (finalized once at finish)", len(toolCalls))
+	}
+	// The first fragment was valid JSON on its own but more followed; the
+	// finalized call must carry the complete accumulated arguments, not the
+	// prematurely-finalized first fragment.
+	if toolCalls[0].ToolInput != `{"path":"main.go"},"mode":"fast"}` {
+		t.Errorf("final tool input = %q, want the full accumulated arguments", toolCalls[0].ToolInput)
+	}
+}
+
+// Item 4: a tool call that never receives a finish_reason is still finalized
+// once at stream end.
+func TestParseStream_ToolCallFinalizeOnStreamEnd(t *testing.T) {
+	input := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"main.go\"}"}}]},"index":0}]}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+	go ParseStream(t.Context(), scanner, out)
+
+	var toolCalls []provider.StreamChunk
+	for chunk := range out {
+		if chunk.Type == provider.ChunkToolCall {
+			toolCalls = append(toolCalls, chunk)
+		}
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("got %d ChunkToolCall chunks, want 1 (finalized at stream end)", len(toolCalls))
+	}
+	if toolCalls[0].ToolInput != `{"path":"main.go"}` {
+		t.Errorf("final tool input = %q, want {\"path\":\"main.go\"}", toolCalls[0].ToolInput)
 	}
 }

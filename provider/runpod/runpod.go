@@ -76,16 +76,18 @@ func Chat(endpointID, modelID string, opts ...Option) provider.LanguageModel {
 		}
 	}
 	return openaicompat.NewChatModel(openaicompat.ChatModelConfig{
-		ProviderID:           "runpod",
-		ModelID:              modelID,
-		BaseURL:              o.baseURL,
-		TokenSource:          o.tokenSource,
-		TokenRequired:        true,
-		Headers:              o.headers,
-		HTTPClient:           o.httpClient,
-		Capabilities:         chatCaps,
-		IncludeStreamOptions: true,
-		WarnPromptCaching:    true,
+		ProviderID:        "runpod",
+		ModelID:           modelID,
+		BaseURL:           o.baseURL,
+		TokenSource:       o.tokenSource,
+		TokenRequired:     true,
+		Headers:           o.headers,
+		HTTPClient:        o.httpClient,
+		Capabilities:      chatCaps,
+		WarnPromptCaching: true,
+		RequestConfig: openaicompat.RequestConfig{
+			IncludeStreamOptions: true,
+		},
 	})
 }
 

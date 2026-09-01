@@ -47,6 +47,7 @@ type options struct {
 	httpClient                 *http.Client
 	apiVersion                 string
 	useDeploymentBasedURLs     bool
+	useMaxCompletionTokens     bool
 	responsesStreamIdleTimeout time.Duration
 	responsesStreamAllowDone   bool
 }
@@ -147,6 +148,20 @@ func WithDeploymentBasedURLs(enabled bool) Option {
 	}
 }
 
+// WithUseMaxCompletionTokens forces Chat Completions requests to send
+// max_completion_tokens instead of max_tokens (item #7).
+//
+// Reasoning models (gpt-5, o-series, codex) reject max_tokens outright
+// ("Unsupported parameter: 'max_tokens'") and require max_completion_tokens.
+// The OpenAI layer normally infers this from the model id, but on Azure the id
+// is the deployment name, which usually does not match the reasoning-model
+// heuristic. Enable this for deployments of reasoning models.
+func WithUseMaxCompletionTokens(enabled bool) Option {
+	return func(o *options) {
+		o.useMaxCompletionTokens = enabled
+	}
+}
+
 // resolveOptions applies defaults and environment variable fallbacks.
 func resolveOptions(o *options) {
 	// Resolve endpoint from env if not set.
@@ -236,6 +251,14 @@ func Chat(modelID string, opts ...Option) provider.LanguageModel {
 		openai.WithResponsesStreamDoneCompatibility(o.responsesStreamAllowDone),
 		// Use a placeholder base URL -- azureRoundTripper rewrites it.
 		openai.WithBaseURL("https://azure-placeholder"),
+	}
+	// Reasoning deployments (gpt-5, o-series, codex) reject max_tokens and
+	// require max_completion_tokens. The deployment name defeats the OpenAI
+	// layer's IsReasoningModel heuristic, so when the caller opted in via
+	// WithUseMaxCompletionTokens we thread the flag through to the shared
+	// openaicompat codec instead of rewriting the body in the transport.
+	if o.useMaxCompletionTokens {
+		openaiOpts = append(openaiOpts, openai.WithUseMaxCompletionTokens(true))
 	}
 
 	model := openai.Chat(modelID, openaiOpts...)
@@ -450,8 +473,16 @@ func (t *aiServicesRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 	q.Set("api-version", t.apiVersion)
 	newReq.URL.RawQuery = q.Encode()
 
+	// Inject custom headers first so the Azure credential below is applied
+	// last and wins. Applying them after auth would let a caller's
+	// WithHeaders({"api-key": ...}) override the configured Azure key.
+	for k, v := range t.headers {
+		newReq.Header.Set(k, v)
+	}
+
 	// Replace OpenAI auth with Azure auth.
 	newReq.Header.Del("Authorization")
+	newReq.Header.Del("api-key")
 	if t.apiKey != "" {
 		newReq.Header.Set("api-key", t.apiKey)
 	} else if t.tokenSource != nil {
@@ -460,11 +491,6 @@ func (t *aiServicesRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 			return nil, fmt.Errorf("azure: resolving auth token: %w", err)
 		}
 		newReq.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	// Inject custom headers.
-	for k, v := range t.headers {
-		newReq.Header.Set(k, v)
 	}
 
 	return t.base.RoundTrip(newReq)
@@ -559,9 +585,17 @@ func (t *azureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	newReq.URL = parsed
 	newReq.Host = parsed.Host
 
+	// Inject Azure-specific headers first so the Azure credential below is
+	// applied last and wins. Applying them after auth would let a caller's
+	// WithHeaders({"api-key": ...}) override the configured Azure key.
+	for k, v := range t.headers {
+		newReq.Header.Set(k, v)
+	}
+
 	// Replace OpenAI auth with Azure auth.
 	// API key uses Azure's api-key header; TokenSource uses Bearer (Managed Identity, etc.).
 	newReq.Header.Del("Authorization")
+	newReq.Header.Del("api-key")
 	if t.apiKey != "" {
 		newReq.Header.Set("api-key", t.apiKey)
 	} else if t.tokenSource != nil {
@@ -570,11 +604,6 @@ func (t *azureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 			return nil, fmt.Errorf("azure: resolving auth token: %w", tokenErr)
 		}
 		newReq.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	// Inject Azure-specific headers.
-	for k, v := range t.headers {
-		newReq.Header.Set(k, v)
 	}
 
 	return t.base.RoundTrip(newReq)

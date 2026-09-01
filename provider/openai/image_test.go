@@ -3,12 +3,16 @@ package openai
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/provider"
 )
 
@@ -167,6 +171,26 @@ func TestImage_WithHeaders(t *testing.T) {
 	}
 }
 
+// A caller-supplied header named "Authorization" must NOT override the real
+// credential: auth is applied last, so it wins.
+func TestImage_AuthHeaderCannotBeOverridden(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("img"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Errorf("Authorization = %q, want %q (caller header must not win)", got, "Bearer test-key")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"data":[{"b64_json":"%s"}]}`, encoded)
+	}))
+	defer server.Close()
+
+	model := Image("dall-e-3", WithAPIKey("test-key"), WithBaseURL(server.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer attacker"}))
+	if _, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "test", N: 1}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestImage_WithHTTPClient(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString([]byte("img"))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -218,5 +242,304 @@ func TestImage_EnvVarNotOverrideExplicit(t *testing.T) {
 	im := m.(*imageModel)
 	if im.opts.baseURL != "https://explicit.url" {
 		t.Errorf("baseURL = %q", im.opts.baseURL)
+	}
+}
+
+// --- Item 1: gpt-image-2 must NOT receive a response_format field ---
+
+func TestHasDefaultResponseFormat_GPTImage2(t *testing.T) {
+	for _, model := range []string{"gpt-image-2", "gpt-image-2-2026-04-21"} {
+		if !hasDefaultResponseFormat(model) {
+			t.Errorf("hasDefaultResponseFormat(%q) = false, want true", model)
+		}
+	}
+}
+
+// Request direction: full golden body for gpt-image-2 — no response_format.
+func TestImage_GPTImage2_GoldenRequest(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("img"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertImageRequestBody(t, r, map[string]any{
+			"model":  "gpt-image-2",
+			"prompt": "test",
+			"n":      float64(1),
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"data":[{"b64_json":"%s"}]}`, encoded)
+	}))
+	defer server.Close()
+
+	model := Image("gpt-image-2", WithAPIKey("k"), WithBaseURL(server.URL))
+	if _, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "test", N: 1}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Response direction: gpt-image-2 b64_json fixture parses correctly.
+func TestImage_GPTImage2_ResponseParsed(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("gpt-image-2-png"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"data":[{"b64_json":"%s","revised_prompt":"improved"}]}`, encoded)
+	}))
+	defer server.Close()
+
+	model := Image("gpt-image-2-2026-04-21", WithAPIKey("k"), WithBaseURL(server.URL))
+	result, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "test", N: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Images) != 1 {
+		t.Fatalf("images = %d, want 1", len(result.Images))
+	}
+	if string(result.Images[0].Data) != "gpt-image-2-png" {
+		t.Errorf("data = %q", result.Images[0].Data)
+	}
+	if result.Images[0].MediaType != "image/png" {
+		t.Errorf("media type = %q, want image/png", result.Images[0].MediaType)
+	}
+	if got := result.ProviderMetadata["openai"]["images"].([]map[string]any)[0]["revisedPrompt"]; got != "improved" {
+		t.Errorf("revisedPrompt = %v", got)
+	}
+}
+
+// --- Item 2: zero-value n must not be sent ---
+
+// Request direction: golden body confirms n is absent when zero-valued.
+func TestImage_ZeroN_NotSent(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("img"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertImageRequestBody(t, r, map[string]any{
+			"model":           "dall-e-3",
+			"prompt":          "test",
+			"response_format": "b64_json",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"data":[{"b64_json":"%s"}]}`, encoded)
+	}))
+	defer server.Close()
+
+	model := Image("dall-e-3", WithAPIKey("k"), WithBaseURL(server.URL))
+	if _, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "test"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Request direction: golden body confirms n is sent only when N>0.
+func TestImage_PositiveN_Sent(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("img"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertImageRequestBody(t, r, map[string]any{
+			"model":           "dall-e-3",
+			"prompt":          "test",
+			"n":               float64(3),
+			"response_format": "b64_json",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"data":[{"b64_json":"%s"}]}`, encoded)
+	}))
+	defer server.Close()
+
+	model := Image("dall-e-3", WithAPIKey("k"), WithBaseURL(server.URL))
+	if _, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "test", N: 3}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// --- Item 3: typed output_format option + detectMediaType restricted ---
+
+// Request direction: golden body confirms output_format is sent via the typed
+// option (gpt-image-1 defaults to b64_json, so no response_format).
+func TestImage_WithImageOutputFormat(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("img"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertImageRequestBody(t, r, map[string]any{
+			"model":         "gpt-image-1",
+			"prompt":        "test",
+			"n":             float64(1),
+			"output_format": "webp",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"data":[{"b64_json":"%s"}]}`, encoded)
+	}))
+	defer server.Close()
+
+	model := Image("gpt-image-1", WithAPIKey("k"), WithBaseURL(server.URL), WithImageOutputFormat(OutputFormatWebP))
+	if _, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "test", N: 1}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Request direction: golden body confirms output_format is absent by default.
+func TestImage_WithoutOutputFormat_NotSent(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("img"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertImageRequestBody(t, r, map[string]any{
+			"model":           "dall-e-3",
+			"prompt":          "test",
+			"n":               float64(1),
+			"response_format": "b64_json",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"data":[{"b64_json":"%s"}]}`, encoded)
+	}))
+	defer server.Close()
+
+	model := Image("dall-e-3", WithAPIKey("k"), WithBaseURL(server.URL))
+	if _, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "test", N: 1}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Unit direction: detectMediaType restricted to png/jpeg/webp, falling back to
+// png for anything outside the enum.
+func TestDetectMediaType(t *testing.T) {
+	cases := []struct {
+		name   string
+		format string
+		want   string
+	}{
+		{"png", "png", "image/png"},
+		{"jpeg", "jpeg", "image/jpeg"},
+		{"jpg alias", "jpg", "image/jpeg"},
+		{"webp", "webp", "image/webp"},
+		// gif is not in the official output_format enum; must fall back to png.
+		{"gif unsupported", "gif", "image/png"},
+		{"empty", "", "image/png"},
+		{"unknown", "avif", "image/png"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := detectMediaType(tc.format, ""); got != tc.want {
+				t.Errorf("detectMediaType(%q) = %q, want %q", tc.format, got, tc.want)
+			}
+		})
+	}
+}
+
+// Response direction for Item 3: the output_format echoed by the server drives
+// the parsed ImageData.MediaType, restricted to png/jpeg/webp.
+func TestImage_ResponseOutputFormat_MediaType(t *testing.T) {
+	cases := []struct {
+		name         string
+		outputFormat string // emitted as top-level "output_format" in the fixture
+		wantMedia    string
+	}{
+		{"png", "png", "image/png"},
+		{"jpeg", "jpeg", "image/jpeg"},
+		{"webp", "webp", "image/webp"},
+		{"absent defaults to png", "", "image/png"},
+		{"unsupported falls back to png", "gif", "image/png"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded := base64.StdEncoding.EncodeToString([]byte("img-" + tc.name))
+			fixture := fmt.Sprintf(`{"data":[{"b64_json":"%s"}]}`, encoded)
+			if tc.outputFormat != "" {
+				fixture = fmt.Sprintf(`{"data":[{"b64_json":"%s"}],"output_format":%q}`, encoded, tc.outputFormat)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, fixture)
+			}))
+			defer server.Close()
+
+			model := Image("gpt-image-1", WithAPIKey("k"), WithBaseURL(server.URL))
+			result, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "test", N: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Images) != 1 {
+				t.Fatalf("images = %d, want 1", len(result.Images))
+			}
+			if result.Images[0].MediaType != tc.wantMedia {
+				t.Errorf("MediaType = %q, want %q", result.Images[0].MediaType, tc.wantMedia)
+			}
+		})
+	}
+}
+
+// TestImage_ResponseBodyOverCap verifies the success-path bounded read: a
+// response body larger than maxImageResponseBytes is rejected instead of being
+// read fully into memory.
+func TestImage_ResponseBodyOverCap(t *testing.T) {
+	transport := &fixedBodyTransport{body: io.NopCloser(io.LimitReader(zeroReader{}, maxImageResponseBytes+2))}
+	client := &http.Client{Transport: transport}
+	model := Image("dall-e-3", WithAPIKey("k"), WithBaseURL("http://fake"), WithHTTPClient(client))
+	_, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "test", N: 1})
+	if err == nil {
+		t.Fatal("expected error for oversized response body")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want an 'exceeds' over-cap error", err)
+	}
+}
+
+// TestImage_ErrorBodyBounded verifies the error-path bounded read: an error
+// response body larger than maxImageErrorBytes is truncated, so the tail marker
+// never reaches the extracted error message.
+func TestImage_ErrorBodyBounded(t *testing.T) {
+	const tailMarker = "TAIL-MARKER-SHOULD-NOT-APPEAR"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.Copy(w, io.MultiReader(
+			strings.NewReader(`{"error":{"message":"`),
+			io.LimitReader(zeroReader{}, int64(maxImageErrorBytes+len(tailMarker))),
+			strings.NewReader(tailMarker),
+		))
+	}))
+	defer server.Close()
+
+	model := Image("dall-e-3", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "test", N: 1})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *goai.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *goai.APIError", err)
+	}
+	if strings.Contains(apiErr.Message, tailMarker) {
+		t.Errorf("error message contains tail marker; error body was not bounded: %q", apiErr.Message)
+	}
+}
+
+// zeroReader yields an endless stream of zero bytes without allocating.
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
+}
+
+// fixedBodyTransport returns a canned 200 response with the given body.
+type fixedBodyTransport struct {
+	body io.ReadCloser
+}
+
+func (t *fixedBodyTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       t.body,
+		Header:     make(http.Header),
+	}, nil
+}
+
+// assertImageRequestBody asserts the outgoing /images/generations request body
+// matches want exactly (golden full-body check).
+func assertImageRequestBody(t *testing.T, r *http.Request, want map[string]any) {
+	t.Helper()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("reading request body: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decoding request body %q: %v", body, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("request body mismatch\n got: %v\nwant: %v", got, want)
 	}
 }

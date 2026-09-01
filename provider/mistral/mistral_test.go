@@ -384,3 +384,69 @@ func TestChat_PromptCachingIgnored(t *testing.T) {
 	for range streamResult.Stream {
 	}
 }
+
+// Item 57: Mistral uses random_seed, not seed, for the seed parameter.
+func TestChat_UsesRandomSeed(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	seed := 42
+	model := Chat("mistral-large-latest", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		Seed:     &seed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotBody["random_seed"] != float64(42) {
+		t.Errorf("random_seed = %v, want 42", gotBody["random_seed"])
+	}
+	if _, ok := gotBody["seed"]; ok {
+		t.Error("seed must not be sent for Mistral")
+	}
+}
+
+// Item 60: mistral opts into IncludeReasoningContent, so an assistant message
+// carrying a reasoning part must serialize reasoning_content on the outgoing
+// request body.
+func TestChat_RoundTripsReasoningContent(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("mistral-large-latest", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{
+			Role: provider.RoleAssistant,
+			Content: []provider.Part{
+				{Type: provider.PartReasoning, Text: "let me think"},
+				{Type: provider.PartText, Text: "answer"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, ok := gotBody["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("messages = %v", gotBody["messages"])
+	}
+	assistant := msgs[0].(map[string]any)
+	if assistant["reasoning_content"] != "let me think" {
+		t.Errorf("reasoning_content = %v, want 'let me think'", assistant["reasoning_content"])
+	}
+}

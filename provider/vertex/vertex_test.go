@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -482,6 +483,35 @@ func (tr *urlCapturingTransport) RoundTrip(req *http.Request) (*http.Response, e
 	}, nil
 }
 
+func TestAuthHeaderWinsOverWithHeaders(t *testing.T) {
+	// A caller-supplied WithHeaders header named like the auth header must
+	// NOT override the real credential on the chat doHTTP path.
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-pro",
+		WithTokenSource(provider.StaticToken("real-token")),
+		WithBaseURL(server.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer spoofed-token"}),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer real-token" {
+		t.Errorf("Authorization = %q, want %q (credential must win over WithHeaders)", gotAuth, "Bearer real-token")
+	}
+}
+
 func TestRequestHeaders(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Request-Header") != "from-params" {
@@ -727,7 +757,7 @@ func TestAutoTokenSource_HasProjectUsesADC(t *testing.T) {
 	}
 }
 
-func TestStripGeminiProviderOptions_RemovesThinkingConfig(t *testing.T) {
+func TestStripGeminiProviderOptions_MapsThinkingConfigToReasoningEffort(t *testing.T) {
 	params := &provider.GenerateParams{
 		ProviderOptions: map[string]any{
 			"thinkingConfig": map[string]any{"thinkingBudget": 1024},
@@ -738,14 +768,149 @@ func TestStripGeminiProviderOptions_RemovesThinkingConfig(t *testing.T) {
 	if _, ok := params.ProviderOptions["thinkingConfig"]; ok {
 		t.Error("expected thinkingConfig to be removed")
 	}
+	// Budget 1024 (< 8192) maps to medium.
+	if got := params.ProviderOptions["reasoning_effort"]; got != "medium" {
+		t.Errorf("reasoning_effort = %v, want medium", got)
+	}
 	if _, ok := params.ProviderOptions["otherOption"]; !ok {
 		t.Error("expected otherOption to be kept")
+	}
+}
+
+func TestStripGeminiProviderOptions_ThinkingBudgetBuckets(t *testing.T) {
+	cases := []struct {
+		name   string
+		tc     any
+		want   string
+		hasEff bool
+	}{
+		{"zero budget -> low", map[string]any{"thinkingBudget": 0}, "low", true},
+		{"small budget -> low", map[string]any{"thinkingBudget": 64}, "low", true},
+		{"medium budget -> medium", map[string]any{"thinkingBudget": 4096}, "medium", true},
+		{"default budget -> high", map[string]any{"thinkingBudget": 8192}, "high", true},
+		{"large budget -> high", map[string]any{"thinkingBudget": 98304}, "high", true},
+		{"no budget key -> default medium", map[string]any{}, "medium", true},
+		{"float budget", map[string]any{"thinkingBudget": float64(4096)}, "medium", true},
+		{"json.Number budget", map[string]any{"thinkingBudget": json.Number("4096")}, "medium", true},
+		{"json.Number invalid -> default", map[string]any{"thinkingBudget": json.Number("abc")}, "medium", true},
+		{"string budget -> default", map[string]any{"thinkingBudget": "abc"}, "medium", true},
+		{"bool true -> default medium", true, "medium", true},
+		{"bool false -> disabled", false, "", false},
+		{"unrecognized -> disabled", "nonsense", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			params := &provider.GenerateParams{
+				ProviderOptions: map[string]any{"thinkingConfig": tc.tc},
+			}
+			stripGeminiProviderOptions(params)
+			got, ok := params.ProviderOptions["reasoning_effort"]
+			if ok != tc.hasEff {
+				t.Fatalf("reasoning_effort present = %v, want %v", ok, tc.hasEff)
+			}
+			if tc.hasEff && got != tc.want {
+				t.Errorf("reasoning_effort = %v, want %v", got, tc.want)
+			}
+			if _, stillThere := params.ProviderOptions["thinkingConfig"]; stillThere {
+				t.Error("thinkingConfig should always be removed")
+			}
+		})
 	}
 }
 
 func TestStripGeminiProviderOptions_NilOptions(t *testing.T) {
 	params := &provider.GenerateParams{}
 	stripGeminiProviderOptions(params) // should not panic
+}
+
+// TestChat_ThinkingConfigMapsToReasoningEffortOnWire is a golden full-body
+// REQUEST contract test (item #29): a caller passing Gemini-native
+// thinkingConfig in ProviderOptions must see it stripped from the outgoing
+// OpenAI-compat body and translated to the reasoning_effort knob, so the
+// OpenAI-compatible Vertex endpoint receives a schema it understands.
+func TestChat_ThinkingConfigMapsToReasoningEffortOnWire(t *testing.T) {
+	var capturedBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		capturedBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-pro", WithTokenSource(provider.StaticToken("tok")), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		ProviderOptions: map[string]any{
+			"thinkingConfig": map[string]any{"thinkingBudget": 4096},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(capturedBody), &got); err != nil {
+		t.Fatalf("captured body not JSON: %v (%q)", err, capturedBody)
+	}
+	// thinkingConfig must be gone, reasoning_effort present (4096 < 8192 → medium).
+	if _, ok := got["thinkingConfig"]; ok {
+		t.Error("thinkingConfig must not be sent to the OpenAI-compat endpoint")
+	}
+	if got["reasoning_effort"] != "medium" {
+		t.Errorf("reasoning_effort = %v, want medium", got["reasoning_effort"])
+	}
+	// Golden full-body assertion: only the OpenAI-compat keys, nothing leaked.
+	want := map[string]any{
+		"model":            "google/gemini-2.5-pro",
+		"stream":           false,
+		"messages":         []any{map[string]any{"role": "user", "content": "hi"}},
+		"reasoning_effort": "medium",
+	}
+	if !reflect.DeepEqual(got, want) {
+		gotJSON, _ := json.Marshal(got)
+		wantJSON, _ := json.Marshal(want)
+		t.Errorf("request body mismatch:\n got: %s\nwant: %s", gotJSON, wantJSON)
+	}
+}
+
+// TestChat_ThinkingConfigDisabledOmitsReasoningEffort verifies that a
+// thinkingConfig:false (disabled) does not emit reasoning_effort at all.
+func TestChat_ThinkingConfigDisabledOmitsReasoningEffort(t *testing.T) {
+	var capturedBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		capturedBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-pro", WithTokenSource(provider.StaticToken("tok")), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		ProviderOptions: map[string]any{
+			"thinkingConfig": false,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(capturedBody), &got); err != nil {
+		t.Fatalf("captured body not JSON: %v (%q)", err, capturedBody)
+	}
+	if _, ok := got["reasoning_effort"]; ok {
+		t.Error("reasoning_effort must not be emitted when thinking is disabled")
+	}
+	if _, ok := got["thinkingConfig"]; ok {
+		t.Error("thinkingConfig must be stripped")
+	}
 }
 
 func TestSanitizeToolSchemas_CleansTool(t *testing.T) {

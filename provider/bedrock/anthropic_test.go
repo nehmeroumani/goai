@@ -154,32 +154,61 @@ func TestAnthropicChat_GenerateRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAnthropicChat_StreamServerToolRoundTrip exercises streaming with
-// EventStream → SSE translation, end-to-end with the anthropic provider's
-// server-tool capture path.
-func TestAnthropicChat_StreamServerToolRoundTrip(t *testing.T) {
-	// Each "event" frame's payload is {"bytes": <base64 of anthropic SSE event JSON>}.
-	emitFrame := func(w io.Writer, anthropicEvent string) {
-		inner, _ := json.Marshal(map[string]any{"bytes": []byte(anthropicEvent)})
-		w.Write(buildEventStreamFrame("messageStart", inner))
+// TestAnthropicChat_RejectsUnsupportedServerTools verifies that Anthropic
+// server-executed tools that AWS Bedrock does not support (web_search,
+// code_execution, web_fetch) are rejected up-front with a clear error instead
+// of being forwarded (which Bedrock rejects opaquely).
+func TestAnthropicChat_RejectsUnsupportedServerTools(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  string
+	}{
+		{"web_search_20250305", "web_search_20250305"},
+		{"web_search_20260209", "web_search_20260209"},
+		{"web_fetch_20260209", "web_fetch_20260209"},
+		{"code_execution_20250522", "code_execution_20250522"},
+		{"code_execution_20250825", "code_execution_20250825"},
+		{"code_execution_20260120", "code_execution_20260120"},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			model := AnthropicChat("test-model.v1:0",
+				WithAccessKey("AKIA00000000"),
+				WithSecretKey("testsecret"),
+				WithRegion("us-east-1"),
+				WithBaseURL("http://should-not-be-hit.invalid"),
+			)
+			_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+				Messages: []provider.Message{
+					{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+				},
+				Tools: []provider.ToolDefinition{
+					{Name: tc.name, ProviderDefinedType: tc.typ},
+				},
+			})
+			if err == nil {
+				t.Fatal("expected error for unsupported server tool, got nil")
+			}
+			if !strings.Contains(err.Error(), "not supported on AWS Bedrock") {
+				t.Errorf("error = %q, want substring 'not supported on AWS Bedrock'", err.Error())
+			}
+		})
+	}
+}
+
+// TestAnthropicChat_AllowsSupportedServerTools confirms that Bedrock-supported
+// server tools (computer-use) are NOT rejected and reach the wire.
+func TestAnthropicChat_AllowsSupportedServerTools(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/invoke-with-response-stream") {
-			t.Errorf("path = %q, want streaming suffix", r.URL.Path)
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		tools, _ := req["tools"].([]any)
+		if len(tools) != 1 {
+			t.Errorf("tools = %v, want 1 entry", tools)
 		}
-		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
-		flusher, _ := w.(http.Flusher)
-		emitFrame(w, `{"type":"message_start","message":{"id":"m1","model":"test","usage":{"input_tokens":5}}}`)
-		emitFrame(w, `{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search"}}`)
-		emitFrame(w, `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"go\"}"}}`)
-		emitFrame(w, `{"type":"content_block_stop","index":0}`)
-		emitFrame(w, `{"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","url":"https://go.dev","title":"Go"}]}}`)
-		emitFrame(w, `{"type":"content_block_stop","index":1}`)
-		emitFrame(w, `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}`)
-		emitFrame(w, `{"type":"message_stop"}`)
-		if flusher != nil {
-			flusher.Flush()
-		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"m","model":"t","type":"message","content":[{"type":"text","text":""}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":0}}`)
 	}))
 	defer server.Close()
 
@@ -189,29 +218,16 @@ func TestAnthropicChat_StreamServerToolRoundTrip(t *testing.T) {
 		WithRegion("us-east-1"),
 		WithBaseURL(server.URL),
 	)
-	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
 		Messages: []provider.Message{
-			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "search"}}},
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		Tools: []provider.ToolDefinition{
+			{Name: "computer", ProviderDefinedType: "computer_20241022"},
 		},
 	})
 	if err != nil {
-		t.Fatalf("DoStream: %v", err)
-	}
-	var sawCall provider.StreamChunk
-	for chunk := range result.Stream {
-		if chunk.Type == provider.ChunkToolCall {
-			sawCall = chunk
-		}
-	}
-	if sawCall.ToolCallID != "srvtoolu_1" {
-		t.Fatalf("ChunkToolCall ID = %q, want srvtoolu_1", sawCall.ToolCallID)
-	}
-	rb, ok := sawCall.Metadata["resultBlock"].(map[string]any)
-	if !ok {
-		t.Fatalf("resultBlock missing: %v", sawCall.Metadata)
-	}
-	if rb["type"] != "web_search_tool_result" {
-		t.Errorf("resultBlock type = %v, want web_search_tool_result", rb["type"])
+		t.Fatalf("DoGenerate: %v", err)
 	}
 }
 
@@ -232,9 +248,11 @@ func TestAnthropicChat_BetaFolding(t *testing.T) {
 	defer server.Close()
 
 	// Anthropic provider injects "claude-code-20250219,interleaved-thinking-2025-05-14"
-	// as base betas. Tools that emit additional betas (web_search, etc.) get
+	// as base betas. Tools that emit additional betas (computer-use, etc.) get
 	// merged in. The transport should drop unsupported flags and keep the
-	// supported ones in the body.
+	// supported ones in the body. (web_search is rejected on Bedrock — see
+	// TestAnthropicChat_RejectsUnsupportedServerTools — so we use a supported
+	// computer-use tool here to exercise beta folding.)
 	model := AnthropicChat("test-model.v1:0",
 		WithAccessKey("AKIA00000000"),
 		WithSecretKey("testsecret"),
@@ -246,24 +264,24 @@ func TestAnthropicChat_BetaFolding(t *testing.T) {
 			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
 		},
 		Tools: []provider.ToolDefinition{
-			{Name: "web_search", ProviderDefinedType: "web_search_20250305"},
+			{Name: "computer", ProviderDefinedType: "computer_20241022"},
 		},
 	})
 	if err != nil {
 		t.Fatalf("DoGenerate: %v", err)
 	}
 	betas, _ := capturedBody["anthropic_beta"].([]any)
-	var hasWebSearch bool
+	var hasComputerUse bool
 	for _, b := range betas {
-		if b == "web-search-2025-03-05" {
-			hasWebSearch = true
+		if b == "computer-use-2024-10-22" {
+			hasComputerUse = true
 		}
 		if b == "claude-code-20250219" || b == "interleaved-thinking-2025-05-14" {
 			t.Errorf("unsupported beta leaked into body: %v", b)
 		}
 	}
-	if !hasWebSearch {
-		t.Errorf("web-search beta missing from body: %v", betas)
+	if !hasComputerUse {
+		t.Errorf("computer-use beta missing from body: %v", betas)
 	}
 }
 
@@ -563,3 +581,19 @@ type trackingReadCloser struct {
 
 func (t *trackingReadCloser) Read(p []byte) (int, error) { return t.src.Read(p) }
 func (t *trackingReadCloser) Close() error               { t.closed = true; return nil }
+
+// TestRejectUnsupportedServerTools_SkipsNonMapElements covers the branch in
+// rejectUnsupportedServerTools where a tools element is NOT a map[string]any
+// (lines 227-228): it is skipped via continue, and no error is returned even
+// though a non-map element precedes a supported map element.
+func TestRejectUnsupportedServerTools_SkipsNonMapElements(t *testing.T) {
+	body := map[string]any{
+		"tools": []any{
+			"not-a-map",                          // non-map element → skipped
+			map[string]any{"type": "custom_tool"}, // supported map element
+		},
+	}
+	if err := rejectUnsupportedServerTools(body); err != nil {
+		t.Errorf("expected nil error, got %v", err)
+	}
+}

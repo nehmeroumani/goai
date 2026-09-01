@@ -509,3 +509,38 @@ func TestStream_HTTPError(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+// Item 63: the default FPTCloud base URL must be mkp-api.fptcloud.com (no /v1),
+// matching the documented base; the JP region keeps its own host.
+func TestDefaultBaseURLs(t *testing.T) {
+	if regionBaseURL("global") != "https://mkp-api.fptcloud.com" {
+		t.Errorf("global base = %q, want https://mkp-api.fptcloud.com", regionBaseURL("global"))
+	}
+	if regionBaseURL("jp") != "https://mkp-api.fptcloud.jp" {
+		t.Errorf("jp base = %q, want https://mkp-api.fptcloud.jp", regionBaseURL("jp"))
+	}
+}
+
+func TestChat_DefaultBaseURLHasNoV1(t *testing.T) {
+	var gotURL string
+	tr := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		gotURL = req.URL.String()
+		return okResponse(), nil
+	})
+	t.Setenv("FPT_API_KEY", "k")
+	t.Setenv("FPT_BASE_URL", "")
+	t.Setenv("FPT_REGION", "")
+	m := Chat("m", WithHTTPClient(&http.Client{Transport: tr}))
+	_, err := m.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(gotURL, "https://mkp-api.fptcloud.com/") {
+		t.Errorf("URL = %q, want default https://mkp-api.fptcloud.com/", gotURL)
+	}
+	if strings.Contains(gotURL, "/v1") {
+		t.Errorf("URL = %q, must not contain /v1", gotURL)
+	}
+}

@@ -739,6 +739,7 @@ func TestBuildRequest_ToolChoice(t *testing.T) {
 		want   any
 	}{
 		{"auto", map[string]any{"type": "auto"}},
+		{"none", map[string]any{"type": "none"}},
 		{"required", map[string]any{"type": "any"}},
 		{"read_file", map[string]any{"type": "tool", "name": "read_file"}},
 	}
@@ -754,15 +755,6 @@ func TestBuildRequest_ToolChoice(t *testing.T) {
 		if string(got) != string(want) {
 			t.Errorf("tool_choice(%s) = %s, want %s", tt.choice, got, want)
 		}
-	}
-
-	// "none" should not set tool_choice.
-	body := m.buildRequest(provider.GenerateParams{
-		Messages:   []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
-		ToolChoice: "none",
-	}, false)
-	if body["tool_choice"] != nil {
-		t.Errorf("tool_choice(none) = %v, want nil", body["tool_choice"])
 	}
 }
 
@@ -1148,7 +1140,7 @@ func TestFileUploader_UploadFile(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"id":"file_xyz789","type":"file","bytes":123,"created_at":1234567890,"filename":"test.pdf","purpose":"assistants"}`)
+		_, _ = fmt.Fprint(w, `{"id":"file_xyz789","type":"file","size_bytes":123,"mime_type":"application/pdf","created_at":"2026-08-30T12:00:00Z","filename":"test.pdf"}`)
 	}))
 	defer server.Close()
 
@@ -1248,7 +1240,7 @@ func TestFileUploader_DeleteFile_HTTPError(t *testing.T) {
 func TestFileUploader_UploadFile_EmptyMediaType_Anthropic(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"id":"file_mediatype","type":"file","bytes":3,"created_at":1234567890,"filename":"test.bin","purpose":"assistants"}`)
+		_, _ = fmt.Fprint(w, `{"id":"file_mediatype","type":"file","size_bytes":3,"mime_type":"application/octet-stream","created_at":"2026-08-30T12:00:00Z","filename":"test.bin"}`)
 	}))
 	defer server.Close()
 
@@ -1324,7 +1316,7 @@ func TestFileUploader_UploadFile_Headers_Anthropic(t *testing.T) {
 			t.Errorf("X-Custom = %q", r.Header.Get("X-Custom"))
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"id":"file_headers","type":"file","bytes":3,"created_at":1234567890,"filename":"test.txt","purpose":"assistants"}`)
+		_, _ = fmt.Fprint(w, `{"id":"file_headers","type":"file","size_bytes":3,"mime_type":"text/plain","created_at":"2026-08-30T12:00:00Z","filename":"test.txt"}`)
 	}))
 	defer server.Close()
 
@@ -1626,6 +1618,64 @@ func TestBuildRequest_PerRequestHeaders(t *testing.T) {
 	headers, ok := body["_headers"].(map[string]string)
 	if !ok || headers["X-Custom"] != "value" {
 		t.Errorf("_headers = %v, want X-Custom=value", body["_headers"])
+	}
+}
+
+func TestDoGenerate_PerRequestHeaderCannotOverrideAuth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("x-api-key"); got != "test-key" {
+			t.Errorf("x-api-key = %q, want %q (per-request header must not override auth)", got, "test-key")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"msg_1","model":"claude-sonnet-4-20250514","type":"message","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("claude-sonnet-4-20250514",
+		WithAPIKey("test-key"),
+		WithBaseURL(server.URL),
+	)
+	result, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		// Caller attempts to override the auth header via a per-request header.
+		Headers: map[string]string{"x-api-key": "attacker-key"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "ok" {
+		t.Errorf("Text = %q, want %q", result.Text, "ok")
+	}
+}
+
+func TestDoGenerate_PerRequestHeaderCannotOverrideAuthBearer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer my-token" {
+			t.Errorf("Authorization = %q, want %q (per-request header must not override auth)", got, "Bearer my-token")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"msg_1","model":"claude-sonnet-4-20250514","type":"message","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("claude-sonnet-4-20250514",
+		WithAuthMode(AuthBearer),
+		WithTokenSource(provider.StaticToken("my-token")),
+		WithBaseURL(server.URL),
+	)
+	result, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		Headers: map[string]string{"Authorization": "Bearer attacker-key"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "ok" {
+		t.Errorf("Text = %q, want %q", result.Text, "ok")
 	}
 }
 
@@ -2135,6 +2185,73 @@ func TestDoGenerate_ParseResponseError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error from invalid response JSON")
+	}
+}
+
+// infiniteZeroReader yields zeros forever (never EOF). Used to drive the
+// non-streaming response-size cap without allocating a huge buffer upfront.
+type infiniteZeroReader struct{}
+
+func (infiniteZeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}
+
+type oversizedBodyTransport struct{}
+
+func (t *oversizedBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(infiniteZeroReader{}),
+		Header:     make(http.Header),
+	}, nil
+}
+
+// The non-streaming response body must be capped (64 MiB); an oversized body
+// must yield a clear error instead of being read unbounded.
+func TestDoGenerate_ResponseTooLarge(t *testing.T) {
+	model := Chat("claude-sonnet-4-20250514",
+		WithAPIKey("test-key"),
+		WithBaseURL("http://localhost"),
+		WithHTTPClient(&http.Client{Transport: &oversizedBodyTransport{}}),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for oversized response body")
+	}
+	if !strings.Contains(err.Error(), "response body exceeds") {
+		t.Errorf("expected 'response body exceeds' error, got: %v", err)
+	}
+}
+
+// Error-response bodies read by doHTTP must be bounded (1 MiB) so a hostile
+// error payload cannot exhaust memory; a large error body still yields a
+// parsed HTTP error.
+func TestDoHTTP_LargeErrorBody_Bounded(t *testing.T) {
+	big := strings.Repeat("x", 2<<20) // 2 MiB > 1 MiB cap
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = fmt.Fprint(w, `{"error":{"type":"api_error","message":"`+big+`"}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("claude-sonnet-4-20250514", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error from 502 response")
+	}
+	if !strings.Contains(err.Error(), "api_error") {
+		t.Errorf("expected api_error in error, got: %v", err)
 	}
 }
 
@@ -2906,8 +3023,10 @@ func TestDoGenerate_ProviderDefinedToolBeta(t *testing.T) {
 	if !strings.Contains(gotBeta, "computer-use-2025-01-24") {
 		t.Errorf("beta header should contain computer-use-2025-01-24, got %q", gotBeta)
 	}
-	if !strings.Contains(gotBeta, "claude-code-20250219") {
-		t.Errorf("beta header should still contain base betas, got %q", gotBeta)
+	// #16: claude-code-20250219 is no longer a default beta; a computer-use
+	// request does not need it.
+	if strings.Contains(gotBeta, "claude-code-20250219") {
+		t.Errorf("beta header should not contain claude-code-20250219, got %q", gotBeta)
 	}
 }
 
@@ -3768,6 +3887,283 @@ func TestChat_Stream_ServerToolResultRoundTrip(t *testing.T) {
 	}
 	if rb["tool_use_id"] != "srvtoolu_abc" {
 		t.Errorf("resultBlock tool_use_id = %v, want srvtoolu_abc", rb["tool_use_id"])
+	}
+}
+
+// TestParseSSE_ServerToolResult_UnknownToolUseID covers flushPendingCall's
+// early return: a server tool result block whose tool_use_id has no matching
+// pending server_tool_use. On content_block_stop the result-block branch calls
+// flushPendingCall(currentResultUseID), which finds the id absent from
+// pendingCalls and returns true immediately (no ChunkToolCall is emitted).
+func TestParseSSE_ServerToolResult_UnknownToolUseID(t *testing.T) {
+	input := "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"ghost_id\",\"content\":[]}}\n" +
+		"data: {\"type\":\"content_block_stop\"}\n"
+
+	out := make(chan provider.StreamChunk, 8)
+	parseSSE(t.Context(), strings.NewReader(input), out, false)
+
+	var chunks []provider.StreamChunk
+	for c := range out {
+		chunks = append(chunks, c)
+	}
+	for _, c := range chunks {
+		if c.Type == provider.ChunkToolCall {
+			t.Fatalf("unexpected ChunkToolCall for unknown tool_use_id ghost_id: %+v", c)
+		}
+	}
+}
+
+// TestParseSSE_ServerTool_PendingFlushedOnPlainTextBlock covers the
+// content_block_start branch where a pending server_tool_use awaits its result
+// block but the next block is a plain text block: the pending call is flushed
+// (without a resultBlock attached) before the text block is processed.
+func TestParseSSE_ServerTool_PendingFlushedOnPlainTextBlock(t *testing.T) {
+	input := "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"st1\",\"name\":\"web_search\"}}\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"x\\\"}\"}}\n" +
+		"data: {\"type\":\"content_block_stop\"}\n" +
+		"data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"follow-up\"}}\n" +
+		"data: {\"type\":\"content_block_stop\"}\n" +
+		"data: {\"type\":\"message_stop\"}\n"
+
+	out := make(chan provider.StreamChunk, 16)
+	parseSSE(t.Context(), strings.NewReader(input), out, false)
+
+	var chunks []provider.StreamChunk
+	for c := range out {
+		chunks = append(chunks, c)
+	}
+	var sawToolCall bool
+	for _, c := range chunks {
+		if c.Type == provider.ChunkToolCall && c.ToolCallID == "st1" {
+			sawToolCall = true
+			if _, hasRB := c.Metadata["resultBlock"]; hasRB {
+				t.Errorf("pending call flushed on plain text block unexpectedly has resultBlock: %+v", c.Metadata)
+			}
+		}
+	}
+	if !sawToolCall {
+		t.Fatal("expected ChunkToolCall for pending server_tool_use st1 flushed on plain text block")
+	}
+}
+
+// TestParseSSE_ServerTool_FlushAllPending_TrySendFail covers flushAllPending's
+// failure path: a pending server_tool_use is flushed when the next block is a
+// plain text block, but TrySend fails (cancelled context), so flushPendingCall
+// returns false and flushAllPending aborts parseSSE.
+func TestParseSSE_ServerTool_FlushAllPending_TrySendFail(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	out := make(chan provider.StreamChunk) // unbuffered
+
+	input := "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"st1\",\"name\":\"web_search\"}}\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n" +
+		"data: {\"type\":\"content_block_stop\"}\n" +
+		"data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n"
+
+	done := make(chan struct{})
+	go func() {
+		parseSSE(ctx, strings.NewReader(input), out, false)
+		close(done)
+	}()
+
+	<-out // server_tool_use start
+	<-out // input_json_delta
+	cancel()
+	<-done
+	for range out {
+	}
+}
+
+// TestParseSSE_ServerTool_FlushOnMessageDelta covers the message_delta
+// stop_reason branch: pending server_tool_use calls are flushed (emitting
+// ChunkToolCall) before the ChunkStepFinish is signalled.
+func TestParseSSE_ServerTool_FlushOnMessageDelta(t *testing.T) {
+	input := "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"st1\",\"name\":\"web_search\"}}\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n" +
+		"data: {\"type\":\"content_block_stop\"}\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n" +
+		"data: {\"type\":\"message_stop\"}\n"
+
+	out := make(chan provider.StreamChunk, 16)
+	parseSSE(t.Context(), strings.NewReader(input), out, false)
+
+	var chunks []provider.StreamChunk
+	for c := range out {
+		chunks = append(chunks, c)
+	}
+	var toolIdx, finishIdx = -1, -1
+	for i, c := range chunks {
+		if c.Type == provider.ChunkToolCall && c.ToolCallID == "st1" {
+			toolIdx = i
+		}
+		if c.Type == provider.ChunkStepFinish {
+			finishIdx = i
+		}
+	}
+	if toolIdx == -1 {
+		t.Fatal("expected ChunkToolCall for st1 flushed on message_delta")
+	}
+	if finishIdx == -1 {
+		t.Fatal("expected ChunkStepFinish")
+	}
+	if finishIdx <= toolIdx {
+		t.Errorf("ChunkStepFinish (%d) should come after flushed ChunkToolCall (%d)", finishIdx, toolIdx)
+	}
+}
+
+// TestParseSSE_ServerTool_FlushOnMessageStop covers the message_stop branch:
+// pending server_tool_use calls are flushed (emitting ChunkToolCall) before the
+// ChunkFinish is emitted.
+func TestParseSSE_ServerTool_FlushOnMessageStop(t *testing.T) {
+	input := "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"st1\",\"name\":\"web_search\"}}\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n" +
+		"data: {\"type\":\"content_block_stop\"}\n" +
+		"data: {\"type\":\"message_stop\"}\n"
+
+	out := make(chan provider.StreamChunk, 16)
+	parseSSE(t.Context(), strings.NewReader(input), out, false)
+
+	var chunks []provider.StreamChunk
+	for c := range out {
+		chunks = append(chunks, c)
+	}
+	var toolIdx, finishIdx = -1, -1
+	for i, c := range chunks {
+		if c.Type == provider.ChunkToolCall && c.ToolCallID == "st1" {
+			toolIdx = i
+		}
+		if c.Type == provider.ChunkFinish {
+			finishIdx = i
+		}
+	}
+	if toolIdx == -1 {
+		t.Fatal("expected ChunkToolCall for st1 flushed on message_stop")
+	}
+	if finishIdx == -1 {
+		t.Fatal("expected ChunkFinish")
+	}
+	if finishIdx <= toolIdx {
+		t.Errorf("ChunkFinish (%d) should come after flushed ChunkToolCall (%d)", finishIdx, toolIdx)
+	}
+}
+
+// TestParseSSE_ServerTool_ResultStopFlushTrySendFail covers the failure branch
+// of the content_block_stop result-block flush: flushPendingCall's TrySend
+// fails (cancelled context), so parseSSE returns at the `return` inside
+// `if !flushPendingCall(currentResultUseID)`.
+func TestParseSSE_ServerTool_ResultStopFlushTrySendFail(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	out := make(chan provider.StreamChunk) // unbuffered
+
+	input := "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"st1\",\"name\":\"web_search\"}}\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n" +
+		"data: {\"type\":\"content_block_stop\"}\n" +
+		"data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"st1\",\"content\":[]}}\n" +
+		"data: {\"type\":\"content_block_stop\"}\n"
+
+	done := make(chan struct{})
+	go func() {
+		parseSSE(ctx, strings.NewReader(input), out, false)
+		close(done)
+	}()
+
+	<-out // server_tool_use start
+	<-out // input_json_delta
+	cancel()
+	<-done
+	for range out {
+	}
+}
+
+// TestParseSSE_ServerTool_MessageDeltaFlushTrySendFail covers the failure branch
+// of the message_delta stop_reason flush: flushAllPending's TrySend fails
+// (cancelled context), so parseSSE returns at the `return` inside
+// `if !flushAllPending()`.
+func TestParseSSE_ServerTool_MessageDeltaFlushTrySendFail(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	out := make(chan provider.StreamChunk) // unbuffered
+
+	input := "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"st1\",\"name\":\"web_search\"}}\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n" +
+		"data: {\"type\":\"content_block_stop\"}\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n"
+
+	done := make(chan struct{})
+	go func() {
+		parseSSE(ctx, strings.NewReader(input), out, false)
+		close(done)
+	}()
+
+	<-out // server_tool_use start
+	<-out // input_json_delta
+	cancel()
+	<-done
+	for range out {
+	}
+}
+
+// TestParseSSE_ServerTool_MessageStopFlushTrySendFail covers the failure branch
+// of the message_stop flush: flushAllPending's TrySend fails (cancelled
+// context), so parseSSE returns at the `return` inside `if !flushAllPending()`.
+func TestParseSSE_ServerTool_MessageStopFlushTrySendFail(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	out := make(chan provider.StreamChunk) // unbuffered
+
+	input := "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"st1\",\"name\":\"web_search\"}}\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n" +
+		"data: {\"type\":\"content_block_stop\"}\n" +
+		"data: {\"type\":\"message_stop\"}\n"
+
+	done := make(chan struct{})
+	go func() {
+		parseSSE(ctx, strings.NewReader(input), out, false)
+		close(done)
+	}()
+
+	<-out // server_tool_use start
+	<-out // input_json_delta
+	cancel()
+	<-done
+	for range out {
+	}
+}
+
+// TestChat_Generate_ServerToolResult_UnknownToolUseID covers the parseResponse
+// branch where a server_tool_result block references a tool_use_id that has no
+// matching server_tool_use: the orphan result block is skipped via continue.
+func TestChat_Generate_ServerToolResult_UnknownToolUseID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id": "msg_ghost",
+			"model": "sonnet-test-model",
+			"type": "message",
+			"content": [
+				{"type": "text", "text": "done"},
+				{"type": "web_search_tool_result", "tool_use_id": "ghost_id", "content": []}
+			],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 5, "output_tokens": 5}
+		}`)
+	}))
+	defer server.Close()
+
+	model := Chat("sonnet-test-model", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	result, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The orphan result block for an unknown tool_use_id is skipped; no
+	// ToolCall should be created from it.
+	if len(result.ToolCalls) != 0 {
+		t.Fatalf("ToolCalls = %d, want 0 (orphan result block skipped)", len(result.ToolCalls))
+	}
+	if result.Text != "done" {
+		t.Errorf("Text = %q, want done", result.Text)
 	}
 }
 
@@ -4784,5 +5180,213 @@ func TestDoGenerate_NonThinkingModelStaysNonStreaming(t *testing.T) {
 	}
 	if result.Text != "plain" {
 		t.Errorf("Text = %q, want %q", result.Text, "plain")
+	}
+}
+
+func TestSupportsThinking_NewModels(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"claude-3-7-sonnet-20250219", true},
+		{"claude-sonnet-4-20250514", true},
+		{"claude-sonnet-4-6", true},
+		{"claude-opus-4-20250514", true},
+		{"claude-opus-4-8", true},
+		{"claude-opus-4-7", true},
+		{"claude-opus-4-6", true},
+		{"claude-haiku-4-5", true},
+		{"claude-sonnet-5", true},
+		{"claude-opus-5", true},
+		{"claude-3-5-haiku-20241022", false},
+		{"claude-3-haiku-20240307", false},
+		{"gpt-4o", false},
+	}
+	for _, c := range cases {
+		if got := supportsThinking(c.model); got != c.want {
+			t.Errorf("supportsThinking(%q) = %v, want %v", c.model, got, c.want)
+		}
+	}
+}
+
+// #14/#15/#16 -- feature-gated beta headers are only added when the feature is
+// present, and claude-code-20250219 is never sent by default.
+func TestCollectRequestBetas(t *testing.T) {
+	// Plain request: no extra betas.
+	if got := collectRequestBetas(map[string]any{"model": "x"}); len(got) != 0 {
+		t.Errorf("plain request betas = %v, want none", got)
+	}
+
+	// context_management -> context-1m beta.
+	if got := collectRequestBetas(map[string]any{"context_management": map[string]any{}}); len(got) != 1 || got[0] != betaContextManagement {
+		t.Errorf("context_management betas = %v, want [%s]", got, betaContextManagement)
+	}
+
+	// speed -> fast-mode beta.
+	if got := collectRequestBetas(map[string]any{"speed": "fast"}); len(got) != 1 || got[0] != betaFastMode {
+		t.Errorf("speed betas = %v, want [%s]", got, betaFastMode)
+	}
+
+	// container -> claude-code beta.
+	if got := collectRequestBetas(map[string]any{"container": map[string]any{}}); len(got) != 1 || got[0] != betaClaudeCode {
+		t.Errorf("container betas = %v, want [%s]", got, betaClaudeCode)
+	}
+
+	// Multiple features combine.
+	got := collectRequestBetas(map[string]any{
+		"context_management": map[string]any{},
+		"speed":              "fast",
+	})
+	if len(got) != 2 {
+		t.Errorf("combined betas = %v, want 2", got)
+	}
+}
+
+// #16 -- claude-code-20250219 must NOT be part of the default beta header.
+func TestBetaFeatures_ExcludesClaudeCode(t *testing.T) {
+	if strings.Contains(betaFeatures, betaClaudeCode) {
+		t.Errorf("betaFeatures = %q must not contain %q", betaFeatures, betaClaudeCode)
+	}
+}
+
+// #14 -- context_management request must carry the context-1m beta header.
+func TestDoGenerate_ContextManagementBetaHeader(t *testing.T) {
+	var betaHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		betaHeader = r.Header.Get("anthropic-beta")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"msg_1","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("claude-sonnet-4-20250514", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ProviderOptions: map[string]any{
+			"contextManagement": map[string]any{
+				"edits": []any{map[string]any{"type": "clear_tool_uses_20250919"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(betaHeader, betaContextManagement) {
+		t.Errorf("anthropic-beta = %q, want it to contain %q", betaHeader, betaContextManagement)
+	}
+}
+
+// #15 -- speed request must carry the fast-mode beta header.
+func TestDoGenerate_SpeedBetaHeader(t *testing.T) {
+	var betaHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		betaHeader = r.Header.Get("anthropic-beta")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"msg_1","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("claude-sonnet-4-20250514", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ProviderOptions: map[string]any{
+			"speed": "fast",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(betaHeader, betaFastMode) {
+		t.Errorf("anthropic-beta = %q, want it to contain %q", betaHeader, betaFastMode)
+	}
+}
+
+// #16 -- a plain request must NOT carry claude-code-20250219.
+func TestDoGenerate_NoClaudeCodeBetaOnPlainRequest(t *testing.T) {
+	var betaHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		betaHeader = r.Header.Get("anthropic-beta")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"msg_1","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("claude-sonnet-4-20250514", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(betaHeader, betaClaudeCode) {
+		t.Errorf("anthropic-beta = %q, must not contain %q on a plain request", betaHeader, betaClaudeCode)
+	}
+}
+
+// #17 -- a PartImage carrying a RemoteRef emits a file-backed image block.
+func TestConvertMessages_ImageRemoteRef(t *testing.T) {
+	msgs := convertMessages([]provider.Message{
+		{Role: provider.RoleUser, Content: []provider.Part{
+			{Type: provider.PartImage, RemoteRef: &provider.RemoteFileRef{ID: "file_img_123"}},
+		}},
+	})
+
+	content := msgs[0]["content"].([]map[string]any)
+	if content[0]["type"] != "image" {
+		t.Fatalf("type = %v, want image", content[0]["type"])
+	}
+	source, _ := content[0]["source"].(map[string]any)
+	if source["type"] != "file" {
+		t.Errorf("source.type = %v, want file", source["type"])
+	}
+	if source["file_id"] != "file_img_123" {
+		t.Errorf("source.file_id = %v, want file_img_123", source["file_id"])
+	}
+}
+
+// #18 -- thinking enabled downgrades a forced tool_choice to auto.
+func TestBuildRequest_ThinkingDowngradesForcedToolChoice(t *testing.T) {
+	m := &chatModel{id: "claude-sonnet-4-20250514", opts: options{baseURL: defaultBaseURL}}
+
+	// required -> auto
+	body := m.buildRequest(provider.GenerateParams{
+		Messages:   []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ToolChoice: "required",
+		ProviderOptions: map[string]any{
+			"thinking": map[string]any{"type": "enabled", "budgetTokens": float64(2000)},
+		},
+	}, false)
+	tc, _ := body["tool_choice"].(map[string]any)
+	if tc["type"] != "auto" {
+		t.Errorf("tool_choice = %v, want auto (downgraded from required)", tc)
+	}
+	if body["thinking"] == nil {
+		t.Error("thinking should still be set")
+	}
+
+	// specific tool -> auto
+	body = m.buildRequest(provider.GenerateParams{
+		Messages:   []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ToolChoice: "read_file",
+		ProviderOptions: map[string]any{
+			"thinking": map[string]any{"type": "enabled"},
+		},
+	}, false)
+	tc, _ = body["tool_choice"].(map[string]any)
+	if tc["type"] != "auto" {
+		t.Errorf("tool_choice = %v, want auto (downgraded from specific tool)", tc)
+	}
+
+	// adaptive thinking must NOT downgrade.
+	body = m.buildRequest(provider.GenerateParams{
+		Messages:   []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ToolChoice: "required",
+		ProviderOptions: map[string]any{
+			"thinking": map[string]any{"type": "adaptive"},
+		},
+	}, false)
+	tc, _ = body["tool_choice"].(map[string]any)
+	if tc["type"] != "any" {
+		t.Errorf("tool_choice = %v, want any (adaptive thinking must not downgrade)", tc)
 	}
 }

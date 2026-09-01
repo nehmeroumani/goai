@@ -31,6 +31,8 @@ testdata/
 
 .vibeflow
 *.out
+docs/reviews
+docs/sec-audit
 docs/drift-report
-docs/issue-fixes-review/
+docs/issue-fixes-review
 .pr-bodies/

@@ -34,11 +34,17 @@ var Tools = struct {
 	// The Gemini 3.x family has it built-in (just add the tool); 2.5 needs the
 	// dedicated gemini-2.5-computer-use-preview model.
 	ComputerUse func(opts ...ComputerUseOption) provider.ToolDefinition
+
+	// FileSearch enables file-based grounding (Vertex AI Search / uploaded
+	// corpus retrieval). The model grounds its answers on the configured
+	// retrieval source instead of live web search.
+	FileSearch func(opts ...FileSearchOption) provider.ToolDefinition
 }{
 	GoogleSearch:  googleSearchTool,
 	URLContext:    urlContextTool,
 	CodeExecution: codeExecutionTool,
 	ComputerUse:   computerUseTool,
+	FileSearch:    fileSearchTool,
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +183,55 @@ func computerUseTool(opts ...ComputerUseOption) provider.ToolDefinition {
 	return provider.ToolDefinition{
 		Name:                   "computer_use",
 		ProviderDefinedType:    "google.computer_use",
+		ProviderDefinedOptions: providerOpts,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FileSearch
+// ---------------------------------------------------------------------------
+
+// FileSearchOption configures the file-search grounding tool.
+type FileSearchOption func(*fileSearchConfig)
+
+type fileSearchConfig struct {
+	// DynamicThreshold controls when the model decides to ground on the
+	// configured retrieval source (0.0–1.0). Lower thresholds trigger
+	// retrieval more eagerly.
+	DynamicThreshold float64
+	// Corpus is the Vertex AI Search / corpus identifier to ground on.
+	Corpus string
+}
+
+// WithDynamicThreshold sets the dynamic retrieval threshold (0.0–1.0).
+func WithDynamicThreshold(t float64) FileSearchOption {
+	return func(c *fileSearchConfig) { c.DynamicThreshold = t }
+}
+
+// WithCorpus sets the retrieval corpus identifier to ground on.
+func WithCorpus(id string) FileSearchOption {
+	return func(c *fileSearchConfig) { c.Corpus = id }
+}
+
+func fileSearchTool(opts ...FileSearchOption) provider.ToolDefinition {
+	cfg := &fileSearchConfig{}
+	for _, o := range opts {
+		o(cfg)
+	}
+
+	providerOpts := map[string]any{}
+	if cfg.DynamicThreshold > 0 {
+		providerOpts["dynamicRetrievalConfig"] = map[string]any{
+			"dynamicThreshold": cfg.DynamicThreshold,
+		}
+	}
+	if cfg.Corpus != "" {
+		providerOpts["corpus"] = cfg.Corpus
+	}
+
+	return provider.ToolDefinition{
+		Name:                   "file_search",
+		ProviderDefinedType:    "google.file_search",
 		ProviderDefinedOptions: providerOpts,
 	}
 }

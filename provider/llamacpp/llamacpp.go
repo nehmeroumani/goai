@@ -1,6 +1,6 @@
 // Package llamacpp provides a llama.cpp server language model implementation for GoAI.
 //
-// llama.cpp server exposes an OpenAI-compatible API at http://localhost:8080 by default.
+// llama.cpp server exposes an OpenAI-compatible API at http://localhost:8080/v1 by default.
 // No authentication is required. This package is a convenience wrapper around
 // the generic compat provider.
 //
@@ -20,7 +20,7 @@ import (
 	"github.com/zendev-sh/goai/provider/compat"
 )
 
-const defaultBaseURL = "http://localhost:8080"
+const defaultBaseURL = "http://localhost:8080/v1"
 
 // Option configures the llama.cpp provider.
 type Option func(*options)
@@ -51,7 +51,7 @@ func WithTokenSource(ts provider.TokenSource) Option {
 // WithBaseURL overrides the default llama.cpp server base URL.
 // The URL must use http:// or https:// scheme.
 //
-// llama.cpp is a local-first provider (default http://localhost:8080).
+// llama.cpp is a local-first provider (default http://localhost:8080/v1).
 // The user explicitly controls the target URL, so SSRF-style host
 // validation is intentionally not applied (same as ollama, vllm).
 func WithBaseURL(rawURL string) Option {
@@ -82,7 +82,7 @@ func WithHTTPClient(c *http.Client) Option {
 }
 
 // Chat creates a llama.cpp server language model for the given model ID.
-// Defaults to http://localhost:8080, no authentication.
+// Defaults to http://localhost:8080/v1, no authentication.
 func Chat(modelID string, opts ...Option) provider.LanguageModel {
 	o := options{baseURL: defaultBaseURL}
 	for _, opt := range opts {
@@ -92,7 +92,7 @@ func Chat(modelID string, opts ...Option) provider.LanguageModel {
 }
 
 // Embedding creates a llama.cpp server embedding model for the given model ID.
-// Defaults to http://localhost:8080, no authentication.
+// Defaults to http://localhost:8080/v1, no authentication.
 func Embedding(modelID string, opts ...Option) provider.EmbeddingModel {
 	o := options{baseURL: defaultBaseURL}
 	for _, opt := range opts {

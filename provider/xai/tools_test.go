@@ -1,6 +1,11 @@
 package xai
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/zendev-sh/goai/provider"
+)
 
 // ---------------------------------------------------------------------------
 // WebSearch
@@ -119,5 +124,107 @@ func TestTools_XSearch_UnderstandingFalse(t *testing.T) {
 	}
 	if _, ok := def.ProviderDefinedOptions["enable_video_understanding"]; ok {
 		t.Error("enable_video_understanding should not be set when false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Responses-API gate (item 61)
+// ---------------------------------------------------------------------------
+
+// plainChatRequest exercises DoGenerate with a plain text request and no tools.
+func plainChatRequest(t *testing.T) error {
+	t.Helper()
+	model := Chat("grok-3", WithAPIKey("test-key"), WithBaseURL("http://127.0.0.1:1"))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	// We expect a connection error (nothing listens on :1), which proves the
+	// request reached the HTTP layer rather than being gated.
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), "Responses API") {
+		t.Errorf("plain chat should not be gated, got: %v", err)
+	}
+	return err
+}
+
+func TestChat_PlainTextNotGated(t *testing.T) {
+	err := plainChatRequest(t)
+	if err == nil || !strings.Contains(err.Error(), "sending request") {
+		t.Errorf("plain chat should reach HTTP layer, got: %v", err)
+	}
+}
+
+func TestChat_GatesWebSearch(t *testing.T) {
+	model := Chat("grok-3", WithAPIKey("test-key"), WithBaseURL("http://127.0.0.1:1"))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "latest news"}}},
+		},
+		Tools: []provider.ToolDefinition{Tools.WebSearch()},
+	})
+	if err == nil {
+		t.Fatal("expected error for web_search on Chat Completions path")
+	}
+	if !strings.Contains(err.Error(), "web_search") || !strings.Contains(err.Error(), "Responses API") {
+		t.Errorf("error should mention web_search and Responses API, got: %v", err)
+	}
+}
+
+func TestChat_GatesXSearch(t *testing.T) {
+	model := Chat("grok-3", WithAPIKey("test-key"), WithBaseURL("http://127.0.0.1:1"))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "x posts"}}},
+		},
+		Tools: []provider.ToolDefinition{Tools.XSearch()},
+	})
+	if err == nil {
+		t.Fatal("expected error for x_search on Chat Completions path")
+	}
+	if !strings.Contains(err.Error(), "x_search") || !strings.Contains(err.Error(), "Responses API") {
+		t.Errorf("error should mention x_search and Responses API, got: %v", err)
+	}
+}
+
+func TestChat_GatesWebSearchOnStream(t *testing.T) {
+	model := Chat("grok-3", WithAPIKey("test-key"), WithBaseURL("http://127.0.0.1:1"))
+	_, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "latest news"}}},
+		},
+		Tools: []provider.ToolDefinition{Tools.WebSearch()},
+	})
+	if err == nil {
+		t.Fatal("expected error for web_search on streaming Chat Completions path")
+	}
+	if !strings.Contains(err.Error(), "Responses API") {
+		t.Errorf("error should mention Responses API, got: %v", err)
+	}
+}
+
+func TestChat_RegularFunctionToolNotGated(t *testing.T) {
+	// A regular (non-provider-defined) function tool must NOT be gated.
+	err := plainChatRequest(t)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	model := Chat("grok-3", WithAPIKey("test-key"), WithBaseURL("http://127.0.0.1:1"))
+	_, err = model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "weather"}}},
+		},
+		Tools: []provider.ToolDefinition{
+			{Name: "get_weather", Description: "Get weather", InputSchema: []byte(`{"type":"object"}`)},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), "Responses API") {
+		t.Errorf("regular function tool should not be gated, got: %v", err)
 	}
 }

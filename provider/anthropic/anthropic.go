@@ -22,7 +22,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/internal/httpc"
@@ -40,8 +39,18 @@ var (
 const (
 	defaultBaseURL   = "https://api.anthropic.com"
 	apiVersion       = "2023-06-01"
-	betaFeatures     = "claude-code-20250219,interleaved-thinking-2025-05-14"
+	// betaFeatures is the baseline anthropic-beta header sent on every request.
+	// It intentionally excludes claude-code-20250219 (only needed when a
+	// feature that depends on it is used, e.g. the container option) so plain
+	// Messages requests are not gated unnecessarily.
+	betaFeatures     = "interleaved-thinking-2025-05-14"
 	defaultMaxTokens = 16384
+
+	// Feature-gated beta headers, applied only when the corresponding field is
+	// present on the request.
+	betaContextManagement = "context-1m-2025-08-07"
+	betaFastMode          = "fast-mode-2026-02-01"
+	betaClaudeCode        = "claude-code-20250219"
 )
 
 // anthropicHandledKeys lists provider option keys that are explicitly handled
@@ -367,6 +376,7 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	body := m.buildRequest(params, streaming)
 	toolBetas := collectToolBetas(params.Tools)
+	toolBetas = append(toolBetas, collectRequestBetas(body)...)
 	if hasRemoteRef(params.Messages) {
 		toolBetas = append(toolBetas, filesBetaHeader)
 	}
@@ -377,11 +387,20 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	var respBody []byte
+var respBody []byte
 	if streaming {
 		respBody, err = accumulateStreamedMessage(ctx, resp.Body)
 	} else {
-		respBody, err = io.ReadAll(resp.Body)
+		// Cap the non-streaming response body at 64 MiB so a runaway/hostile
+		// response cannot exhaust memory.
+		const maxNonStreamResponseBytes = 64 << 20 // 64 MiB
+		respBody, err = io.ReadAll(io.LimitReader(resp.Body, maxNonStreamResponseBytes+1))
+		if err != nil {
+			return nil, fmt.Errorf("reading response: %w", err)
+		}
+		if len(respBody) > maxNonStreamResponseBytes {
+			return nil, fmt.Errorf("anthropic: response body exceeds %d bytes", maxNonStreamResponseBytes)
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
@@ -412,6 +431,7 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 	}
 	body := m.buildRequest(params, true)
 	toolBetas := collectToolBetas(params.Tools)
+	toolBetas = append(toolBetas, collectRequestBetas(body)...)
 	if hasRemoteRef(params.Messages) {
 		toolBetas = append(toolBetas, filesBetaHeader)
 	}
@@ -423,26 +443,9 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 	// Keep resp.Request and its serialized request body out of the stream closure.
 	responseBody := resp.Body
 
-	out := make(chan provider.StreamChunk, 64)
-	go func() {
-		var closeOnce sync.Once
-		closeBody := func() { closeOnce.Do(func() { _ = responseBody.Close() }) }
-		defer closeBody()
-		// Close body on context cancellation to unblock scanner.Scan().
-		// Without this, the goroutine leaks if the server stalls mid-stream.
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			select {
-			case <-ctx.Done():
-				closeBody()
-			case <-done:
-			}
-		}()
-		parseSSE(ctx, responseBody, out, rfMode)
-	}()
-
-	return &provider.StreamResult{Stream: out}, nil
+return provider.RunStream(ctx, responseBody, func(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk) {
+		parseSSE(ctx, body, out, rfMode)
+	}), nil
 }
 
 // --- Request building ---
@@ -483,8 +486,10 @@ func (m *chatModel) buildRequest(params provider.GenerateParams, streaming bool)
 		case "auto":
 			body["tool_choice"] = map[string]any{"type": "auto"}
 		case "none":
-			// Anthropic doesn't have a "none" tool_choice; omit tools instead.
-			delete(body, "tools")
+			// Anthropic supports an explicit "none" tool_choice type that
+			// prevents tool use while keeping tools registered. Send it
+			// instead of deleting the tools array.
+			body["tool_choice"] = map[string]any{"type": "none"}
 		case "required":
 			body["tool_choice"] = map[string]any{"type": "any"}
 		default:
@@ -532,6 +537,19 @@ func (m *chatModel) buildRequest(params provider.GenerateParams, streaming bool)
 			}
 			if len(thinkingReq) > 0 {
 				body["thinking"] = thinkingReq
+			}
+
+			// Extended thinking is incompatible with a forced tool_choice
+			// ("required" / a specific tool). The API rejects the combination,
+			// so downgrade to "auto" so the model may still choose to call a
+			// tool while thinking.
+			if t, _ := tm["type"].(string); t == "enabled" {
+				if tc, ok := body["tool_choice"].(map[string]any); ok {
+					switch tc["type"] {
+					case "any", "tool":
+						body["tool_choice"] = map[string]any{"type": "auto"}
+					}
+				}
 			}
 		}
 	}
@@ -746,6 +764,19 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 				}
 
 			case provider.PartImage:
+				if part.RemoteRef != nil {
+					// A remotely uploaded image is referenced by file ID.
+					p := map[string]any{
+						"type": "image",
+						"source": map[string]any{
+							"type":    "file",
+							"file_id": part.RemoteRef.ID,
+						},
+					}
+					applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
+					content = append(content, p)
+					break
+				}
 				if part.URL == "" {
 					continue
 				}
@@ -1316,32 +1347,44 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 	var responseMeta provider.ResponseMetadata
 	var finishMeta map[string]any // metadata accumulated for ChunkFinish
 
-	// Pending server_tool_use ChunkToolCall: deferred so we can attach the
-	// matching result block (which arrives in the next content_block) before
-	// emitting. See parseResponse for the non-streaming equivalent.
-	var pendingHasCall bool
-	var pendingCallID, pendingCallName string
-	var pendingCallArgs string
-	var capturedResultBlock map[string]any
+	// Pending server_tool_use ChunkToolCalls keyed by tool_use_id, deferred so
+	// each can be paired with its own result block before emitting. Keyed by ID
+	// (not a single slot) so parallel server tools each keep their result.
+	// See parseResponse for the non-streaming equivalent.
+	type pendingServerCall struct {
+		name        string
+		args        string
+		resultBlock map[string]any
+	}
+	pendingCalls := make(map[string]*pendingServerCall)
+	currentResultUseID := ""
 
-	flushPendingCall := func() bool {
-		if !pendingHasCall {
+	flushPendingCall := func(id string) bool {
+		pc, ok := pendingCalls[id]
+		if !ok {
 			return true
 		}
-		args := cmp.Or(pendingCallArgs, "{}")
+		args := cmp.Or(pc.args, "{}")
 		chunk := provider.StreamChunk{
 			Type:       provider.ChunkToolCall,
-			ToolCallID: pendingCallID,
-			ToolName:   pendingCallName,
+			ToolCallID: id,
+			ToolName:   pc.name,
 			ToolInput:  args,
 		}
-		if capturedResultBlock != nil {
-			chunk.Metadata = map[string]any{"resultBlock": capturedResultBlock}
+		if pc.resultBlock != nil {
+			chunk.Metadata = map[string]any{"resultBlock": pc.resultBlock}
 		}
-		pendingHasCall = false
-		pendingCallID, pendingCallName, pendingCallArgs = "", "", ""
-		capturedResultBlock = nil
+		delete(pendingCalls, id)
 		return provider.TrySend(ctx, out, chunk)
+	}
+
+	flushAllPending := func() bool {
+		for id := range pendingCalls {
+			if !flushPendingCall(id) {
+				return false
+			}
+		}
+		return true
 	}
 
 	for data, ok := sseScanner.Next(); ok; data, ok = sseScanner.Next() {
@@ -1379,11 +1422,12 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 			if cb, ok := event["content_block"].(map[string]any); ok {
 				cbType, _ := cb["type"].(string)
 				isResultBlock = false
-				// If a pending server_tool_use awaits a result block and the
-				// next block is NOT its matching result, flush it without
+				// If pending server_tool_use calls await their result blocks and
+				// the next block is neither a result nor another server tool,
+				// their results are not coming this step: flush without
 				// resultBlock attached.
-				if pendingHasCall && !isServerToolResultBlock(cbType) {
-					if !flushPendingCall() {
+				if len(pendingCalls) > 0 && !isServerToolResultBlock(cbType) && cbType != "server_tool_use" {
+					if !flushAllPending() {
 						return
 					}
 				}
@@ -1431,20 +1475,18 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 							return
 						}
 					}
-				default:
-					if isServerToolResultBlock(cbType) {
-						isResultBlock = true
-						if pendingHasCall {
-							// Anthropic emits the full result block in
-							// content_block_start (no input_json_delta for
-							// these). Capture verbatim for round-trip when
-							// tool_use_id matches the pending call.
-							useID, _ := cb["tool_use_id"].(string)
-							if useID == pendingCallID {
-								capturedResultBlock = cb
-							}
-						}
+default:
+				if isServerToolResultBlock(cbType) {
+					isResultBlock = true
+					// Anthropic emits the full result block in
+					// content_block_start (no input_json_delta for
+					// these). Capture verbatim for round-trip when
+					// tool_use_id matches a pending call.
+					currentResultUseID, _ = cb["tool_use_id"].(string)
+					if pc, ok := pendingCalls[currentResultUseID]; ok {
+						pc.resultBlock = cb
 					}
+				}
 				}
 			}
 
@@ -1532,17 +1574,18 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 			case isResultBlock:
 				// End of a server tool result block. Flush the deferred
 				// server_tool_use ChunkToolCall with resultBlock attached.
-				if !flushPendingCall() {
+				if !flushPendingCall(currentResultUseID) {
 					return
 				}
 				isResultBlock = false
+				currentResultUseID = ""
 			case isServerTool && currentToolCallID != "":
 				// Defer ChunkToolCall emission so we can attach the matching
 				// result block (next content_block) before flushing.
-				pendingHasCall = true
-				pendingCallID = currentToolCallID
-				pendingCallName = currentToolName
-				pendingCallArgs = currentToolArgs.String()
+				pendingCalls[currentToolCallID] = &pendingServerCall{
+					name: currentToolName,
+					args: currentToolArgs.String(),
+				}
 				currentToolArgs.Reset()
 			case currentToolCallID != "" && !isRFBlock:
 				// Emit accumulated tool call with complete JSON args.
@@ -1567,9 +1610,9 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 		case "message_delta":
 			if delta, ok := event["delta"].(map[string]any); ok {
 				if sr, ok := delta["stop_reason"].(string); ok {
-					// Flush any pending server tool call before signalling
+					// Flush any pending server tool calls before signalling
 					// step finish so consumers see the ChunkToolCall first.
-					if !flushPendingCall() {
+					if !flushAllPending() {
 						return
 					}
 					fr := mapFinishReason(sr)
@@ -1638,8 +1681,8 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 			}
 
 		case "message_stop":
-			// Flush pending server tool call without resultBlock if none arrived.
-			if !flushPendingCall() {
+			// Flush pending server tool calls without resultBlock if none arrived.
+			if !flushAllPending() {
 				return
 			}
 			usage.TotalTokens = usage.InputTokens + usage.OutputTokens
@@ -1673,7 +1716,7 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 		return
 	}
 	// Clean EOF without message_stop: emit finish with accumulated usage and response meta.
-	_ = flushPendingCall()
+	_ = flushAllPending()
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	provider.TrySend(ctx, out, provider.StreamChunk{
 		Type:     provider.ChunkFinish,
@@ -2100,9 +2143,10 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 	var textParts []string
 	var reasoningParts []string
 	var providerMeta map[string]any
-	// Index of the last server_tool_use ToolCall, for attaching the matching
-	// result block when it appears immediately after.
-	lastServerToolIdx := -1
+	// Map of server_tool_use ToolCall index by tool_use_id, for attaching the
+	// matching result block. Keyed by ID (not a single slot) so parallel
+	// server tools each get their own result block.
+	serverToolIdxByID := make(map[string]int)
 	for i, block := range resp.Content {
 		switch block.Type {
 		case "text":
@@ -2173,24 +2217,26 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 				Name:  block.Name,
 				Input: block.Input,
 			})
-			if block.Type == "server_tool_use" {
-				lastServerToolIdx = len(result.ToolCalls) - 1
-			} else {
-				lastServerToolIdx = -1
+			if block.Type == "server_tool_use" && block.ID != "" {
+				serverToolIdxByID[block.ID] = len(result.ToolCalls) - 1
 			}
 		default:
-			if isServerToolResultBlock(block.Type) && lastServerToolIdx >= 0 && i < len(rawContent.Content) {
+			if isServerToolResultBlock(block.Type) && i < len(rawContent.Content) {
+				idx, ok := serverToolIdxByID[block.ToolUseID]
+				if !ok {
+					continue
+				}
 				// Decode raw block as map[string]any so the request serializer
 				// can re-emit it verbatim alongside the matching server_tool_use.
 				var rb map[string]any
 				if err := json.Unmarshal(rawContent.Content[i], &rb); err == nil {
-					tc := &result.ToolCalls[lastServerToolIdx]
+					tc := &result.ToolCalls[idx]
 					if tc.Metadata == nil {
 						tc.Metadata = map[string]any{}
 					}
 					tc.Metadata["resultBlock"] = rb
 				}
-				lastServerToolIdx = -1
+				delete(serverToolIdxByID, block.ToolUseID)
 			}
 		}
 	}
@@ -2315,14 +2361,6 @@ func (m *chatModel) doHTTP(ctx context.Context, body map[string]any, toolBetas .
 	req := httpc.MustNewRequest(ctx, "POST", reqURL, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
 
-	// Set auth header based on mode.
-	switch m.opts.authMode {
-	case AuthBearer:
-		req.Header.Set("Authorization", "Bearer "+token)
-	default:
-		req.Header.Set("x-api-key", token)
-	}
-
 	req.Header.Set("anthropic-version", apiVersion)
 	// Merge base betas with tool-specific betas.
 	allBetas := betaFeatures
@@ -2347,13 +2385,23 @@ func (m *chatModel) doHTTP(ctx context.Context, body map[string]any, toolBetas .
 		req.Header.Set(k, v)
 	}
 
+	// Set auth header last so per-request headers can never override it.
+	switch m.opts.authMode {
+	case AuthBearer:
+		req.Header.Set("Authorization", "Bearer "+token)
+	default:
+		req.Header.Set("x-api-key", token)
+	}
+
 	resp, err := m.httpClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		// Bound the error-response body read so a hostile/large error payload
+		// cannot exhaust memory.
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 		errProvider := cmp.Or(m.opts.errorProvider, "anthropic")
 		return nil, goai.ParseHTTPErrorWithHeaders(errProvider, resp.StatusCode, respBody, resp.Header)

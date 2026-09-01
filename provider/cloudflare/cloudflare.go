@@ -86,17 +86,19 @@ func resolveOptions(opts []Option) options {
 func Chat(modelID string, opts ...Option) provider.LanguageModel {
 	o := resolveOptions(opts)
 	return openaicompat.NewChatModel(openaicompat.ChatModelConfig{
-		ProviderID:           "cloudflare",
-		ModelID:              modelID,
-		BaseURL:              o.baseURL,
-		TokenSource:          o.tokenSource,
-		TokenRequired:        true,
-		BaseURLRequired:      true,
-		Headers:              o.headers,
-		HTTPClient:           o.httpClient,
-		Capabilities:         chatCaps,
-		IncludeStreamOptions: true,
-		WarnPromptCaching:    true,
+		ProviderID:        "cloudflare",
+		ModelID:           modelID,
+		BaseURL:           o.baseURL,
+		TokenSource:       o.tokenSource,
+		TokenRequired:     true,
+		BaseURLRequired:   true,
+		Headers:           o.headers,
+		HTTPClient:        o.httpClient,
+		Capabilities:      chatCaps,
+		WarnPromptCaching: true,
+		RequestConfig: openaicompat.RequestConfig{
+			IncludeStreamOptions: true,
+		},
 	})
 }
 
@@ -120,7 +122,7 @@ func Embedding(modelID string, opts ...Option) provider.EmbeddingModel {
 
 var chatCaps = provider.ModelCapabilities{
 	Temperature:      true,
-	ToolCall:         true,
+	ToolCall:         false, // Workers AI tool-calling/json_schema support is model-dependent and not reliable (item 50).
 	InputModalities:  provider.ModalitySet{Text: true},
 	OutputModalities: provider.ModalitySet{Text: true},
 }

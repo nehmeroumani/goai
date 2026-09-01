@@ -1,7 +1,9 @@
 package google
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/zendev-sh/goai"
@@ -34,6 +37,39 @@ func (f failTokenSource) Token(_ context.Context) (string, error) {
 type googleRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f googleRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// errReadCloser is an io.ReadCloser whose Read always fails, used to drive the
+// io.ReadAll error branch in fileUploader.UploadFile.
+type errReadCloser struct{}
+
+func (errReadCloser) Read([]byte) (int, error) { return 0, errors.New("boom") }
+func (errReadCloser) Close() error             { return nil }
+
+// resumableUploadHandler implements the 2-phase resumable upload protocol used
+// by fileUploader.UploadFile. The START phase responds with an X-Goog-Upload-URL
+// pointing back at the same test server; the UPLOAD+FINALIZE phase returns
+// finalBody. check, when non-nil, is invoked for every request so tests can
+// assert on headers/method/path of each phase.
+func resumableUploadHandler(check func(*http.Request), finalBody string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("X-Goog-Upload-Command") {
+		case "start":
+			if check != nil {
+				check(r)
+			}
+			w.Header().Set("X-Goog-Upload-URL", "http://"+r.Host+"/upload-session")
+			w.WriteHeader(http.StatusOK)
+		case "upload, finalize":
+			if check != nil {
+				check(r)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, finalBody)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}
+}
 
 // --- Streaming tests ---
 
@@ -811,6 +847,52 @@ func TestConvertMessages_Image(t *testing.T) {
 	}
 }
 
+func TestConvertMessages_ImageRemoteRef(t *testing.T) {
+	// A PartImage carrying a RemoteRef must not be dropped: it should emit a
+	// fileData part (or inlineData when the raw bytes are available).
+	msgs := convertMessages([]provider.Message{
+		{Role: provider.RoleUser, Content: []provider.Part{
+			{Type: provider.PartImage, RemoteRef: &provider.RemoteFileRef{
+				ID: "files/img1", URI: "https://generativelanguage.googleapis.com/v1beta/files/img1",
+				MediaType: "image/png",
+			}},
+		}},
+	})
+
+	parts := msgs[0]["parts"].([]map[string]any)
+	fd, ok := parts[0]["fileData"].(map[string]any)
+	if !ok {
+		t.Fatal("expected fileData for remote image ref")
+	}
+	if fd["fileUri"] != "https://generativelanguage.googleapis.com/v1beta/files/img1" {
+		t.Errorf("fileUri = %v", fd["fileUri"])
+	}
+	if fd["mimeType"] != "image/png" {
+		t.Errorf("mimeType = %v", fd["mimeType"])
+	}
+}
+
+func TestConvertMessages_ImageRemoteRefWithData(t *testing.T) {
+	// When the RemoteRef carries raw bytes, emit inlineData instead of fileData.
+	msgs := convertMessages([]provider.Message{
+		{Role: provider.RoleUser, Content: []provider.Part{
+			{Type: provider.PartImage, RemoteRef: &provider.RemoteFileRef{
+				ID: "files/img2", URI: "https://example/files/img2",
+				MediaType: "image/png", Data: []byte("raw-png"),
+			}},
+		}},
+	})
+
+	parts := msgs[0]["parts"].([]map[string]any)
+	inline, ok := parts[0]["inlineData"].(map[string]any)
+	if !ok {
+		t.Fatal("expected inlineData for remote image ref with data")
+	}
+	if inline["data"] != base64.StdEncoding.EncodeToString([]byte("raw-png")) {
+		t.Errorf("data = %v", inline["data"])
+	}
+}
+
 func TestConvertMessages_FileInline(t *testing.T) {
 	msgs := convertMessages([]provider.Message{
 		{Role: provider.RoleUser, Content: []provider.Part{
@@ -1019,7 +1101,7 @@ func TestHasRemoteRef_Google(t *testing.T) {
 }
 
 func TestHttpcParseDataURL(t *testing.T) {
-	mt, data, ok := httpcParseDataURL("data:application/pdf;base64,abc123")
+	mt, data, ok := httpc.ParseDataURL("data:application/pdf;base64,abc123")
 	if !ok {
 		t.Fatal("expected ok")
 	}
@@ -1030,15 +1112,15 @@ func TestHttpcParseDataURL(t *testing.T) {
 		t.Errorf("data = %q", data)
 	}
 
-	_, _, ok = httpcParseDataURL("")
+	_, _, ok = httpc.ParseDataURL("")
 	if ok {
 		t.Error("expected not ok for empty")
 	}
-	_, _, ok = httpcParseDataURL("https://example.com/file.pdf")
+	_, _, ok = httpc.ParseDataURL("https://example.com/file.pdf")
 	if ok {
 		t.Error("expected not ok for non-data URL")
 	}
-	_, _, ok = httpcParseDataURL("data:invalid")
+	_, _, ok = httpc.ParseDataURL("data:invalid")
 	if ok {
 		t.Error("expected not ok for invalid data URL")
 	}
@@ -1056,7 +1138,22 @@ func TestChat_FileUploader_Google(t *testing.T) {
 }
 
 func TestFileUploader_UploadFile_Google(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(resumableUploadHandler(func(r *http.Request) {
+		if r.Method == http.MethodPut {
+			// Finalize phase: verify the upload command and raw body.
+			if r.Header.Get("X-Goog-Upload-Command") != "upload, finalize" {
+				t.Errorf("finalize command = %q", r.Header.Get("X-Goog-Upload-Command"))
+			}
+			if r.Header.Get("X-Goog-Upload-Offset") != "0" {
+				t.Errorf("offset = %q", r.Header.Get("X-Goog-Upload-Offset"))
+			}
+			b, _ := io.ReadAll(r.Body)
+			if string(b) != "fake-pdf-content" {
+				t.Errorf("upload body = %q", string(b))
+			}
+			return
+		}
+		// Start phase.
 		if r.URL.Path != "/upload/v1beta/files" {
 			t.Errorf("path = %q, want /upload/v1beta/files", r.URL.Path)
 		}
@@ -1066,14 +1163,19 @@ func TestFileUploader_UploadFile_Google(t *testing.T) {
 		if r.Header.Get("x-goog-api-key") != "test-key" {
 			t.Errorf("x-goog-api-key = %q", r.Header.Get("x-goog-api-key"))
 		}
-		ct := r.Header.Get("Content-Type")
-		if !strings.Contains(ct, "multipart/form-data") {
-			t.Errorf("Content-Type = %q, want multipart/form-data", ct)
+		if r.Header.Get("X-Goog-Upload-Protocol") != "resumable" {
+			t.Errorf("protocol = %q", r.Header.Get("X-Goog-Upload-Protocol"))
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"file":{"name":"files/abc123","uri":"https://generativelanguage.googleapis.com/v1beta/files/abc123","mimeType":"application/pdf","sizeBytes":"1234","expirationTime":"2025-01-01T00:00:00Z","displayName":"test.pdf","state":"ACTIVE"}}`)
-	}))
+		if r.Header.Get("X-Goog-Upload-Command") != "start" {
+			t.Errorf("command = %q", r.Header.Get("X-Goog-Upload-Command"))
+		}
+		if r.Header.Get("X-Goog-Upload-Header-Content-Length") != "16" {
+			t.Errorf("content-length header = %q", r.Header.Get("X-Goog-Upload-Header-Content-Length"))
+		}
+		if r.Header.Get("X-Goog-Upload-Header-Content-Type") != "application/pdf" {
+			t.Errorf("content-type header = %q", r.Header.Get("X-Goog-Upload-Header-Content-Type"))
+		}
+	}, `{"file":{"name":"files/abc123","uri":"https://generativelanguage.googleapis.com/v1beta/files/abc123","mimeType":"application/pdf","sizeBytes":"1234","expirationTime":"2025-01-01T00:00:00Z","displayName":"test.pdf","state":"ACTIVE"}}`))
 	defer server.Close()
 
 	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
@@ -1110,11 +1212,187 @@ func TestFileUploader_UploadFile_Google(t *testing.T) {
 	}
 }
 
+func TestFileUploader_UploadFile_Google_StartBodyGolden(t *testing.T) {
+	// REQUEST-direction contract test for audit #33: the START phase of the
+	// 2-phase resumable upload must POST the exact metadata JSON body
+	// {"file":{"displayName":...,"mimeType":...}} (no extraneous fields) and
+	// carry the X-Goog-Upload-* headers. The UPLOAD+FINALIZE phase must send
+	// the raw bytes with X-Goog-Upload-Command: "upload, finalize".
+	var startBody string
+	server := httptest.NewServer(resumableUploadHandler(func(r *http.Request) {
+		if r.Header.Get("X-Goog-Upload-Command") == "start" {
+			b, _ := io.ReadAll(r.Body)
+			startBody = string(b)
+		}
+	}, `{"file":{"name":"files/abc123","uri":"https://generativelanguage.googleapis.com/v1beta/files/abc123","mimeType":"application/pdf","sizeBytes":"16","expirationTime":"2025-01-01T00:00:00Z","displayName":"test.pdf","state":"ACTIVE"}}`))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	ref, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("fake-pdf-content"), Filename: "test.pdf", MediaType: "application/pdf",
+	})
+	if err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+
+	// START body must be exactly the metadata envelope.
+	const wantStart = `{"file":{"displayName":"test.pdf","mimeType":"application/pdf"}}`
+	if startBody != wantStart {
+		t.Errorf("START body = %s, want %s", startBody, wantStart)
+	}
+	// sizeBytes is serialized by the GenAI API as a JSON string (proto3 int64);
+	// it must decode into SizeBytes without error.
+	if ref.ID != "files/abc123" {
+		t.Errorf("ref.ID = %q, want files/abc123", ref.ID)
+	}
+}
+
+func TestFileUploader_UploadFile_Google_ResumableMissingURL(t *testing.T) {
+	// The START phase must return an X-Goog-Upload-URL; without it the upload
+	// cannot proceed and should error out.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	_, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "test.txt", MediaType: "text/plain",
+	})
+	if err == nil || !strings.Contains(err.Error(), "X-Goog-Upload-URL") {
+		t.Fatalf("error = %v, want missing X-Goog-Upload-URL error", err)
+	}
+}
+
+func TestFileUploader_UploadFile_Google_SizeBytesString(t *testing.T) {
+	// The GenAI API serializes the proto3 int64 sizeBytes field as a JSON
+	// string (e.g. "123456789"). This is the real wire format and must decode.
+	server := httptest.NewServer(resumableUploadHandler(nil,
+		`{"file":{"name":"files/sz","uri":"https://example/files/sz","mimeType":"application/pdf","sizeBytes":"123456789","displayName":"big.pdf","state":"ACTIVE"}}`))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	ref, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "big.pdf", MediaType: "application/pdf",
+	})
+	if err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+	if ref.ID != "files/sz" {
+		t.Errorf("ref.ID = %q", ref.ID)
+	}
+}
+
+func TestFileUploader_UploadFile_Google_SizeBytesNumber(t *testing.T) {
+	// Some servers emit sizeBytes as a plain JSON number; SizeBytes must accept
+	// that form too.
+	server := httptest.NewServer(resumableUploadHandler(nil,
+		`{"file":{"name":"files/szn","uri":"https://example/files/szn","mimeType":"application/pdf","sizeBytes":987654321,"displayName":"big.pdf","state":"ACTIVE"}}`))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	ref, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "big.pdf", MediaType: "application/pdf",
+	})
+	if err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+	if ref.ID != "files/szn" {
+		t.Errorf("ref.ID = %q", ref.ID)
+	}
+}
+
+func TestFileUploader_UploadFile_Google_SuccessBodyBounded(t *testing.T) {
+	t.Run("oversized success body rejected", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.Header.Get("X-Goog-Upload-Command") {
+			case "start":
+				w.Header().Set("X-Goog-Upload-URL", "http://"+r.Host+"/upload-session")
+				w.WriteHeader(http.StatusOK)
+				return
+			case "upload, finalize":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(bytes.Repeat([]byte{' '}, int(maxGoogleFileResponseBytes)+2))
+				return
+			}
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+		_, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+			Reader: strings.NewReader("data"), Filename: "big.pdf", MediaType: "application/pdf",
+		})
+		if err == nil {
+			t.Fatal("expected error for oversized success body, got nil")
+		}
+		if !strings.Contains(err.Error(), "exceeds") {
+			t.Errorf("err = %v, want substring 'exceeds'", err)
+		}
+	})
+
+	t.Run("normal success body parses", func(t *testing.T) {
+		server := httptest.NewServer(resumableUploadHandler(nil,
+			`{"file":{"name":"files/ok","uri":"https://example/files/ok","mimeType":"application/pdf","sizeBytes":"4","displayName":"a.pdf","state":"ACTIVE"}}`))
+		defer server.Close()
+
+		model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+		ref, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+			Reader: strings.NewReader("data"), Filename: "a.pdf", MediaType: "application/pdf",
+		})
+		if err != nil {
+			t.Fatalf("UploadFile error: %v", err)
+		}
+		if ref.ID != "files/ok" {
+			t.Errorf("ref.ID = %q, want files/ok", ref.ID)
+		}
+	})
+}
+
+// Round-5 fix: an error while reading the upload success body must propagate.
+func TestFileUploader_UploadFile_Google_ReadError(t *testing.T) {
+	transport := googleRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPut {
+			// UPLOAD+FINALIZE phase: the success body read fails.
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       errReadCloser{},
+				Header:     make(http.Header),
+			}, nil
+		}
+		// START phase: return a valid same-origin upload URL.
+		h := make(http.Header)
+		h.Set("X-Goog-Upload-URL", "http://localhost/upload-session")
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("")), Header: h}, nil
+	})
+	model := Chat("gemini-2.5-flash",
+		WithAPIKey("test-key"),
+		WithBaseURL("http://localhost"),
+		WithHTTPClient(&http.Client{Transport: transport}),
+	)
+	_, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "a.pdf", MediaType: "application/pdf",
+	})
+	if err == nil {
+		t.Fatal("expected error from read failure")
+	}
+	if !strings.Contains(err.Error(), "reading response") {
+		t.Errorf("expected 'reading response' error, got: %v", err)
+	}
+}
+
 func TestFileUploader_UploadFile_Google_ProcessingToActive(t *testing.T) {
 	var polls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.Method == http.MethodPost {
+		switch r.Header.Get("X-Goog-Upload-Command") {
+		case "start":
+			w.Header().Set("X-Goog-Upload-URL", "http://"+r.Host+"/upload-session")
+			w.WriteHeader(http.StatusOK)
+			return
+		case "upload, finalize":
+			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprint(w, `{"file":{"name":"files/async","uri":"https://example/files/async","mimeType":"application/pdf","displayName":"async.pdf","state":"PROCESSING"}}`)
 			return
 		}
@@ -1137,8 +1415,17 @@ func TestFileUploader_UploadFile_Google_ProcessingToActive(t *testing.T) {
 
 func TestFileUploader_UploadFile_Google_FailedProcessing(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"file":{"name":"files/failed","state":"FAILED","error":{"message":"unsupported format"}}}`)
+		switch r.Header.Get("X-Goog-Upload-Command") {
+		case "start":
+			w.Header().Set("X-Goog-Upload-URL", "http://"+r.Host+"/upload-session")
+			w.WriteHeader(http.StatusOK)
+			return
+		case "upload, finalize":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"file":{"name":"files/failed","state":"FAILED","error":{"message":"unsupported format"}}}`)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
 	}))
 	defer server.Close()
 
@@ -1154,10 +1441,17 @@ func TestFileUploader_UploadFile_Google_FailedProcessing(t *testing.T) {
 func TestFileUploader_UploadFile_Google_ContextCancelledWhileProcessing(t *testing.T) {
 	polling := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.Method == http.MethodGet {
-			close(polling)
+		switch r.Header.Get("X-Goog-Upload-Command") {
+		case "start":
+			w.Header().Set("X-Goog-Upload-URL", "http://"+r.Host+"/upload-session")
+			w.WriteHeader(http.StatusOK)
+			return
+		case "upload, finalize":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"file":{"name":"files/wait","state":"PROCESSING"}}`)
+			return
 		}
+		close(polling)
 		_, _ = fmt.Fprint(w, `{"file":{"name":"files/wait","state":"PROCESSING"}}`)
 	}))
 	defer server.Close()
@@ -1295,6 +1589,343 @@ func TestFileUploader_UploadFile_Google_HTTPError(t *testing.T) {
 	}
 }
 
+func TestFileUploader_UploadFile_Google_STARTRefusesRedirect(t *testing.T) {
+	// The phase-1 START request must refuse to follow redirects so the
+	// x-goog-api-key (and provider headers) are never forwarded to a redirect
+	// target. A server that redirects the START POST must not be followed.
+	var redirected atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect-target" {
+			redirected.Store(true)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Redirect(w, r, "http://"+r.Host+"/redirect-target", http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	_, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "test.pdf", MediaType: "application/pdf",
+	})
+	if err == nil {
+		t.Fatal("expected error from non-200 START response")
+	}
+	if redirected.Load() {
+		t.Fatal("START request followed a redirect")
+	}
+}
+
+func TestFileUploader_UploadFile_Google_RejectsCrossOriginUploadURL(t *testing.T) {
+	// SSRF defense (FINDING-001): the START phase supplies an X-Goog-Upload-URL
+	// pointing at a foreign host. UploadFile must refuse to PUT the file bytes
+	// (and the x-goog-api-key) to that host, and the foreign host must never be
+	// contacted.
+	var externalCalls atomic.Int32
+	external := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		externalCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer external.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Goog-Upload-Command") == "start" {
+			w.Header().Set("X-Goog-Upload-URL", external.URL+"/upload-session")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	_, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "test.pdf", MediaType: "application/pdf",
+	})
+	if err == nil || !strings.Contains(err.Error(), "configured API origin") {
+		t.Fatalf("error = %v, want configured API origin error", err)
+	}
+	if externalCalls.Load() != 0 {
+		t.Fatalf("cross-origin upload endpoint called %d times", externalCalls.Load())
+	}
+}
+
+func TestFileUploader_UploadFile_Google_SendingUploadRequestError(t *testing.T) {
+	// A transport failure on the UPLOAD+FINALIZE PUT must surface the
+	// "sending upload request" error. The START phase returns a same-origin
+	// upload URL; the PUT then hits a transport that fails.
+	transport := googleRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"X-Goog-Upload-Url": {"http://example.com/upload-session"},
+				},
+				Body: io.NopCloser(strings.NewReader("")),
+			}, nil
+		}
+		return nil, errors.New("transport failed on upload")
+	})
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL("http://example.com"), WithHTTPClient(&http.Client{Transport: transport}))
+	_, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "test.pdf", MediaType: "application/pdf",
+	})
+	if err == nil || !strings.Contains(err.Error(), "sending upload request") {
+		t.Fatalf("error = %v, want sending upload request error", err)
+	}
+}
+
+func TestFileUploader_UploadFile_Google_RejectsCrossOriginUploadRedirect(t *testing.T) {
+	// Redirect protection (FINDING-001): a same-origin upload session that
+	// redirects to a foreign host must be refused, and the foreign host must
+	// never receive the file bytes or the x-goog-api-key.
+	var externalCalls atomic.Int32
+	external := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		externalCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer external.Close()
+
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/upload/v1beta/files":
+			w.Header().Set("X-Goog-Upload-URL", serverURL+"/upload-session")
+			w.WriteHeader(http.StatusOK)
+		case "/upload-session":
+			http.Redirect(w, r, external.URL+"/steal", http.StatusFound)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL), WithHeaders(map[string]string{"X-Custom": "value"}))
+	_, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "test.pdf", MediaType: "application/pdf",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cross-origin redirect") {
+		t.Fatalf("error = %v, want cross-origin redirect error", err)
+	}
+	if externalCalls.Load() != 0 {
+		t.Fatalf("cross-origin redirect target called %d times", externalCalls.Load())
+	}
+}
+
+func TestFileUploader_UploadFile_Google_UsesPreviousCheckRedirect(t *testing.T) {
+	// uploadHTTPClient must delegate to a pre-existing CheckRedirect on the
+	// configured client for same-origin redirects.
+	var prevCalled atomic.Int32
+	client := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			prevCalled.Add(1)
+			return nil
+		},
+	}
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/upload/v1beta/files":
+			w.Header().Set("X-Goog-Upload-URL", serverURL+"/upload-session")
+			w.WriteHeader(http.StatusOK)
+		case "/upload-session":
+			http.Redirect(w, r, serverURL+"/finalize", http.StatusFound)
+		case "/finalize":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"file":{"name":"files/pc","uri":"https://example/files/pc","mimeType":"application/pdf","sizeBytes":"1","displayName":"pc.pdf","state":"ACTIVE"}}`)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL), WithHTTPClient(client))
+	ref, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "pc.pdf", MediaType: "application/pdf",
+	})
+	if err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+	if ref.ID != "files/pc" {
+		t.Errorf("ref.ID = %q", ref.ID)
+	}
+	if prevCalled.Load() == 0 {
+		t.Error("previous CheckRedirect was not called")
+	}
+}
+
+func TestFileUploader_UploadFile_Google_StopsAfterRedirectLimit(t *testing.T) {
+	// A same-origin redirect loop must eventually be stopped by the redirect
+	// cap in uploadHTTPClient.
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/upload/v1beta/files":
+			w.Header().Set("X-Goog-Upload-URL", serverURL+"/upload-session")
+			w.WriteHeader(http.StatusOK)
+		case "/upload-session":
+			http.Redirect(w, r, serverURL+"/upload-session", http.StatusFound)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	_, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "test.pdf", MediaType: "application/pdf",
+	})
+	if err == nil || !strings.Contains(err.Error(), "stopped after 10 redirects") {
+		t.Fatalf("error = %v, want stopped after 10 redirects error", err)
+	}
+}
+
+func TestFileUploader_UploadFile_Google_AllowsSameOriginUploadRedirect(t *testing.T) {
+	// A same-origin redirect during the upload phase must be followed so the
+	// resumable protocol works with servers that bounce the session URL.
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/upload/v1beta/files":
+			w.Header().Set("X-Goog-Upload-URL", serverURL+"/upload-session")
+			w.WriteHeader(http.StatusOK)
+		case "/upload-session":
+			http.Redirect(w, r, serverURL+"/finalize", http.StatusFound)
+		case "/finalize":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"file":{"name":"files/redirected","uri":"https://example/files/redirected","mimeType":"application/pdf","sizeBytes":"5","displayName":"r.pdf","state":"ACTIVE"}}`)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	ref, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "r.pdf", MediaType: "application/pdf",
+	})
+	if err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+	if ref.ID != "files/redirected" {
+		t.Errorf("ref.ID = %q", ref.ID)
+	}
+}
+
+func TestSizeBytes_UnmarshalJSON(t *testing.T) {
+	var s SizeBytes
+	if err := json.Unmarshal([]byte(`"123"`), &s); err != nil || s != 123 {
+		t.Fatalf("string form: s=%d err=%v", s, err)
+	}
+	if err := json.Unmarshal([]byte(`456`), &s); err != nil || s != 456 {
+		t.Fatalf("number form: s=%d err=%v", s, err)
+	}
+	if err := json.Unmarshal([]byte(`"abc"`), &s); err == nil {
+		t.Fatal("want error for non-numeric string")
+	}
+	// Direct calls to UnmarshalJSON cover the inner decode-error branches that
+	// json.Unmarshal itself rejects before dispatching.
+	if err := s.UnmarshalJSON([]byte(`"\x"`)); err == nil {
+		t.Fatal("want error for invalid string escape")
+	}
+	if err := s.UnmarshalJSON([]byte(`true`)); err == nil {
+		t.Fatal("want error for non-number JSON value")
+	}
+}
+
+func TestValidateResourceName(t *testing.T) {
+	for _, name := range []string{"files/abc123", "files/ok", "operations/123"} {
+		if err := validateResourceName(name); err != nil {
+			t.Errorf("validateResourceName(%q) = %v, want nil", name, err)
+		}
+	}
+	// Literal and percent-encoded traversal variants must all be rejected. The
+	// percent-encoded forms ("..%2f", "..%2e%2e%2f", ...) previously bypassed
+	// the naive ../ check because the server decodes them after the ID is
+	// interpolated into the URL.
+	for _, name := range []string{
+		"", "/files/x", "files/../x", "files/..\\x",
+		"..%2f..%2fadmin", "..%2e%2e%2f", "%2e%2e%2f", "files/%2e%2e/admin",
+	} {
+		if err := validateResourceName(name); err == nil {
+			t.Errorf("validateResourceName(%q) = nil, want error", name)
+		}
+	}
+}
+
+func TestEscapeResourcePath(t *testing.T) {
+	// The collection/id separator ("/") is preserved so real names keep their
+	// meaning, while each segment is escaped to neutralize special characters.
+	for _, tt := range []struct{ in, want string }{
+		{"files/abc123", "files/abc123"},
+		{"operations/123", "operations/123"},
+		{"files/a b", "files/a%20b"},
+		{"files/a?b#c", "files/a%3Fb%23c"},
+	} {
+		if got := escapeResourcePath(tt.in); got != tt.want {
+			t.Errorf("escapeResourcePath(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestWaitForFile_UnsafeName(t *testing.T) {
+	u := &fileUploader{opts: options{tokenSource: provider.StaticToken("test-key"), baseURL: "http://example.com"}}
+	_, err := u.waitForFile(t.Context(), googleFile{State: "PROCESSING", Name: "files/../../admin"})
+	if err == nil || !strings.Contains(err.Error(), "path traversal") {
+		t.Fatalf("error = %v, want path traversal error", err)
+	}
+}
+
+func TestFileUploader_DeleteFile_UnsafeID(t *testing.T) {
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL("http://example.com"))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+	err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "files/../../admin"})
+	if err == nil || !strings.Contains(err.Error(), "path traversal") {
+		t.Fatalf("error = %v, want path traversal error", err)
+	}
+}
+
+func TestFileUploader_UploadFile_Google_UploadPhaseHTTPError(t *testing.T) {
+	// When the UPLOAD+FINALIZE phase returns a non-200 status, the response
+	// must be turned into a parsed HTTP error via ParseHTTPErrorWithHeaders
+	// (file.go:127-129).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("X-Goog-Upload-Command") {
+		case "start":
+			w.Header().Set("X-Goog-Upload-URL", "http://"+r.Host+"/upload-session")
+			w.WriteHeader(http.StatusOK)
+		case "upload, finalize":
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"upload rejected"}}`)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	_, err := model.(provider.FileUploadCapableModel).FileUploader().UploadFile(t.Context(), provider.FileUpload{
+		Reader: strings.NewReader("data"), Filename: "test.pdf", MediaType: "application/pdf",
+	})
+	if err == nil || !strings.Contains(err.Error(), "upload rejected") {
+		t.Fatalf("error = %v, want upload rejected error", err)
+	}
+}
+
+func TestFileUploader_httpClient_ReturnsConfiguredClient(t *testing.T) {
+	// httpClient() must return the caller-supplied client when opts.httpClient
+	// is non-nil (file.go:148).
+	custom := &http.Client{}
+	u := &fileUploader{opts: options{httpClient: custom}}
+	if got := u.httpClient(); got != custom {
+		t.Errorf("httpClient() = %v, want the configured client", got)
+	}
+}
+
 func TestFileUploader_DeleteFile_Google(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1beta/files/abc123" {
@@ -1319,6 +1950,27 @@ func TestFileUploader_DeleteFile_Google(t *testing.T) {
 	}
 }
 
+func TestFileUploader_DeleteFile_Google_EscapesSpecialChars(t *testing.T) {
+	// Defense-in-depth: a caller-supplied ID with special characters must be
+	// path-escaped before interpolation (file.go DeleteFile), so the request
+	// hits the escaped path rather than smuggling query/fragment delimiters.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.EscapedPath(); got != "/v1beta/files/a%20b%3Fc" {
+			t.Errorf("escaped path = %q, want /v1beta/files/a%%20b%%3Fc", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "files/a b?c"})
+	if err != nil {
+		t.Fatalf("DeleteFile error: %v", err)
+	}
+}
+
 func TestFileUploader_DeleteFile_Google_HTTPError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -1336,10 +1988,15 @@ func TestFileUploader_DeleteFile_Google_HTTPError(t *testing.T) {
 }
 
 func TestFileUploader_UploadFile_EmptyMediaType_Google(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"file":{"name":"files/mediatype","uri":"https://generativelanguage.googleapis.com/v1beta/files/mediatype","mimeType":"application/octet-stream","sizeBytes":"3","displayName":"test.bin","state":"ACTIVE"}}`)
-	}))
+	server := httptest.NewServer(resumableUploadHandler(func(r *http.Request) {
+		if r.Method == http.MethodPut {
+			return
+		}
+		// Start phase: content type should be detected from the raw bytes.
+		if r.Header.Get("X-Goog-Upload-Header-Content-Type") == "" {
+			t.Error("content-type header should be detected when MediaType is empty")
+		}
+	}, `{"file":{"name":"files/mediatype","uri":"https://generativelanguage.googleapis.com/v1beta/files/mediatype","mimeType":"application/octet-stream","sizeBytes":"3","displayName":"test.bin","state":"ACTIVE"}}`))
 	defer server.Close()
 
 	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
@@ -1361,10 +2018,7 @@ func TestFileUploader_UploadFile_EmptyMediaType_Google(t *testing.T) {
 }
 
 func TestFileUploader_UploadFile_InvalidJSON_Google(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `not-json`)
-	}))
+	server := httptest.NewServer(resumableUploadHandler(nil, `not-json`))
 	defer server.Close()
 
 	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
@@ -1409,13 +2063,11 @@ func TestFileUploader_UploadFile_TokenError_Google(t *testing.T) {
 }
 
 func TestFileUploader_UploadFile_Headers_Google(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(resumableUploadHandler(func(r *http.Request) {
 		if r.Header.Get("X-Custom") != "value" {
 			t.Errorf("X-Custom = %q", r.Header.Get("X-Custom"))
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"file":{"name":"files/headers","uri":"https://generativelanguage.googleapis.com/v1beta/files/headers","mimeType":"text/plain","sizeBytes":"3","displayName":"test.txt","state":"ACTIVE"}}`)
-	}))
+	}, `{"file":{"name":"files/headers","uri":"https://generativelanguage.googleapis.com/v1beta/files/headers","mimeType":"text/plain","sizeBytes":"3","displayName":"test.txt","state":"ACTIVE"}}`))
 	defer server.Close()
 
 	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL), WithHeaders(map[string]string{"X-Custom": "value"}))
@@ -1431,6 +2083,44 @@ func TestFileUploader_UploadFile_Headers_Google(t *testing.T) {
 	}
 	if ref.ID != "files/headers" {
 		t.Errorf("ref.ID = %q", ref.ID)
+	}
+}
+
+// TestFileUploader_UploadFile_AuthHeaderCannotBeOverridden verifies the
+// auth-override invariant on the file upload path: a caller-supplied
+// x-goog-api-key header must NOT override the real credential on the START
+// phase, the UPLOAD+FINALIZE phase, or the poll GET.
+func TestFileUploader_UploadFile_AuthHeaderCannotBeOverridden(t *testing.T) {
+	seen := map[string]bool{}
+	server := httptest.NewServer(resumableUploadHandler(func(r *http.Request) {
+		if got := r.Header.Get("x-goog-api-key"); got != "test-key" {
+			t.Errorf("[%s] x-goog-api-key = %q, want test-key (credential must win)", r.Method, got)
+		}
+		seen[r.Method] = true
+	}, `{"file":{"name":"files/auth","uri":"https://generativelanguage.googleapis.com/v1beta/files/auth","mimeType":"text/plain","sizeBytes":"3","displayName":"test.txt","state":"ACTIVE"}}`))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-flash",
+		WithAPIKey("test-key"),
+		WithBaseURL(server.URL),
+		// Caller attempts to spoof the credential.
+		WithHeaders(map[string]string{"x-goog-api-key": "spoofed"}),
+	)
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	ref, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:    strings.NewReader("abc"),
+		Filename:  "test.txt",
+		MediaType: "text/plain",
+	})
+	if err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+	if ref.ID != "files/auth" {
+		t.Errorf("ref.ID = %q", ref.ID)
+	}
+	if !seen[http.MethodPost] || !seen[http.MethodPut] {
+		t.Errorf("expected both START (POST) and UPLOAD (PUT) phases to be checked, saw %v", seen)
 	}
 }
 
@@ -1704,6 +2394,67 @@ func TestWithHeaders(t *testing.T) {
 	}
 }
 
+// TestChat_AuthHeaderCannotBeOverridden verifies the auth-override invariant:
+// a caller-supplied header named like the auth header (via WithHeaders or
+// per-request params.Headers) must NOT override the real credential. The
+// credential is applied LAST, so it always wins.
+func TestChat_AuthHeaderCannotBeOverridden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("x-goog-api-key"); got != "test-key" {
+			t.Errorf("x-goog-api-key = %q, want test-key (credential must win)", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-flash",
+		WithAPIKey("test-key"),
+		WithBaseURL(server.URL),
+		// Provider-level header attempting to spoof the credential.
+		WithHeaders(map[string]string{"x-goog-api-key": "spoofed-provider"}),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		// Per-request header attempting to spoof the credential.
+		Headers: map[string]string{"x-goog-api-key": "spoofed-per-request"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestChat_Vertex_AuthHeaderCannotBeOverridden is the Vertex variant: the
+// bearer Authorization header must win over any caller-supplied Authorization.
+func TestChat_Vertex_AuthHeaderCannotBeOverridden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer oauth-token" {
+			t.Errorf("Authorization = %q, want Bearer oauth-token (credential must win)", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-pro",
+		WithTokenSource(provider.StaticToken("oauth-token")),
+		withVertex("my-proj", "us-central1"),
+		withVertexBaseURL(server.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer spoofed"}),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		Headers: map[string]string{"Authorization": "Bearer spoofed-per-request"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNoTokenSource(t *testing.T) {
 	t.Setenv("GOOGLE_GENERATIVE_AI_API_KEY", "")
 	t.Setenv("GEMINI_API_KEY", "")
@@ -1746,6 +2497,170 @@ func TestModelID(t *testing.T) {
 	model := Chat("gemini-2.5-flash", WithAPIKey("key"))
 	if model.ModelID() != "gemini-2.5-flash" {
 		t.Errorf("ModelID() = %q", model.ModelID())
+	}
+}
+
+func TestParseResponse_ExtraPartsPreserved(t *testing.T) {
+	// Gemini can return richer part types (inlineData, executableCode,
+	// codeExecutionResult, fileData, videoMetadata). These must be surfaced
+	// under metadata.google.parts instead of being dropped.
+	body := `{"candidates":[{"content":{"parts":[
+		{"text":"summary"},
+		{"inlineData":{"mimeType":"image/png","data":"aGVsbG8="}},
+		{"executableCode":{"code":"print(1)","language":"PYTHON"}},
+		{"codeExecutionResult":{"output":"1"}},
+		{"fileData":{"fileUri":"files/x","mimeType":"application/pdf"}},
+		{"videoMetadata":{"videoDuration":"3.5s"}}
+	]},"finishReason":"STOP"}]}`
+
+	result, err := parseResponse([]byte(body))
+	if err != nil {
+		t.Fatalf("parseResponse error: %v", err)
+	}
+	if result.Text != "summary" {
+		t.Errorf("Text = %q, want summary", result.Text)
+	}
+	gm := result.ProviderMetadata["google"]
+	if gm == nil {
+		t.Fatal("expected google provider metadata")
+	}
+	parts, ok := gm["parts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("parts type = %T, want []map[string]any", gm["parts"])
+	}
+	if len(parts) != 5 {
+		t.Fatalf("len(parts) = %d, want 5", len(parts))
+	}
+	if _, ok := parts[0]["inlineData"]; !ok {
+		t.Error("expected inlineData part")
+	}
+	if _, ok := parts[1]["executableCode"]; !ok {
+		t.Error("expected executableCode part")
+	}
+	if _, ok := parts[2]["codeExecutionResult"]; !ok {
+		t.Error("expected codeExecutionResult part")
+	}
+	if _, ok := parts[3]["fileData"]; !ok {
+		t.Error("expected fileData part")
+	}
+	if _, ok := parts[4]["videoMetadata"]; !ok {
+		t.Error("expected videoMetadata part")
+	}
+}
+
+// TestChat_Generate_ExtraPartsRoundTrip is the RESPONSE-direction contract
+// test for audit #32: a mock HTTP server returns a latest-schema fixture
+// containing inlineData / executableCode / codeExecutionResult / fileData /
+// videoMetadata parts, and the parsed GenerateResult must preserve all of
+// them under metadata.google.parts instead of dropping them.
+func TestChat_Generate_ExtraPartsRoundTrip(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"modelVersion": "gemini-2.5-flash",
+			"candidates":[{"content":{"parts":[
+				{"text":"summary"},
+				{"inlineData":{"mimeType":"image/png","data":"aGVsbG8="}},
+				{"executableCode":{"code":"print(1)","language":"PYTHON"}},
+				{"codeExecutionResult":{"output":"1"}},
+				{"fileData":{"fileUri":"files/x","mimeType":"application/pdf"}},
+				{"videoMetadata":{"videoDuration":"3.5s"}}
+			]},"finishReason":"STOP"}],
+			"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}
+		}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-flash", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	result, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "summary" {
+		t.Errorf("Text = %q, want summary", result.Text)
+	}
+	gm := result.ProviderMetadata["google"]
+	if gm == nil {
+		t.Fatal("expected google provider metadata")
+	}
+	parts, ok := gm["parts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("parts type = %T, want []map[string]any", gm["parts"])
+	}
+	if len(parts) != 5 {
+		t.Fatalf("len(parts) = %d, want 5", len(parts))
+	}
+	wantKeys := []string{"inlineData", "executableCode", "codeExecutionResult", "fileData", "videoMetadata"}
+	for i, key := range wantKeys {
+		if _, ok := parts[i][key]; !ok {
+			t.Errorf("parts[%d] missing %q: %v", i, key, parts[i])
+		}
+	}
+	// The inlineData payload must survive intact (base64 "hello").
+	if inline, ok := parts[0]["inlineData"].(map[string]any); ok {
+		if inline["data"] != "aGVsbG8=" {
+			t.Errorf("inlineData.data = %v, want aGVsbG8=", inline["data"])
+		}
+	}
+}
+
+func TestParseSSE_ExtraPartSurfaced(t *testing.T) {
+	// Streaming path must also surface non-text parts as a text chunk carrying
+	// metadata.google.part rather than dropping them.
+	payload := `{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"aGVsbG8="}}]},"finishReason":"STOP"}]}`
+	ctx := context.Background()
+	out := make(chan provider.StreamChunk, 16)
+	go parseSSE(ctx, strings.NewReader("data: "+payload+"\n\n"), out)
+
+	var sawPart bool
+	for ch := range out {
+		if ch.Metadata != nil {
+			if gm, ok := ch.Metadata["google"].(map[string]any); ok {
+				if _, ok := gm["part"]; ok {
+					sawPart = true
+				}
+			}
+		}
+	}
+	if !sawPart {
+		t.Error("expected a chunk surfacing the inlineData part under metadata.google.part")
+	}
+}
+
+func TestExtraPart_UnknownReturnsNil(t *testing.T) {
+	// extraPart() must return nil (the default case) for a part that is none
+	// of the recognized non-text types (google.go:758).
+	if got := (geminiPart{}).extraPart(); got != nil {
+		t.Errorf("extraPart() = %v, want nil for unrecognized part", got)
+	}
+	// Sanity: recognized part types still yield a structured map, so the nil
+	// above is specifically the fall-through, not a regression.
+	if got := (geminiPart{InlineData: &struct {
+		MimeType string `json:"mimeType"`
+		Data     string `json:"data"`
+	}{MimeType: "image/png", Data: "aGVsbG8="}}).extraPart(); got == nil {
+		t.Error("expected inlineData part to be surfaced")
+	}
+}
+
+func TestParseSSE_ExtraPartContextCancelled(t *testing.T) {
+	// When an extra (non-text) part is surfaced and TrySend fails because the
+	// context is cancelled, parseSSE must return early (google.go:872).
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	input := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"aGVsbG8=\"}}]}}]}\n"
+	out := make(chan provider.StreamChunk) // unbuffered
+	done := make(chan struct{})
+	go func() {
+		parseSSE(ctx, strings.NewReader(input), out)
+		close(done)
+	}()
+	<-done
+	for range out {
 	}
 }
 
@@ -2203,8 +3118,13 @@ func TestBuildRequest_ImageConfig(t *testing.T) {
 	if ic["aspectRatio"] != "16:9" {
 		t.Errorf("aspectRatio = %v, want 16:9", ic["aspectRatio"])
 	}
-	if ic["imageSize"] != "2K" {
-		t.Errorf("imageSize = %v, want 2K", ic["imageSize"])
+	// imageSize is not an official ImageConfig field -- it must be hoisted to
+	// the top-level generationConfig instead of nested under imageConfig.
+	if _, hasSize := ic["imageSize"]; hasSize {
+		t.Error("imageSize should not remain nested under imageConfig")
+	}
+	if config["imageSize"] != "2K" {
+		t.Errorf("imageSize = %v, want 2K at top-level generationConfig", config["imageSize"])
 	}
 }
 
@@ -2242,6 +3162,8 @@ func TestBuildRequest_RetrievalConfig(t *testing.T) {
 }
 
 func TestBuildRequest_Labels(t *testing.T) {
+	// `labels` is not an official GenerateContentRequest field, so it must not
+	// be emitted on the wire even when supplied via ProviderOptions.
 	m := &chatModel{id: "gemini-2.5-flash", opts: options{baseURL: defaultBaseURL}}
 	body, _ := m.buildRequest(provider.GenerateParams{
 		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
@@ -2255,15 +3177,12 @@ func TestBuildRequest_Labels(t *testing.T) {
 		},
 	})
 
-	labels, ok := body.Labels.(map[string]any)
-	if !ok {
-		t.Fatalf("Labels type = %T, want map", body.Labels)
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
 	}
-	if labels["team"] != "backend" {
-		t.Errorf("labels.team = %v, want backend", labels["team"])
-	}
-	if labels["project"] != "myapp" {
-		t.Errorf("labels.project = %v, want myapp", labels["project"])
+	if strings.Contains(string(raw), "labels") {
+		t.Errorf("request body should not contain labels, got %s", raw)
 	}
 }
 
@@ -2417,9 +3336,6 @@ func TestBuildRequest_NoProviderOptions(t *testing.T) {
 	if body.CachedContent != nil {
 		t.Error("CachedContent should be nil")
 	}
-	if body.Labels != nil {
-		t.Error("Labels should be nil")
-	}
 	config := body.GenerationConfig.(map[string]any)
 	if _, ok := config["responseModalities"]; ok {
 		t.Error("responseModalities should not be set")
@@ -2510,10 +3426,9 @@ func TestChat_Generate_ProviderOptionsPassthrough(t *testing.T) {
 			t.Errorf("cachedContent = %v, want cachedContents/xyz", req["cachedContent"])
 		}
 
-		// Check labels.
-		labels, ok := req["labels"].(map[string]any)
-		if !ok || labels["env"] != "test" {
-			t.Errorf("labels = %v, want {env: test}", req["labels"])
+		// Check labels are NOT emitted (not an official GenerateContentRequest field).
+		if _, hasLabels := req["labels"]; hasLabels {
+			t.Error("labels should not be in request body")
 		}
 
 		// Check generationConfig fields.
@@ -2575,7 +3490,6 @@ func TestBuildRequest_AllProviderOptions(t *testing.T) {
 				"mediaResolution":    "MEDIA_RESOLUTION_MEDIUM",
 				"imageConfig":        map[string]any{"aspectRatio": "1:1"},
 				"retrievalConfig":    map[string]any{"latLng": map[string]any{"latitude": 0.0, "longitude": 0.0}},
-				"labels":             map[string]any{"a": "b"},
 				"audioTimestamp":     true,
 			},
 		},
@@ -2605,15 +3519,111 @@ func TestBuildRequest_AllProviderOptions(t *testing.T) {
 	if config["audioTimestamp"] != true {
 		t.Error("audioTimestamp should be true")
 	}
-	if body.Labels == nil {
-		t.Error("Labels should be set")
-	}
 	toolCfg := body.ToolConfig.(map[string]any)
 	if toolCfg["functionCallingConfig"] == nil {
 		t.Error("functionCallingConfig should be set")
 	}
 	if toolCfg["retrievalConfig"] == nil {
 		t.Error("retrievalConfig should be set")
+	}
+}
+
+// TestBuildRequest_GoldenContract is a full-body REQUEST contract test. It
+// locks the exact outgoing GenerateContentRequest JSON against the latest
+// Gemini schema, exercising several audited fixes at once:
+//
+//   - #30: labels must NOT appear on the wire (not an official field).
+//   - #34: thinkingLevel lives inside thinkingConfig; audioTimestamp and
+//     imageSize are top-level GenerationConfig fields (imageSize is hoisted
+//     out of imageConfig).
+//   - #35: the fileSearch provider tool is emitted as {"fileSearch": {...}}.
+//   - #37: a PartImage carrying a RemoteRef is emitted as a fileData part.
+func TestBuildRequest_GoldenContract(t *testing.T) {
+	m := &chatModel{id: "gemini-3-pro", opts: options{baseURL: defaultBaseURL}}
+	body, err := m.buildRequest(provider.GenerateParams{
+		System: "You are helpful.",
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{
+				{Type: provider.PartText, Text: "analyze this"},
+				{Type: provider.PartImage, RemoteRef: &provider.RemoteFileRef{
+					ID:        "files/img1",
+					URI:       "https://generativelanguage.googleapis.com/v1beta/files/img1",
+					MediaType: "image/png",
+				}},
+			}},
+		},
+		Tools: []provider.ToolDefinition{
+			{Name: "get_weather", Description: "Get weather", InputSchema: json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}`)},
+			Tools.FileSearch(WithDynamicThreshold(0.3)),
+		},
+		ProviderOptions: map[string]any{
+			"google": map[string]any{
+				// labels is not an official GenerateContentRequest field and
+				// must be silently dropped (audit #30).
+				"labels":         map[string]any{"env": "test"},
+				"audioTimestamp": true,
+				// imageSize is not an ImageConfig field: it must be hoisted to
+				// the top level of generationConfig (audit #34).
+				"imageConfig": map[string]any{"aspectRatio": "16:9", "imageSize": "1K"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildRequest error: %v", err)
+	}
+
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// Explicit negative assertion for #30 (labels must never reach the wire).
+	if strings.Contains(string(raw), "labels") {
+		t.Errorf("request body must not contain labels, got %s", raw)
+	}
+
+	const want = `{
+		"systemInstruction": {"parts": [{"text": "You are helpful."}]},
+		"tools": [
+			{"functionDeclarations": [{
+				"name": "get_weather",
+				"description": "Get weather",
+				"parameters": {
+					"type": "object",
+					"properties": {"city": {"type": "string"}},
+					"required": ["city"]
+				}
+			}]},
+			{"fileSearch": {"dynamicRetrievalConfig": {"dynamicThreshold": 0.3}}}
+		],
+		"generationConfig": {
+			"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "high"},
+			"audioTimestamp": true,
+			"imageSize": "1K",
+			"imageConfig": {"aspectRatio": "16:9"}
+		},
+		"contents": [
+			{"role": "user", "parts": [
+				{"text": "analyze this"},
+				{"fileData": {
+					"fileUri": "https://generativelanguage.googleapis.com/v1beta/files/img1",
+					"mimeType": "image/png"
+				}}
+			]}
+		]
+	}`
+
+	var got, exp map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal got: %v", err)
+	}
+	if err := json.Unmarshal([]byte(want), &exp); err != nil {
+		t.Fatalf("unmarshal want: %v", err)
+	}
+	if !reflect.DeepEqual(got, exp) {
+		gotJSON, _ := json.MarshalIndent(got, "", "  ")
+		expJSON, _ := json.MarshalIndent(exp, "", "  ")
+		t.Errorf("request body mismatch\n--- got ---\n%s\n--- want ---\n%s", gotJSON, expJSON)
 	}
 }
 

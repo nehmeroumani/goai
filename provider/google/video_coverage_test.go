@@ -443,6 +443,17 @@ func TestVideo_ReadAndRedirectHelpers(t *testing.T) {
 	if sameOrigin("%", "https://video.example.test") || sameOrigin("https://video.example.test", "%") {
 		t.Fatal("invalid URL reported as same origin")
 	}
+	// Userinfo on either side must disqualify the URL: "https://evil@api.google.com"
+	// shares scheme+host with the origin but must not be treated as same-origin.
+	if sameOrigin("https://evil@api.google.com", "https://api.google.com") {
+		t.Fatal("URL with userinfo reported as same origin")
+	}
+	if sameOrigin("https://api.google.com", "https://user@api.google.com") {
+		t.Fatal("origin with userinfo reported as same origin")
+	}
+	if !sameOrigin("https://api.google.com/v1beta/files/x", "https://api.google.com") {
+		t.Fatal("clean same-origin URL rejected")
+	}
 
 	var previousCalled atomic.Bool
 	model := &videoModel{opts: options{

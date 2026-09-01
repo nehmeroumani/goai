@@ -45,6 +45,24 @@ var openAIProtectedKeys = map[string]bool{
 	"tools": true, "tool_choice": true, "response_format": true,
 }
 
+// Accumulation caps that bound worst-case memory from a malicious or
+// misbehaving provider streaming unbounded data. Generous enough for
+// legitimate large outputs (multi-hundred-thousand-token generations) while
+// preventing client OOM. Declared as package vars so tests can lower them.
+var (
+	// maxToolCallArgsBytes caps the bytes buffered for a single streaming
+	// tool call's argument fragments before they are finalized.
+	maxToolCallArgsBytes int64 = 64 << 20 // 64 MiB
+
+	// maxCitationsBytes caps the total bytes of top-level citation URLs
+	// accumulated across a stream.
+	maxCitationsBytes int64 = 64 << 20 // 64 MiB
+
+	// maxResponseBodyBytes caps the non-streaming response body read in
+	// DoGenerate / DoEmbed.
+	maxResponseBodyBytes int64 = 64 << 20 // 64 MiB
+)
+
 // RequestConfig holds provider-specific settings for building requests.
 type RequestConfig struct {
 	// IncludeStreamOptions adds stream_options.include_usage to the request.
@@ -57,9 +75,36 @@ type RequestConfig struct {
 	// reasoning_content field. Providers must opt in when their API requires it.
 	IncludeReasoningContent bool
 
-	// UseMaxCompletionTokens forces the max_tokens / max_completion_tokens choice
-	// instead of deriving it from modelID. Nil keeps the modelID heuristic.
+	// UseMaxCompletionTokens is a provider policy: when true the request body
+	// always emits max_completion_tokens (renaming any max_tokens); when false
+	// it always emits max_tokens. Nil keeps the modelID heuristic
+	// (IsReasoningModel). It expresses a provider-wide wire-format preference,
+	// NOT an inference about whether the model is a reasoning model. Providers
+	// that accept both fields (e.g. Groq) force it true; routers to
+	// heterogeneous upstreams (e.g. OpenRouter) leave it nil and let callers
+	// opt in via a typed option.
 	UseMaxCompletionTokens *bool
+
+	// JsonSchemaAsJsonObject makes structured output emit
+	// {"type":"json_object","schema":{...}} instead of
+	// {"type":"json_schema","json_schema":{...}}. Fireworks only accepts the
+	// former shape (item 44).
+	JsonSchemaAsJsonObject bool
+
+	// JsonObjectAsJsonSchema makes schema-less JSON mode emit a generic
+	// {"type":"json_schema","json_schema":{...}} object instead of
+	// {"type":"json_object"}. Perplexity Sonar only accepts text/json_schema
+	// and rejects json_object (item 55).
+	JsonObjectAsJsonSchema bool
+
+	// SeedKey is the wire-format key used for the seed parameter. Defaults to
+	// "seed"; Mistral uses "random_seed" (item 57).
+	SeedKey string
+
+	// FlatInputFile makes PDF parts serialize as the flat
+	// {"type":"input_file","file_data":...} shape instead of the nested
+	// {"type":"file","file":{...}} shape. Requesty requires the flat form (item 59).
+	FlatInputFile bool
 }
 
 // BuildRequest creates a standard OpenAI chat/completions request body.
@@ -80,7 +125,10 @@ func BuildRequest(params provider.GenerateParams, modelID string, streaming bool
 	}
 
 	// Messages
-	body["messages"] = ConvertMessages(params.Messages, params.System, cfg.IncludeReasoningContent)
+	body["messages"] = ConvertMessagesWithConfig(params.Messages, params.System, MessagesConfig{
+		IncludeReasoningContent: cfg.IncludeReasoningContent,
+		FlatInputFile:           cfg.FlatInputFile,
+	})
 
 	// Extract structuredOutputs and strictJsonSchema once -- used by both tools and response format.
 	structuredOutputs := true // default true, matching Vercel
@@ -167,7 +215,11 @@ func BuildRequest(params provider.GenerateParams, modelID string, streaming bool
 		body["presence_penalty"] = *params.PresencePenalty
 	}
 	if params.Seed != nil {
-		body["seed"] = *params.Seed
+		seedKey := cfg.SeedKey
+		if seedKey == "" {
+			seedKey = "seed"
+		}
+		body[seedKey] = *params.Seed
 	}
 
 	// Stop sequences
@@ -190,28 +242,55 @@ func BuildRequest(params provider.GenerateParams, modelID string, streaming bool
 		if structuredOutputs && len(params.ResponseFormat.Schema) > 0 {
 			var schema any
 			if err := json.Unmarshal(params.ResponseFormat.Schema, &schema); err == nil {
-				body["response_format"] = map[string]any{
-					"type": "json_schema",
-					"json_schema": map[string]any{
-						"name":   params.ResponseFormat.Name,
+				if cfg.JsonSchemaAsJsonObject {
+					// Fireworks only accepts {"type":"json_object","schema":{...}}.
+					body["response_format"] = map[string]any{
+						"type":   "json_object",
 						"schema": schema,
-						"strict": strictJSON,
-					},
+					}
+				} else {
+					body["response_format"] = map[string]any{
+						"type": "json_schema",
+						"json_schema": map[string]any{
+							"name":   params.ResponseFormat.Name,
+							"schema": schema,
+							"strict": strictJSON,
+						},
+					}
 				}
 				schemaSet = true
 			}
 		}
 		if !schemaSet {
-			// Schema-less JSON mode (json_object) -- item 7.
-			body["response_format"] = map[string]any{
-				"type": "json_object",
+			if cfg.JsonObjectAsJsonSchema {
+				// Perplexity Sonar only accepts text/json_schema, not json_object.
+				name := params.ResponseFormat.Name
+				if name == "" {
+					name = "json_schema"
+				}
+				body["response_format"] = map[string]any{
+					"type": "json_schema",
+					"json_schema": map[string]any{
+						"name":   name,
+						"schema": map[string]any{"type": "object"},
+						"strict": false,
+					},
+				}
+			} else {
+				// Schema-less JSON mode (json_object) -- item 7.
+				body["response_format"] = map[string]any{
+					"type": "json_object",
+				}
 			}
 		}
 	}
 
-	// Per-request headers (extracted in doHTTP before marshaling).
+	// Per-request headers (extracted in doHTTP before marshaling). The
+	// Authorization header is reserved for the configured token source: a
+	// caller-supplied Authorization is dropped so it can never strip or replace
+	// the provider credential (Bedrock likewise sets auth last).
 	if len(params.Headers) > 0 {
-		body["_headers"] = params.Headers
+		body["_headers"] = sanitizeRequestHeaders(params.Headers)
 	}
 
 	// Reasoning models (o-series, gpt-5+, codex) require
@@ -253,6 +332,20 @@ func IsReasoningModel(modelID string) bool {
 	}
 	// codex- prefix models.
 	return strings.HasPrefix(id, "codex-")
+}
+
+// sanitizeRequestHeaders removes the Authorization header (case-insensitively)
+// from per-request headers so a caller cannot override the configured token.
+// Returns a fresh map; the input is never mutated.
+func sanitizeRequestHeaders(headers map[string]string) map[string]string {
+	out := make(map[string]string, len(headers))
+	for k, v := range headers {
+		if strings.EqualFold(k, "Authorization") {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // applyProviderOptions maps known provider options to their wire-format keys,
@@ -340,14 +433,25 @@ type streamResponse struct {
 	Usage *streamUsage `json:"usage,omitempty"`
 }
 
+// promptTokensDetails carries the standard prompt_tokens_details.cached_tokens
+// field, plus the top-level cache counters some providers emit instead (item 46).
+type promptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
 type streamUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 
-	PromptTokensDetails *struct {
-		CachedTokens int `json:"cached_tokens"`
-	} `json:"prompt_tokens_details,omitempty"`
+	// Top-level cache counters emitted by Together/DeepInfra/DeepSeek
+	// (prompt_cache_hit_tokens / prompt_cache_miss_tokens) and OpenRouter
+	// (cached_tokens) when prompt_tokens_details.cached_tokens is absent (item 46).
+	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+	CachedTokens          int `json:"cached_tokens"`
+
+	PromptTokensDetails *promptTokensDetails `json:"prompt_tokens_details,omitempty"`
 
 	CompletionTokensDetails *struct {
 		ReasoningTokens          int `json:"reasoning_tokens"`
@@ -377,6 +481,7 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 		id      string
 		name    string
 		args    strings.Builder
+		size    int64
 		started bool
 	}
 	activeTools := make(map[int]*activeToolCall)
@@ -384,6 +489,7 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 	var responseMeta provider.ResponseMetadata
 	providerMeta := map[string]any{}
 	var citations []string
+	var citationsSize int64
 
 	for {
 		data, ok := scanner.Next()
@@ -419,12 +525,10 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 			usage.InputTokens = resp.Usage.PromptTokens
 			usage.OutputTokens = resp.Usage.CompletionTokens
 			usage.TotalTokens = resp.Usage.TotalTokens
-			if resp.Usage.PromptTokensDetails != nil {
-				usage.CacheReadTokens = resp.Usage.PromptTokensDetails.CachedTokens
-				usage.InputTokens -= usage.CacheReadTokens
-				if usage.InputTokens < 0 {
-					usage.InputTokens = 0
-				}
+			usage.CacheReadTokens = cacheReadTokens(resp.Usage.PromptTokensDetails, resp.Usage.PromptCacheHitTokens, resp.Usage.CachedTokens)
+			usage.InputTokens -= usage.CacheReadTokens
+			if usage.InputTokens < 0 {
+				usage.InputTokens = 0
 			}
 			// Item 10: extract prediction tokens + reasoning tokens from completion_tokens_details.
 			if resp.Usage.CompletionTokensDetails != nil {
@@ -440,7 +544,17 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 
 		// Capture top-level citations (xAI, Perplexity) -- accumulate across chunks.
 		if len(resp.Citations) > 0 {
-			citations = append(citations, resp.Citations...)
+			for _, c := range resp.Citations {
+				if citationsSize+int64(len(c)) > maxCitationsBytes {
+					provider.TrySend(ctx, out, provider.StreamChunk{
+						Type:  provider.ChunkError,
+						Error: fmt.Errorf("stream citations exceed %d byte limit", maxCitationsBytes),
+					})
+					return
+				}
+				citationsSize += int64(len(c))
+				citations = append(citations, c)
+			}
 		}
 
 		if len(resp.Choices) == 0 {
@@ -527,6 +641,10 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 				}
 				active.started = true
 
+				// Flush any arguments that arrived before the name/id resolved
+				// as a delta (streaming progress). Do NOT finalize a
+				// ChunkToolCall here: more fragments may still arrive and the
+				// call is only complete at the finish reason (item 4).
 				if pending := active.args.String(); pending != "" {
 					if !provider.TrySend(ctx, out, provider.StreamChunk{
 						Type:       provider.ChunkToolCallDelta,
@@ -536,21 +654,18 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 					}) {
 						return
 					}
-					if json.Valid([]byte(pending)) {
-						if !provider.TrySend(ctx, out, provider.StreamChunk{
-							Type:       provider.ChunkToolCall,
-							ToolCallID: active.id,
-							ToolName:   active.name,
-							ToolInput:  pending,
-						}) {
-							return
-						}
-						active.args.Reset()
-					}
 				}
 			}
 
 			if tc.Function.Arguments != "" {
+				if active.size+int64(len(tc.Function.Arguments)) > maxToolCallArgsBytes {
+					provider.TrySend(ctx, out, provider.StreamChunk{
+						Type:  provider.ChunkError,
+						Error: fmt.Errorf("tool call arguments exceed %d byte limit", maxToolCallArgsBytes),
+					})
+					return
+				}
+				active.size += int64(len(tc.Function.Arguments))
 				active.args.WriteString(tc.Function.Arguments)
 
 				// Emit delta for UI streaming progress.
@@ -562,19 +677,6 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 						ToolInput:  tc.Function.Arguments,
 					}) {
 						return
-					}
-
-					// Emit ChunkToolCall when accumulated args form valid JSON.
-					if accumulated := active.args.String(); json.Valid([]byte(accumulated)) {
-						if !provider.TrySend(ctx, out, provider.StreamChunk{
-							Type:       provider.ChunkToolCall,
-							ToolCallID: active.id,
-							ToolName:   active.name,
-							ToolInput:  accumulated,
-						}) {
-							return
-						}
-						active.args.Reset()
 					}
 				}
 			}
@@ -612,6 +714,22 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 			return
 		}
 		return
+	}
+
+	// Finalize any tool call that never saw a finish_reason (item 4): the
+	// accumulated arguments are emitted once as a complete ChunkToolCall.
+	for _, active := range activeTools {
+		if remaining := active.args.String(); remaining != "" && active.started {
+			if !provider.TrySend(ctx, out, provider.StreamChunk{
+				Type:       provider.ChunkToolCall,
+				ToolCallID: active.id,
+				ToolName:   active.name,
+				ToolInput:  remaining,
+			}) {
+				return
+			}
+			active.args.Reset()
+		}
 	}
 
 	chunk := provider.StreamChunk{
@@ -673,12 +791,13 @@ type chatResponse struct {
 	Citations []string `json:"citations,omitempty"`
 
 	Usage *struct {
-		PromptTokens        int `json:"prompt_tokens"`
-		CompletionTokens    int `json:"completion_tokens"`
-		TotalTokens         int `json:"total_tokens"`
-		PromptTokensDetails *struct {
-			CachedTokens int `json:"cached_tokens"`
-		} `json:"prompt_tokens_details,omitempty"`
+		PromptTokens            int                  `json:"prompt_tokens"`
+		CompletionTokens        int                  `json:"completion_tokens"`
+		TotalTokens             int                  `json:"total_tokens"`
+		PromptCacheHitTokens    int                  `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens   int                  `json:"prompt_cache_miss_tokens"`
+		CachedTokens            int                  `json:"cached_tokens"`
+		PromptTokensDetails     *promptTokensDetails `json:"prompt_tokens_details,omitempty"`
 		CompletionTokensDetails *struct {
 			ReasoningTokens          int `json:"reasoning_tokens"`
 			AcceptedPredictionTokens int `json:"accepted_prediction_tokens"`
@@ -760,12 +879,10 @@ func ParseResponse(body []byte) (*provider.GenerateResult, error) {
 		result.Usage.InputTokens = resp.Usage.PromptTokens
 		result.Usage.OutputTokens = resp.Usage.CompletionTokens
 		result.Usage.TotalTokens = resp.Usage.TotalTokens
-		if resp.Usage.PromptTokensDetails != nil {
-			result.Usage.CacheReadTokens = resp.Usage.PromptTokensDetails.CachedTokens
-			result.Usage.InputTokens -= result.Usage.CacheReadTokens
-			if result.Usage.InputTokens < 0 {
-				result.Usage.InputTokens = 0
-			}
+		result.Usage.CacheReadTokens = cacheReadTokens(resp.Usage.PromptTokensDetails, resp.Usage.PromptCacheHitTokens, resp.Usage.CachedTokens)
+		result.Usage.InputTokens -= result.Usage.CacheReadTokens
+		if result.Usage.InputTokens < 0 {
+			result.Usage.InputTokens = 0
 		}
 		// Item 10: extract prediction tokens + reasoning tokens.
 		if resp.Usage.CompletionTokensDetails != nil {
@@ -840,4 +957,19 @@ func generateToolCallID() string {
 	b := make([]byte, 12)
 	_, _ = rand.Read(b)
 	return "call_" + hex.EncodeToString(b)
+}
+
+// cacheReadTokens resolves the number of prompt tokens served from cache. It
+// prefers prompt_tokens_details.cached_tokens, then falls back to the top-level
+// prompt_cache_hit_tokens (Together/DeepInfra/DeepSeek) and finally OpenRouter's
+// top-level cached_tokens (item 46). prompt_cache_miss_tokens is intentionally
+// not counted here: miss tokens are computed, not read from cache.
+func cacheReadTokens(details *promptTokensDetails, hitTokens, openRouterCached int) int {
+	if details != nil && details.CachedTokens > 0 {
+		return details.CachedTokens
+	}
+	if hitTokens > 0 {
+		return hitTokens
+	}
+	return openRouterCached
 }

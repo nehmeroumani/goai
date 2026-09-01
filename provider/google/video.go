@@ -549,14 +549,24 @@ func sameOrigin(rawURL, baseURL string) bool {
 	if err != nil {
 		return false
 	}
-	return u.Scheme == base.Scheme && u.Host == base.Host
+	if u.Scheme != base.Scheme || u.Host != base.Host {
+		return false
+	}
+	// Reject userinfo (e.g. "https://evil@api.google.com"), which can be used
+	// to disguise a foreign authority as the configured origin.
+	if u.User != nil || base.User != nil {
+		return false
+	}
+	return true
 }
 
 func (m *videoModel) setHeaders(req *http.Request, token string) {
-	req.Header.Set("x-goog-api-key", token)
+	// Apply caller headers first, then the credential last so it cannot be
+	// overridden by a caller-supplied x-goog-api-key.
 	for key, value := range m.opts.headers {
 		req.Header.Set(key, value)
 	}
+	req.Header.Set("x-goog-api-key", token)
 }
 
 func (m *videoModel) resolveToken(ctx context.Context) (string, error) {

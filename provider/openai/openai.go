@@ -14,7 +14,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"time"
@@ -44,6 +43,8 @@ type options struct {
 	httpClient                 *http.Client
 	responsesStreamIdleTimeout time.Duration
 	responsesStreamAllowDone   bool
+	outputFormat               string
+	useMaxCompletionTokens     *bool
 }
 
 // WithAPIKey sets a static API key for authentication.
@@ -82,6 +83,18 @@ func WithHeaders(h map[string]string) Option {
 func WithHTTPClient(c *http.Client) Option {
 	return func(o *options) {
 		o.httpClient = c
+	}
+}
+
+// WithUseMaxCompletionTokens forces Chat Completions requests to send
+// max_completion_tokens instead of max_tokens. Reasoning models (gpt-5,
+// o-series, codex) reject max_tokens outright and require
+// max_completion_tokens. The OpenAI layer normally infers this from the model
+// id, but callers whose wire id is not the model id (e.g. Azure deployments)
+// must opt in explicitly. Nil keeps the model-id heuristic.
+func WithUseMaxCompletionTokens(use bool) Option {
+	return func(o *options) {
+		o.useMaxCompletionTokens = &use
 	}
 }
 
@@ -164,7 +177,8 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 
 func (m *chatModel) doStreamChatCompletions(ctx context.Context, params provider.GenerateParams) (*provider.StreamResult, error) {
 	body := openaicompat.BuildRequest(params, m.id, true, openaicompat.RequestConfig{
-		IncludeStreamOptions: true,
+		IncludeStreamOptions:   true,
+		UseMaxCompletionTokens: m.opts.useMaxCompletionTokens,
 	})
 
 	resp, err := m.doHTTP(ctx, m.opts.baseURL+"/chat/completions", body)
@@ -176,7 +190,9 @@ func (m *chatModel) doStreamChatCompletions(ctx context.Context, params provider
 }
 
 func (m *chatModel) doGenerateChatCompletions(ctx context.Context, params provider.GenerateParams) (*provider.GenerateResult, error) {
-	body := openaicompat.BuildRequest(params, m.id, false, openaicompat.RequestConfig{})
+	body := openaicompat.BuildRequest(params, m.id, false, openaicompat.RequestConfig{
+		UseMaxCompletionTokens: m.opts.useMaxCompletionTokens,
+	})
 
 	resp, err := m.doHTTP(ctx, m.opts.baseURL+"/chat/completions", body)
 	if err != nil {
@@ -184,7 +200,7 @@ func (m *chatModel) doGenerateChatCompletions(ctx context.Context, params provid
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := openaicompat.ReadResponseBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -228,7 +244,7 @@ func (m *chatModel) doGenerateResponses(ctx context.Context, params provider.Gen
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := openaicompat.ReadResponseBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}

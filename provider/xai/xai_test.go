@@ -1,11 +1,13 @@
 package xai
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -180,6 +182,34 @@ func TestCapabilities(t *testing.T) {
 	}
 	if !caps.InputModalities.Image {
 		t.Error("xAI should support image input")
+	}
+}
+
+// stubLanguageModel is a minimal provider.LanguageModel that deliberately does
+// NOT implement provider.CapableModel, so responsesAPIGatedModel.Capabilities
+// must fall back to an empty ModelCapabilities.
+type stubLanguageModel struct{}
+
+func (stubLanguageModel) ModelID() string { return "stub" }
+func (stubLanguageModel) DoGenerate(context.Context, provider.GenerateParams) (*provider.GenerateResult, error) {
+	return nil, nil
+}
+func (stubLanguageModel) DoStream(context.Context, provider.GenerateParams) (*provider.StreamResult, error) {
+	return nil, nil
+}
+
+// TestResponsesAPIGatedModel_CapabilitiesFallback covers the fallback branch of
+// responsesAPIGatedModel.Capabilities (xai.go:98): when the wrapped model is
+// NOT a provider.CapableModel, Capabilities() must return an empty
+// ModelCapabilities instead of panicking or delegating.
+func TestResponsesAPIGatedModel_CapabilitiesFallback(t *testing.T) {
+	wrapped := &responsesAPIGatedModel{LanguageModel: stubLanguageModel{}}
+	if _, ok := wrapped.LanguageModel.(provider.CapableModel); ok {
+		t.Fatal("stub unexpectedly implements CapableModel")
+	}
+	caps := wrapped.Capabilities()
+	if !reflect.DeepEqual(caps, provider.ModelCapabilities{}) {
+		t.Errorf("Capabilities() = %+v, want empty ModelCapabilities", caps)
 	}
 }
 
@@ -389,5 +419,40 @@ func TestChat_PromptCachingIgnored(t *testing.T) {
 		t.Fatalf("DoStream unexpected error: %v", err)
 	}
 	for range streamResult.Stream {
+	}
+}
+
+// Item 60: xAI must round-trip reasoning_content on assistant messages.
+func TestChat_RoundTripsReasoningContent(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("grok-2", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{
+			Role: provider.RoleAssistant,
+			Content: []provider.Part{
+				{Type: provider.PartReasoning, Text: "let me think"},
+				{Type: provider.PartText, Text: "answer"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, ok := gotBody["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("messages = %v", gotBody["messages"])
+	}
+	assistant := msgs[0].(map[string]any)
+	if assistant["reasoning_content"] != "let me think" {
+		t.Errorf("reasoning_content = %v, want 'let me think'", assistant["reasoning_content"])
 	}
 }

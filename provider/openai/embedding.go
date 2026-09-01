@@ -17,6 +17,16 @@ import (
 // Compile-time interface compliance check.
 var _ provider.EmbeddingModel = (*embeddingModel)(nil)
 
+const (
+	// maxEmbeddingResponseBytes bounds the size of a successful embedding
+	// response body to defend against a malicious/misbehaving server returning
+	// an unbounded payload.
+	maxEmbeddingResponseBytes = 64 << 20 // 64 MiB
+	// maxEmbeddingErrorBytes bounds the size of an error response body read
+	// solely to extract the error message.
+	maxEmbeddingErrorBytes = 1 << 20 // 1 MiB
+)
+
 // Embedding creates an OpenAI embedding model for the given model ID.
 // Supports text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002, etc.
 func Embedding(modelID string, opts ...Option) provider.EmbeddingModel {
@@ -74,11 +84,14 @@ func (m *embeddingModel) DoEmbed(ctx context.Context, values []string, params pr
 	jsonBody := httpc.MustMarshalJSON(body)
 	req := httpc.MustNewRequest(ctx, "POST", m.opts.baseURL+"/embeddings", jsonBody)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
 
 	for k, v := range m.opts.headers {
 		req.Header.Set(k, v)
 	}
+
+	// Auth is applied last so a caller-supplied header named "Authorization"
+	// cannot override the real credential.
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := m.httpClient().Do(req)
 	if err != nil {
@@ -87,13 +100,16 @@ func (m *embeddingModel) DoEmbed(ctx context.Context, values []string, params pr
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxEmbeddingErrorBytes))
 		return nil, goai.ParseHTTPErrorWithHeaders("openai", resp.StatusCode, respBody, resp.Header)
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxEmbeddingResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if len(respBody) > maxEmbeddingResponseBytes {
+		return nil, fmt.Errorf("openai: embedding response body exceeds %d bytes", maxEmbeddingResponseBytes)
 	}
 
 	var result struct {

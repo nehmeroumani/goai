@@ -40,6 +40,11 @@ var Tools = struct {
 	// Requires beta header: code-execution-web-tools-2026-02-09.
 	WebSearch_20260209 func(opts ...WebSearchOption) provider.ToolDefinition
 
+	// WebSearch_20260318 creates a web search tool (version 20260318).
+	// Adds the response_inclusion option to control how much search context is
+	// returned. Requires beta header: code-execution-web-tools-2026-03-18.
+	WebSearch_20260318 func(opts ...WebSearchOption) provider.ToolDefinition
+
 	// WebFetch creates a web fetch tool definition (version 20260209).
 	// Gives Claude direct access to real-time web content via URL fetching.
 	WebFetch func(opts ...WebFetchOption) provider.ToolDefinition
@@ -48,6 +53,10 @@ var Tools = struct {
 	// Does not require a beta header. Recommended version.
 	// Supported models: Claude Opus 4.6, Sonnet 4.6, Sonnet 4.5, Opus 4.5.
 	CodeExecution func() provider.ToolDefinition
+
+	// CodeExecution_20250522 creates a code execution tool (version 20250522).
+	// Legacy Python-only build. Does not require a beta header.
+	CodeExecution_20250522 func() provider.ToolDefinition
 
 	// CodeExecution_20250825 creates a code execution tool (version 20250825).
 	// Requires beta header: code-execution-2025-08-25.
@@ -76,9 +85,13 @@ var Tools = struct {
 	TextEditor_20250728: textEditor20250728Tool,
 	WebSearch:           webSearchTool,
 	WebSearch_20260209:  webSearch20260209Tool,
+	WebSearch_20260318:  webSearch20260318Tool,
 	WebFetch:            webFetchTool,
 	CodeExecution: func() provider.ToolDefinition {
 		return codeExecutionTool("code_execution_20260120")
+	},
+	CodeExecution_20250522: func() provider.ToolDefinition {
+		return codeExecutionTool("code_execution_20250522")
 	},
 	CodeExecution_20250825: func() provider.ToolDefinition {
 		return codeExecutionTool("code_execution_20250825")
@@ -210,10 +223,11 @@ func textEditor20250728Tool(opts ...TextEditorOption) provider.ToolDefinition {
 type WebSearchOption func(*webSearchConfig)
 
 type webSearchConfig struct {
-	MaxUses        int                // max number of searches per turn
-	AllowedDomains []string           // restrict search to these domains
-	BlockedDomains []string           // exclude these domains from search
-	UserLocation   *WebSearchLocation // optional user location
+	MaxUses           int                // max number of searches per turn
+	AllowedDomains    []string           // restrict search to these domains
+	BlockedDomains    []string           // exclude these domains from search
+	UserLocation      *WebSearchLocation // optional user location
+	ResponseInclusion string             // how much search context to return (web_search_20260318+)
 }
 
 // WebSearchLocation provides geographically relevant search results.
@@ -245,6 +259,12 @@ func WithWebSearchUserLocation(loc WebSearchLocation) WebSearchOption {
 	return func(c *webSearchConfig) { c.UserLocation = &loc }
 }
 
+// WithResponseInclusion controls how much search context is returned
+// (web_search_20260318+). Valid values: "base" or "low".
+func WithResponseInclusion(value string) WebSearchOption {
+	return func(c *webSearchConfig) { c.ResponseInclusion = value }
+}
+
 func buildWebSearchOptions(cfg *webSearchConfig) map[string]any {
 	providerOpts := map[string]any{}
 	if cfg.MaxUses > 0 {
@@ -272,6 +292,9 @@ func buildWebSearchOptions(cfg *webSearchConfig) map[string]any {
 		}
 		providerOpts["user_location"] = loc
 	}
+	if cfg.ResponseInclusion != "" {
+		providerOpts["response_inclusion"] = cfg.ResponseInclusion
+	}
 	return providerOpts
 }
 
@@ -297,6 +320,19 @@ func webSearch20260209Tool(opts ...WebSearchOption) provider.ToolDefinition {
 	return provider.ToolDefinition{
 		Name:                   "web_search",
 		ProviderDefinedType:    "web_search_20260209",
+		ProviderDefinedOptions: buildWebSearchOptions(cfg),
+	}
+}
+
+func webSearch20260318Tool(opts ...WebSearchOption) provider.ToolDefinition {
+	cfg := &webSearchConfig{}
+	for _, o := range opts {
+		o(cfg)
+	}
+
+	return provider.ToolDefinition{
+		Name:                   "web_search",
+		ProviderDefinedType:    "web_search_20260318",
 		ProviderDefinedOptions: buildWebSearchOptions(cfg),
 	}
 }
@@ -420,15 +456,35 @@ func betaForTool(toolType string) string {
 		return "" // no beta needed
 	case "code_execution_20250825":
 		return "code-execution-2025-08-25"
-	case "code_execution_20260120":
+	case "code_execution_20250522", "code_execution_20260120":
 		return "" // no beta needed
 	case "web_search_20250305":
 		return "web-search-2025-03-05"
 	case "web_search_20260209", "web_fetch_20260209":
 		return "code-execution-web-tools-2026-02-09"
+	case "web_search_20260318":
+		return "code-execution-web-tools-2026-03-18"
 	default:
 		return ""
 	}
+}
+
+// collectRequestBetas returns beta header values required by features present
+// in the request body (context management, fast-mode speed, code-execution
+// container). These are gated so they are only sent when the feature is used,
+// rather than on every request.
+func collectRequestBetas(body map[string]any) []string {
+	var betas []string
+	if _, ok := body["context_management"]; ok {
+		betas = append(betas, betaContextManagement)
+	}
+	if _, ok := body["speed"]; ok {
+		betas = append(betas, betaFastMode)
+	}
+	if _, ok := body["container"]; ok {
+		betas = append(betas, betaClaudeCode)
+	}
+	return betas
 }
 
 // collectToolBetas extracts unique beta header values from provider-defined tools.

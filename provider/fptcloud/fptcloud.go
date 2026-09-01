@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	baseURLGlobal = "https://mkp-api.fptcloud.com/v1"
-	baseURLJP     = "https://mkp-api.fptcloud.jp/v1"
+	baseURLGlobal = "https://mkp-api.fptcloud.com"
+	baseURLJP     = "https://mkp-api.fptcloud.jp"
 )
 
 // Option configures the FPT Smart Cloud provider.
@@ -97,16 +97,18 @@ func resolveOptions(opts []Option) options {
 func Chat(modelID string, opts ...Option) provider.LanguageModel {
 	o := resolveOptions(opts)
 	return openaicompat.NewChatModel(openaicompat.ChatModelConfig{
-		ProviderID:           "fptcloud",
-		ModelID:              modelID,
-		BaseURL:              o.baseURL,
-		TokenSource:          o.tokenSource,
-		TokenRequired:        true,
-		Headers:              o.headers,
-		HTTPClient:           o.httpClient,
-		Capabilities:         chatCaps,
-		IncludeStreamOptions: true,
-		WarnPromptCaching:    true,
+		ProviderID:        "fptcloud",
+		ModelID:           modelID,
+		BaseURL:           o.baseURL,
+		TokenSource:       o.tokenSource,
+		TokenRequired:     true,
+		Headers:           o.headers,
+		HTTPClient:        o.httpClient,
+		Capabilities:      chatCaps,
+		WarnPromptCaching: true,
+		RequestConfig: openaicompat.RequestConfig{
+			IncludeStreamOptions: true,
+		},
 	})
 }
 

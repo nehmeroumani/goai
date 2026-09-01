@@ -82,6 +82,36 @@ func TestImage_Generate(t *testing.T) {
 	}
 }
 
+func TestImage_AuthHeaderWinsOverWithHeaders(t *testing.T) {
+	// A caller-supplied WithHeaders header named like the auth header must
+	// NOT override the real credential on the :predict path.
+	imgData := base64.StdEncoding.EncodeToString([]byte("fake-png-data"))
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"predictions": []map[string]any{
+				{"bytesBase64Encoded": imgData, "mimeType": "image/png"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	model := Image("imagen-3.0-generate-002",
+		WithTokenSource(provider.StaticToken("real-token")),
+		WithBaseURL(srv.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer spoofed-token"}),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "a cat", N: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer real-token" {
+		t.Errorf("Authorization = %q, want %q (credential must win over WithHeaders)", gotAuth, "Bearer real-token")
+	}
+}
+
 func TestImage_ProviderOptions(t *testing.T) {
 	imgData := base64.StdEncoding.EncodeToString([]byte("img"))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

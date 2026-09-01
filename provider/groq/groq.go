@@ -63,16 +63,24 @@ func Chat(modelID string, opts ...Option) provider.LanguageModel {
 		}
 	}
 	return openaicompat.NewChatModel(openaicompat.ChatModelConfig{
-		ProviderID:           "groq",
-		ModelID:              modelID,
-		BaseURL:              o.baseURL,
-		TokenSource:          o.tokenSource,
-		TokenRequired:        true,
-		Headers:              o.headers,
-		HTTPClient:           o.httpClient,
-		Capabilities:         chatCaps,
-		IncludeStreamOptions: true,
-		WarnPromptCaching:    true,
+		ProviderID:        "groq",
+		ModelID:           modelID,
+		BaseURL:           o.baseURL,
+		TokenSource:       o.tokenSource,
+		TokenRequired:     true,
+		Headers:           o.headers,
+		HTTPClient:        o.httpClient,
+		Capabilities:      chatCaps,
+		WarnPromptCaching: true,
+		RequestConfig: openaicompat.RequestConfig{
+			IncludeStreamOptions:    true,
+			IncludeReasoningContent: true,
+			// Groq deprecated max_tokens in favor of max_completion_tokens (item 48).
+			// Groq accepts both fields, so forcing max_completion_tokens for every
+			// model is a deliberate provider policy (UseMaxCompletionTokens expresses
+			// a wire-format preference, not a reasoning-model inference).
+			UseMaxCompletionTokens: openaicompat.BoolPtr(true),
+		},
 	})
 }
 

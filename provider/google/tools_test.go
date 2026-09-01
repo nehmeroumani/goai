@@ -120,6 +120,54 @@ func TestTools_CodeExecution(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// FileSearch
+// ---------------------------------------------------------------------------
+
+func TestTools_FileSearch_Default(t *testing.T) {
+	def := Tools.FileSearch()
+	if def.Name != "file_search" {
+		t.Errorf("Name = %q, want file_search", def.Name)
+	}
+	if def.ProviderDefinedType != "google.file_search" {
+		t.Errorf("ProviderDefinedType = %q, want google.file_search", def.ProviderDefinedType)
+	}
+	if len(def.ProviderDefinedOptions) != 0 {
+		t.Errorf("expected empty options, got %v", def.ProviderDefinedOptions)
+	}
+}
+
+func TestTools_FileSearch_WithOptions(t *testing.T) {
+	def := Tools.FileSearch(WithDynamicThreshold(0.3), WithCorpus("projects/123/locations/us/collections/my-corpus"))
+	opts := def.ProviderDefinedOptions
+	drc, ok := opts["dynamicRetrievalConfig"].(map[string]any)
+	if !ok {
+		t.Fatal("dynamicRetrievalConfig not set")
+	}
+	if drc["dynamicThreshold"] != 0.3 {
+		t.Errorf("dynamicThreshold = %v, want 0.3", drc["dynamicThreshold"])
+	}
+	if opts["corpus"] != "projects/123/locations/us/collections/my-corpus" {
+		t.Errorf("corpus = %v", opts["corpus"])
+	}
+}
+
+func TestGoogleProviderTool_FileSearch(t *testing.T) {
+	def := Tools.FileSearch(WithDynamicThreshold(0.5))
+	apiTool := googleProviderTool(def)
+	inner, ok := apiTool["fileSearch"]
+	if !ok {
+		t.Fatal("fileSearch key not found in API tool")
+	}
+	opts, ok := inner.(map[string]any)
+	if !ok {
+		t.Fatal("inner should be map")
+	}
+	if _, ok := opts["dynamicRetrievalConfig"]; !ok {
+		t.Error("dynamicRetrievalConfig should be in API tool options")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // googleProviderTool
 // ---------------------------------------------------------------------------
 

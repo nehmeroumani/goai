@@ -6,13 +6,22 @@ import (
 	"github.com/zendev-sh/goai/provider"
 )
 
-// ConvertMessages converts provider.Message slice to OpenAI wire format.
-// The system prompt is prepended as the first message if non-empty.
-func ConvertMessages(msgs []provider.Message, system string, includeReasoningContent ...bool) []map[string]any {
-	includeReasoning := true
-	if len(includeReasoningContent) > 0 {
-		includeReasoning = includeReasoningContent[0]
-	}
+// MessagesConfig carries per-request serialization knobs for ConvertMessages.
+type MessagesConfig struct {
+	// IncludeReasoningContent controls serialization of the non-standard
+	// reasoning_content field on assistant messages.
+	IncludeReasoningContent bool
+
+	// FlatInputFile makes PDF parts serialize as the flat
+	// {"type":"input_file","file_data":...} shape (Requesty) instead of the
+	// nested {"type":"file","file":{...}} shape (item 59).
+	FlatInputFile bool
+}
+
+// ConvertMessagesWithConfig converts provider.Message slice to OpenAI wire
+// format using the supplied MessagesConfig.
+func ConvertMessagesWithConfig(msgs []provider.Message, system string, cfg MessagesConfig) []map[string]any {
+	includeReasoning := cfg.IncludeReasoningContent
 	result := make([]map[string]any, 0, len(msgs)+1)
 
 	if system != "" {
@@ -103,7 +112,7 @@ func ConvertMessages(msgs []provider.Message, system string, includeReasoningCon
 						"image_url": imgURL,
 					})
 				case provider.PartFile:
-					if item, ok := filePartToContent(part); ok {
+					if item, ok := filePartToContent(part, cfg.FlatInputFile); ok {
 						contentArr = append(contentArr, item)
 					}
 				}
@@ -156,7 +165,7 @@ func joinText(parts []string) string {
 // remote files) and audio becomes an "input_audio" part. Anything else has no
 // wire representation and is omitted (ok=false) — inlining raw base64 as text
 // only feeds the model garbage.
-func filePartToContent(part provider.Part) (map[string]any, bool) {
+func filePartToContent(part provider.Part, flatInputFile bool) (map[string]any, bool) {
 	mediaType := part.MediaType
 	fileData := "" // what goes in file.file_data: a data URL or a plain URL
 	payload := ""  // bare base64 for input_audio
@@ -187,6 +196,14 @@ func filePartToContent(part provider.Part) (map[string]any, bool) {
 		filename := part.Filename
 		if filename == "" {
 			filename = "document.pdf"
+		}
+		if flatInputFile {
+			// Requesty uses the flat {"type":"input_file","file_data":...} shape
+			// instead of the nested {"type":"file","file":{...}} shape (item 59).
+			return map[string]any{
+				"type":      "input_file",
+				"file_data": fileData,
+			}, true
 		}
 		return map[string]any{
 			"type": "file",

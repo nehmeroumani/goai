@@ -94,15 +94,17 @@ func (m *imageModel) DoGenerate(ctx context.Context, params provider.ImageParams
 	req := httpc.MustNewRequest(ctx, "POST", reqURL, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
 
-	// Native endpoints use ?key= for API keys (already in URL), Bearer for OAuth.
+	for k, v := range m.opts.headers {
+		req.Header.Set(k, v)
+	}
+
+	// Set the credential last so it wins over any caller-supplied header
+	// named like the auth header. Native endpoints use ?key= for API keys
+	// (already in URL), Bearer for OAuth.
 	if m.opts.tokenSource != nil && !isNativeAPIKeyAuth(m.opts.tokenSource) {
 		if err := setAuth(ctx, req, m.opts.tokenSource); err != nil {
 			return nil, err
 		}
-	}
-
-	for k, v := range m.opts.headers {
-		req.Header.Set(k, v)
 	}
 
 	resp, err := m.httpClient().Do(req)
@@ -112,11 +114,11 @@ func (m *imageModel) DoGenerate(ctx context.Context, params provider.ImageParams
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxVertexErrorBodyBytes))
 		return nil, goai.ParseHTTPErrorWithHeaders("vertex", resp.StatusCode, respBody, resp.Header)
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readSuccessBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}

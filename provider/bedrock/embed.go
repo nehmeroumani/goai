@@ -3,6 +3,7 @@ package bedrock
 import (
 	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,16 @@ import (
 
 // Compile-time interface compliance check.
 var _ provider.EmbeddingModel = (*embeddingModel)(nil)
+
+const (
+	// maxEmbedResponseBytes bounds the size of a successful embedding response
+	// body to defend against a malicious/misbehaving server returning an
+	// unbounded payload.
+	maxEmbedResponseBytes = 64 << 20 // 64 MiB
+	// maxEmbedErrorBytes bounds the size of an error response body read solely
+	// to extract the error message.
+	maxEmbedErrorBytes = 1 << 20 // 1 MiB
+)
 
 // Embedding creates a Bedrock text embedding model for the given model ID.
 //
@@ -115,14 +126,28 @@ func (m *embeddingModel) doTitanEmbed(ctx context.Context, value string, params 
 	}
 
 	var result struct {
-		Embedding           []float64 `json:"embedding"`
-		InputTextTokenCount int       `json:"inputTextTokenCount"`
+		Embedding           []float64       `json:"embedding"`
+		EmbeddingsByType    json.RawMessage `json:"embeddingsByType"`
+		InputTextTokenCount int             `json:"inputTextTokenCount"`
 	}
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("parsing response: %w", err)
 	}
+
+	// When embeddingTypes includes "binary" (or another non-float type), Titan
+	// V2 returns embeddings under "embeddingsByType" instead of "embedding".
+	var embeddings [][]float64
+	if len(result.EmbeddingsByType) > 0 {
+		embeddings, err = parseTypedEmbeddings(result.EmbeddingsByType)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		embeddings = [][]float64{result.Embedding}
+	}
+
 	return &provider.EmbedResult{
-		Embeddings: [][]float64{result.Embedding},
+		Embeddings: embeddings,
 		Usage:      provider.Usage{InputTokens: result.InputTextTokenCount, TotalTokens: result.InputTextTokenCount},
 		Response:   provider.ResponseMetadata{Model: m.id},
 	}, nil
@@ -193,7 +218,7 @@ func (m *embeddingModel) doNovaEmbed(ctx context.Context, value string, params p
 		"schemaVersion": "nova-multimodal-embed-v1",
 		"taskType":      "SINGLE_EMBEDDING",
 		"singleEmbeddingParams": map[string]any{
-			"embeddingPurpose": purpose,
+			"embeddingPurpose":   purpose,
 			"embeddingDimension": dimension,
 			"text": map[string]any{
 				"truncationMode": truncation,
@@ -209,8 +234,8 @@ func (m *embeddingModel) doNovaEmbed(ctx context.Context, value string, params p
 
 	var result struct {
 		Embeddings []struct {
-			Embedding            []float64 `json:"embedding"`
-			TruncatedCharLength  int       `json:"truncatedCharLength"`
+			Embedding           []float64 `json:"embedding"`
+			TruncatedCharLength int       `json:"truncatedCharLength"`
 		} `json:"embeddings"`
 	}
 	if err := json.Unmarshal(resp, &result); err != nil {
@@ -326,22 +351,113 @@ func (m *embeddingModel) doCohereEmbed(ctx context.Context, values []string, par
 	}, nil
 }
 
-// parseCohereEmbeddings handles both Cohere v3 (flat array) and v4 ({"float": [...]}) formats.
+// parseCohereEmbeddings handles both Cohere v3 (flat array) and v4
+// ({"float": [...], "int8": [...], ...}) formats.
 func parseCohereEmbeddings(raw json.RawMessage) ([][]float64, error) {
 	var flat [][]float64
 	if err := json.Unmarshal(raw, &flat); err == nil {
 		return flat, nil
 	}
-	var nested struct {
-		Float [][]float64 `json:"float"`
-	}
-	if err := json.Unmarshal(raw, &nested); err != nil {
+	return parseTypedEmbeddings(raw)
+}
+
+// parseTypedEmbeddings parses a Bedrock embeddings map keyed by embedding type
+// ("float", "int8", "uint8", "binary", "ubinary") — used by Cohere v4
+// ({"embeddings": {...}}) and Titan V2 ({"embeddingsByType": {...}}). It returns
+// the first present type's vectors, converted to float64.
+func parseTypedEmbeddings(raw json.RawMessage) ([][]float64, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, errors.New("bedrock: unrecognised embeddings format")
 	}
-	if len(nested.Float) == 0 {
-		return nil, errors.New("bedrock: no float embeddings in response (embedding_types may not include \"float\")")
+	for _, key := range []string{"float", "int8", "uint8", "binary", "ubinary"} {
+		val, ok := m[key]
+		if !ok || len(val) == 0 || string(val) == "null" {
+			continue
+		}
+		switch key {
+		case "float":
+			var v [][]float64
+			if err := json.Unmarshal(val, &v); err != nil {
+				return nil, err
+			}
+			return v, nil
+		case "int8":
+			var v [][]int8
+			if err := json.Unmarshal(val, &v); err != nil {
+				return nil, err
+			}
+			return toFloat64Matrix(v), nil
+		case "uint8":
+			var v [][]uint8
+			if err := json.Unmarshal(val, &v); err != nil {
+				return nil, err
+			}
+			return toFloat64Matrix(v), nil
+		case "binary", "ubinary":
+			return parseBinaryRows(val)
+		}
 	}
-	return nested.Float, nil
+	return nil, errors.New("bedrock: no embeddings in response (embedding_types may not include \"float\")")
+}
+
+// toFloat64Matrix converts an integer matrix to float64, preserving each value.
+func toFloat64Matrix[T ~int8 | ~uint8](v [][]T) [][]float64 {
+	out := make([][]float64, len(v))
+	for i, row := range v {
+		out[i] = make([]float64, len(row))
+		for j, x := range row {
+			out[i][j] = float64(x)
+		}
+	}
+	return out
+}
+
+// parseBinaryRows decodes packed-bit binary embeddings. Bedrock returns them as
+// either a single base64 string (single input) or an array of base64 strings
+// (batched input). Each bit encodes one dimension as 0.0/1.0.
+func parseBinaryRows(raw json.RawMessage) ([][]float64, error) {
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil && single != "" {
+		vec, err := decodeBinaryVector(single)
+		if err != nil {
+			return nil, err
+		}
+		return [][]float64{vec}, nil
+	}
+	var arr []string
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return nil, errors.New("bedrock: unrecognised binary embedding format")
+	}
+	out := make([][]float64, 0, len(arr))
+	for _, s := range arr {
+		vec, err := decodeBinaryVector(s)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, vec)
+	}
+	return out, nil
+}
+
+// decodeBinaryVector decodes one base64-encoded packed-bit vector into a
+// float64 slice of 0.0/1.0 values (one per bit, MSB-first).
+func decodeBinaryVector(s string) ([]float64, error) {
+	data, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("decoding binary embedding: %w", err)
+	}
+	vec := make([]float64, 0, len(data)*8)
+	for _, b := range data {
+		for i := 7; i >= 0; i-- {
+			if b&(1<<uint(i)) != 0 {
+				vec = append(vec, 1)
+			} else {
+				vec = append(vec, 0)
+			}
+		}
+	}
+	return vec, nil
 }
 
 // invokeModel sends a POST to the Bedrock InvokeModel endpoint and returns the raw response body.
@@ -391,13 +507,16 @@ func (m *embeddingModel) invokeModel(ctx context.Context, jsonBody []byte) ([]by
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxEmbedErrorBytes))
 		return nil, goai.ParseHTTPErrorWithHeaders("bedrock", resp.StatusCode, body, resp.Header)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxEmbedResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if len(body) > maxEmbedResponseBytes {
+		return nil, fmt.Errorf("bedrock: embedding response body exceeds %d bytes", maxEmbedResponseBytes)
 	}
 	return body, nil
 }

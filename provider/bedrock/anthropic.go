@@ -163,6 +163,11 @@ func (t *bedrockAnthropicTransport) RoundTrip(req *http.Request) (*http.Response
 		// in flags that Bedrock rejects, so we filter to a known-good list.
 		var bodyMap map[string]any
 		if err := json.Unmarshal(body, &bodyMap); err == nil {
+			// Reject Anthropic server-executed tools that Bedrock does not
+			// support (web_search / code_execution / web_fetch) before sending.
+			if err := rejectUnsupportedServerTools(bodyMap); err != nil {
+				return nil, err
+			}
 			delete(bodyMap, "stream")
 			if beta != "" {
 				if filtered := filterBedrockBetas(splitBetas(beta)); len(filtered) > 0 {
@@ -200,6 +205,44 @@ func (t *bedrockAnthropicTransport) RoundTrip(req *http.Request) (*http.Response
 		resp.Header.Set("Content-Type", "text/event-stream")
 	}
 	return resp, nil
+}
+
+// unsupportedBedrockServerTools are Anthropic server-executed tool types that
+// AWS Bedrock does not support. AWS returns "web_search not available on
+// Bedrock" (and likewise for code_execution / web_fetch); forwarding them with
+// a beta header causes a validation error. We reject them up-front with a clear
+// message instead of letting the request fail opaquely server-side.
+//
+// Computer-use tools (computer_*/bash_*/text_editor_*) ARE supported on Bedrock
+// and are deliberately not gated here.
+var unsupportedBedrockServerTools = map[string]bool{
+	"web_search_20250305":        true,
+	"web_search_20260209":        true,
+	"web_fetch_20260209":         true,
+	"code_execution_20250522":    true,
+	"code_execution_20250825":    true,
+	"code_execution_20260120":    true,
+}
+
+// rejectUnsupportedServerTools scans the outgoing request body's "tools" array
+// for Anthropic server-executed tool types that Bedrock does not support and
+// returns a descriptive error if any are present.
+func rejectUnsupportedServerTools(body map[string]any) error {
+	tools, _ := body["tools"].([]any)
+	for _, t := range tools {
+		tm, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		typ, _ := tm["type"].(string)
+		if unsupportedBedrockServerTools[typ] {
+			return fmt.Errorf(
+				"bedrock-anthropic: server tool %q is not supported on AWS Bedrock "+
+					"(web_search, web_fetch and code_execution are Anthropic-direct-only); "+
+					"remove it or replace it with a custom tool", typ)
+		}
+	}
+	return nil
 }
 
 func splitBetas(header string) []string {

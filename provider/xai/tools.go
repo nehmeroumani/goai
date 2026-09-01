@@ -7,10 +7,18 @@ import "github.com/zendev-sh/goai/provider"
 var Tools = struct {
 	// WebSearch creates a web search tool definition.
 	// Allows models to search the web for up-to-date information.
+	//
+	// Responses-API only: xAI exposes this server tool exclusively through its
+	// Responses API. The goai xai provider is a Chat Completions wrapper, so a
+	// request carrying this tool is rejected with an explanatory error (item 61).
 	WebSearch func(opts ...WebSearchOption) provider.ToolDefinition
 
 	// XSearch creates an X (Twitter) search tool definition.
 	// Allows models to search posts on X for real-time social content.
+	//
+	// Responses-API only: xAI exposes this server tool exclusively through its
+	// Responses API. The goai xai provider is a Chat Completions wrapper, so a
+	// request carrying this tool is rejected with an explanatory error (item 61).
 	XSearch func(opts ...XSearchOption) provider.ToolDefinition
 }{
 	WebSearch: webSearchTool,

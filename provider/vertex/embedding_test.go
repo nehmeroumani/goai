@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -277,6 +278,33 @@ func TestEmbedding_UnmarshalError(t *testing.T) {
 	}
 }
 
+// TestEmbedding_GeminiUnmarshalError covers the error branch of the Gemini
+// batchEmbedContents response parse (embedding.go:169-171): with API-key auth
+// the server returns malformed JSON, so json.Unmarshal into the geminiResult
+// struct must fail with a "parsing response" error.
+func TestEmbedding_GeminiUnmarshalError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, ":batchEmbedContents") {
+			t.Errorf("path = %s, want ...:batchEmbedContents", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"embeddings": not-valid-json`)
+	}))
+	defer srv.Close()
+
+	model := Embedding("text-embedding-004",
+		WithAPIKey("my-embed-key"),
+		WithBaseURL(srv.URL),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "parsing response") {
+		t.Errorf("unexpected error: %s", err)
+	}
+}
+
 func TestEmbedding_TokenSourceError(t *testing.T) {
 	ts := provider.CachedTokenSource(func(_ context.Context) (*provider.Token, error) {
 		return nil, fmt.Errorf("token failed")
@@ -315,6 +343,35 @@ func TestEmbedding_WithHeaders(t *testing.T) {
 	}
 	if gotHeader != "val" {
 		t.Errorf("X-Custom = %q", gotHeader)
+	}
+}
+
+func TestEmbedding_AuthHeaderWinsOverWithHeaders(t *testing.T) {
+	// A caller-supplied WithHeaders header named like the auth header must
+	// NOT override the real credential on the OAuth :predict path.
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"predictions": []map[string]any{
+				{"embeddings": map[string]any{"values": []float64{0.1}, "statistics": map[string]any{"token_count": 1}}},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	model := Embedding("text-embedding-004",
+		WithTokenSource(provider.StaticToken("real-token")),
+		WithBaseURL(srv.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer spoofed-token"}),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer real-token" {
+		t.Errorf("Authorization = %q, want %q (credential must win over WithHeaders)", gotAuth, "Bearer real-token")
 	}
 }
 
@@ -373,14 +430,20 @@ func TestEmbedding_ReadBodyError(t *testing.T) {
 	}
 }
 
-// embedAPIKeyURLTransport captures the URL for API-key embedding requests.
+// embedAPIKeyURLTransport captures the URL and request body for API-key
+// embedding requests. It responds with the Gemini batchEmbedContents shape.
 type embedAPIKeyURLTransport struct {
 	captured string
+	body     map[string]any
 }
 
 func (tr *embedAPIKeyURLTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	tr.captured = req.URL.String()
-	body := `{"predictions":[{"embeddings":{"values":[0.1],"statistics":{"token_count":1}}}]}`
+	if req.Body != nil {
+		raw, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(raw, &tr.body)
+	}
+	body := `{"embeddings":[{"value":[0.1]}]}`
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(strings.NewReader(body)),
@@ -408,6 +471,177 @@ func TestEmbedding_APIKeySkipsBearerAuth(t *testing.T) {
 	}
 	if len(result.Embeddings) != 1 {
 		t.Errorf("expected 1 embedding, got %d", len(result.Embeddings))
+	}
+}
+
+// TestEmbedding_APIKeyUsesGeminiBodyShape verifies that API-key auth emits the
+// Gemini batchEmbedContents body shape (item #27) instead of the Vertex
+// :predict instances/parameters shape.
+func TestEmbedding_APIKeyUsesGeminiBodyShape(t *testing.T) {
+	transport := &embedAPIKeyURLTransport{}
+	model := Embedding("text-embedding-004",
+		WithAPIKey("my-embed-key"),
+		WithHTTPClient(&http.Client{Transport: transport}),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hello world"}, provider.EmbedParams{
+		ProviderOptions: map[string]any{
+			"vertex": map[string]any{
+				"taskType":             "RETRIEVAL_QUERY",
+				"title":               "My Doc",
+				"outputDimensionality": 256,
+				"autoTruncate":         true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Endpoint must be batchEmbedContents, not :predict.
+	if !strings.Contains(transport.captured, ":batchEmbedContents") {
+		t.Errorf("expected :batchEmbedContents in URL, got %q", transport.captured)
+	}
+
+	// Body must use the Gemini "requests" shape, not Vertex "instances".
+	if transport.body == nil {
+		t.Fatal("no request body captured")
+	}
+	if _, ok := transport.body["instances"]; ok {
+		t.Error("Gemini body must NOT contain Vertex 'instances'")
+	}
+	if _, ok := transport.body["parameters"]; ok {
+		t.Error("Gemini body must NOT contain Vertex 'parameters'")
+	}
+	requests, ok := transport.body["requests"].([]any)
+	if !ok || len(requests) != 1 {
+		t.Fatalf("expected 1 Gemini request, got %#v", transport.body["requests"])
+	}
+	req := requests[0].(map[string]any)
+	if req["model"] != "models/text-embedding-004" {
+		t.Errorf("request model = %v", req["model"])
+	}
+	content, ok := req["content"].(map[string]any)
+	if !ok {
+		t.Fatalf("request content = %#v", req["content"])
+	}
+	parts := content["parts"].([]any)
+	part := parts[0].(map[string]any)
+	if part["text"] != "hello world" {
+		t.Errorf("part text = %v", part["text"])
+	}
+	// Gemini request-level fields (autoTruncate is Vertex-only and dropped).
+	if req["taskType"] != "RETRIEVAL_QUERY" {
+		t.Errorf("taskType = %v", req["taskType"])
+	}
+	if req["title"] != "My Doc" {
+		t.Errorf("title = %v", req["title"])
+	}
+	if req["outputDimensionality"] != float64(256) {
+		t.Errorf("outputDimensionality = %v", req["outputDimensionality"])
+	}
+	if _, ok := req["autoTruncate"]; ok {
+		t.Error("autoTruncate must not be sent to the Gemini API")
+	}
+}
+
+// TestEmbedding_APIKeyMultipleValues verifies the Gemini batch body carries
+// one request per value and parses the embeddings array.
+func TestEmbedding_APIKeyMultipleValues(t *testing.T) {
+	transport := &embedAPIKeyURLTransport{}
+	model := Embedding("text-embedding-004",
+		WithAPIKey("my-embed-key"),
+		WithHTTPClient(&http.Client{Transport: transport}),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"a", "b", "c"}, provider.EmbedParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests, ok := transport.body["requests"].([]any)
+	if !ok || len(requests) != 3 {
+		t.Fatalf("expected 3 Gemini requests, got %#v", transport.body["requests"])
+	}
+}
+
+// TestEmbedding_APIKeyGeminiGoldenBody is a golden full-body REQUEST contract
+// test (item #27): API-key auth must emit the exact Gemini
+// batchEmbedContents body shape -- {"requests":[{model,content:{parts:[{text}]},
+// taskType,title,outputDimensionality}]} -- with no Vertex :predict keys
+// (instances/parameters) and no Vertex-only fields (autoTruncate).
+func TestEmbedding_APIKeyGeminiGoldenBody(t *testing.T) {
+	transport := &embedAPIKeyURLTransport{}
+	model := Embedding("text-embedding-004",
+		WithAPIKey("my-embed-key"),
+		WithHTTPClient(&http.Client{Transport: transport}),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hello world"}, provider.EmbedParams{
+		ProviderOptions: map[string]any{
+			"vertex": map[string]any{
+				"taskType":             "RETRIEVAL_QUERY",
+				"title":               "My Doc",
+				"outputDimensionality": 256,
+				"autoTruncate":         true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]any{
+		"requests": []any{
+			map[string]any{
+				"model":                "models/text-embedding-004",
+				"content":              map[string]any{"parts": []any{map[string]any{"text": "hello world"}}},
+				"taskType":             "RETRIEVAL_QUERY",
+				"title":                "My Doc",
+				"outputDimensionality": float64(256),
+			},
+		},
+	}
+	if !reflect.DeepEqual(transport.body, want) {
+		gotJSON, _ := json.Marshal(transport.body)
+		wantJSON, _ := json.Marshal(want)
+		t.Errorf("request body mismatch:\n got: %s\nwant: %s", gotJSON, wantJSON)
+	}
+}
+
+// TestEmbedding_APIKeyParsesGeminiResponse is a RESPONSE-direction contract
+// test (item #27): a Gemini batchEmbedContents response
+// {"embeddings":[{"value":[...]}]} must be parsed into the EmbedResult.
+func TestEmbedding_APIKeyParsesGeminiResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, ":batchEmbedContents") {
+			t.Errorf("path = %s, want ...:batchEmbedContents", r.URL.Path)
+		}
+		if !strings.Contains(r.URL.RawQuery, "key=my-embed-key") {
+			t.Errorf("query = %q, want key=my-embed-key", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"embeddings":[{"value":[0.1,0.2,0.3]},{"value":[0.4,0.5,0.6]}]}`)
+	}))
+	defer srv.Close()
+
+	model := Embedding("text-embedding-004",
+		WithAPIKey("my-embed-key"),
+		WithBaseURL(srv.URL),
+	)
+	result, err := model.DoEmbed(t.Context(), []string{"a", "b"}, provider.EmbedParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Embeddings) != 2 {
+		t.Fatalf("expected 2 embeddings, got %d", len(result.Embeddings))
+	}
+	wantFirst := []float64{0.1, 0.2, 0.3}
+	wantSecond := []float64{0.4, 0.5, 0.6}
+	if !reflect.DeepEqual(result.Embeddings[0], wantFirst) {
+		t.Errorf("embedding[0] = %v, want %v", result.Embeddings[0], wantFirst)
+	}
+	if !reflect.DeepEqual(result.Embeddings[1], wantSecond) {
+		t.Errorf("embedding[1] = %v, want %v", result.Embeddings[1], wantSecond)
+	}
+	if result.Response.Model != "text-embedding-004" {
+		t.Errorf("Response.Model = %q, want text-embedding-004", result.Response.Model)
 	}
 }
 
@@ -459,5 +693,44 @@ func TestEmbedding_ResponseModelPopulated(t *testing.T) {
 	}
 	if result.Response.Model != "text-embedding-004" {
 		t.Errorf("Response.Model = %q, want %q", result.Response.Model, "text-embedding-004")
+	}
+}
+
+func TestEmbedding_ResponseBodyTooLarge(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Body larger than maxVertexSuccessBodyBytes (64 MiB) must be rejected.
+		_, _ = w.Write(make([]byte, maxVertexSuccessBodyBytes+1))
+	}))
+	defer srv.Close()
+
+	model := Embedding("text-embedding-004",
+		WithTokenSource(provider.StaticToken("test-token")),
+		WithBaseURL(srv.URL),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err == nil {
+		t.Fatal("expected error for oversized success response")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want it to mention the size limit", err.Error())
+	}
+}
+
+func TestEmbedding_ErrorBodyTooLarge(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		// Error body larger than maxVertexErrorBodyBytes (1 MiB) must be bounded.
+		_, _ = w.Write(make([]byte, maxVertexErrorBodyBytes+1))
+	}))
+	defer srv.Close()
+
+	model := Embedding("text-embedding-004",
+		WithTokenSource(provider.StaticToken("test-token")),
+		WithBaseURL(srv.URL),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err == nil {
+		t.Fatal("expected error for HTTP 500 response")
 	}
 }

@@ -72,9 +72,12 @@ type ollamaChatRequest struct {
 	Model    string          `json:"model"`
 	Messages []ollamaMessage `json:"messages"`
 	Stream   bool            `json:"stream"`
-	Think    bool            `json:"think"`
-	Tools    []ollamaTool    `json:"tools,omitempty"`
-	Options  map[string]any  `json:"options,omitempty"`
+	// Think enables extended reasoning. Ollama accepts either a boolean
+	// enable/disable flag or a reasoning-effort string level ("high",
+	// "medium", "low", "max"), so it is carried as a raw value.
+	Think   any            `json:"think"`
+	Tools   []ollamaTool   `json:"tools,omitempty"`
+	Options map[string]any `json:"options,omitempty"`
 	// Format requests structured output. Ollama accepts either the string
 	// "json" for generic JSON mode or a JSON Schema object for constrained
 	// output, so it is carried as a raw JSON value.
@@ -88,6 +91,9 @@ type ollamaMessage struct {
 	Thinking   string           `json:"thinking,omitempty"`
 	ToolCalls  []ollamaToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
+	// ToolName is required on role "tool" messages so Ollama can associate a
+	// tool result with the tool call that produced it across turns.
+	ToolName string `json:"tool_name,omitempty"`
 }
 
 // ollamaToolCall is a tool call in the Ollama wire format.
@@ -657,6 +663,7 @@ func convertMessage(msg provider.Message) ([]ollamaMessage, error) {
 					Role:       "tool",
 					Content:    part.ToolOutput,
 					ToolCallID: part.ToolCallID,
+					ToolName:   part.ToolName,
 				})
 			}
 		}
@@ -732,12 +739,20 @@ func buildOllamaOptions(params provider.GenerateParams) map[string]any {
 	return opts
 }
 
-// extractThink reads ProviderOptions["think"] and returns the bool value.
-// Defaults to false when absent or not a bool.
-func extractThink(providerOptions map[string]any) bool {
+// extractThink reads ProviderOptions["think"] and returns the Ollama think
+// parameter value. It accepts a bool (enable/disable) or a reasoning-effort
+// string level ("high", "medium", "low", "max"). Defaults to false when absent
+// or of an unrecognized type/value.
+func extractThink(providerOptions map[string]any) any {
 	if val, ok := providerOptions["think"]; ok {
-		if boolVal, isBool := val.(bool); isBool {
-			return boolVal
+		switch v := val.(type) {
+		case bool:
+			return v
+		case string:
+			switch v {
+			case "high", "medium", "low", "max":
+				return v
+			}
 		}
 	}
 	return false

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 
@@ -24,6 +25,15 @@ import (
 
 // ChatModelConfig configures a chat language model backed by the OpenAI
 // Chat Completions wire format.
+//
+// RequestConfig is embedded (not a named field) so its wire-format knobs are
+// promoted onto ChatModelConfig: providers can read them as
+// m.cfg.IncludeStreamOptions, and DoGenerate / DoStream pass the embedded
+// value straight to BuildRequest. This keeps a single source of truth -- a new
+// wire-format knob is declared once in RequestConfig and needs no manual copy
+// here. Note: Go does not allow promoted fields in a struct composite literal,
+// so callers set them by naming the embedded field, e.g.
+// ChatModelConfig{RequestConfig: RequestConfig{IncludeStreamOptions: true}}.
 type ChatModelConfig struct {
 	// ProviderID identifies the provider in error messages and stderr warnings
 	// (for example "deepinfra", "cloudflare").
@@ -59,27 +69,14 @@ type ChatModelConfig struct {
 	// Capabilities is returned from the model's Capabilities() method.
 	Capabilities provider.ModelCapabilities
 
-	// ExtraBody merges provider-specific fields into the request body
-	// (for example OpenRouter's "usage": {"include": true}).
-	ExtraBody map[string]any
-
-	// IncludeStreamOptions adds stream_options.include_usage on streaming requests.
-	// Most providers want this true.
-	IncludeStreamOptions bool
-
-	// IncludeReasoningContent opts into the provider-specific reasoning_content
-	// field for assistant messages.
-	IncludeReasoningContent bool
-
 	// WarnPromptCaching emits a one-line stderr warning when the caller sets
 	// GenerateParams.PromptCaching and the provider does not support it.
 	WarnPromptCaching bool
 
-	// UseMaxCompletionTokens forces the max_tokens / max_completion_tokens choice
-	// instead of deriving it from ModelID. Nil keeps the ModelID heuristic.
-	// Azure OpenAI needs it: its wire model id is the user-chosen deployment
-	// name, which says nothing about the model behind it.
-	UseMaxCompletionTokens *bool
+	// RequestConfig holds the wire-format knobs shared with BuildRequest.
+	// Embedded so DoGenerate / DoStream can hand it to BuildRequest wholesale
+	// instead of reconstructing it field-by-field (single touch point).
+	RequestConfig
 }
 
 // NewChatModel returns a provider.LanguageModel backed by the shared
@@ -161,11 +158,7 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	if err := m.checkBaseURL(); err != nil {
 		return nil, err
 	}
-	body := BuildRequest(params, m.cfg.ModelID, false, RequestConfig{
-		ExtraBody:               m.cfg.ExtraBody,
-		IncludeReasoningContent: m.cfg.IncludeReasoningContent,
-		UseMaxCompletionTokens:  m.cfg.UseMaxCompletionTokens,
-	})
+	body := BuildRequest(params, m.cfg.ModelID, false, m.cfg.RequestConfig)
 
 	resp, err := m.doHTTP(ctx, m.cfg.BaseURL+"/chat/completions", body)
 	if err != nil {
@@ -173,7 +166,7 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := ReadResponseBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -185,12 +178,7 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 	if err := m.checkBaseURL(); err != nil {
 		return nil, err
 	}
-	body := BuildRequest(params, m.cfg.ModelID, true, RequestConfig{
-		IncludeStreamOptions:    m.cfg.IncludeStreamOptions,
-		ExtraBody:               m.cfg.ExtraBody,
-		IncludeReasoningContent: m.cfg.IncludeReasoningContent,
-		UseMaxCompletionTokens:  m.cfg.UseMaxCompletionTokens,
-	})
+	body := BuildRequest(params, m.cfg.ModelID, true, m.cfg.RequestConfig)
 
 	resp, err := m.doHTTP(ctx, m.cfg.BaseURL+"/chat/completions", body)
 	if err != nil {
@@ -278,11 +266,14 @@ func (m *embeddingModel) DoEmbed(ctx context.Context, values []string, params pr
 	jsonBody := httpc.MustMarshalJSON(body)
 	req := httpc.MustNewRequest(ctx, "POST", m.cfg.BaseURL+"/embeddings", jsonBody)
 	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
 	for k, v := range m.cfg.Headers {
 		req.Header.Set(k, v)
+	}
+	// Apply the credential last so a caller-supplied Authorization header in
+	// cfg.Headers can never override the configured token. This mirrors
+	// httpc.DoJSONRequest, which sets auth after the merged headers.
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	client := m.cfg.HTTPClient
@@ -295,7 +286,7 @@ func (m *embeddingModel) DoEmbed(ctx context.Context, values []string, params pr
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := ReadResponseBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -332,6 +323,28 @@ func (m *embeddingModel) DoEmbed(ctx context.Context, values []string, params pr
 }
 
 // --- Helpers ---
+
+// ReadResponseBody reads a non-streaming response body, bounding it to
+// maxResponseBodyBytes to protect the client from a malicious provider that
+// sends an unbounded body.
+func ReadResponseBody(r io.Reader) ([]byte, error) {
+	// Clamp before adding the sentinel byte so the +1 cannot overflow when
+	// maxResponseBodyBytes is set near math.MaxInt64: a negative LimitReader
+	// would be treated as EOF and silently return an empty body.
+	limit := maxResponseBodyBytes
+	if limit == math.MaxInt64 {
+		limit = math.MaxInt64 - 1
+	}
+	limited := io.LimitReader(r, limit+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxResponseBodyBytes {
+		return nil, fmt.Errorf("response body exceeds %d byte limit", maxResponseBodyBytes)
+	}
+	return data, nil
+}
 
 func resolveToken(ctx context.Context, ts provider.TokenSource, required bool) (string, error) {
 	if ts == nil {

@@ -2,12 +2,14 @@ package openai
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/provider"
 )
 
@@ -290,6 +292,32 @@ func TestEmbedding_WithHeaders(t *testing.T) {
 	}
 }
 
+// A caller-supplied header named "Authorization" must NOT override the real
+// credential: auth is applied last, so it wins.
+func TestEmbedding_AuthHeaderCannotBeOverridden(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Errorf("Authorization = %q, want %q (caller header must not win)", got, "Bearer test-key")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data":  []map[string]any{{"embedding": []float64{0.1}, "index": 0}},
+			"usage": map[string]any{"prompt_tokens": 1, "total_tokens": 1},
+		})
+	}))
+	defer srv.Close()
+
+	model := Embedding("text-embedding-3-small",
+		WithAPIKey("test-key"),
+		WithBaseURL(srv.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer attacker"}),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestEmbedding_SendRequestError(t *testing.T) {
 	// Use a custom client that fails on Do.
 	model := Embedding("text-embedding-3-small",
@@ -383,5 +411,46 @@ func TestEmbedding_ResponseModelPopulated(t *testing.T) {
 	}
 	if result.Response.Model != "text-embedding-3-small" {
 		t.Errorf("Response.Model = %q, want %q", result.Response.Model, "text-embedding-3-small")
+	}
+}
+
+// TestEmbedding_ResponseBodyOverCap verifies the success-path bounded read.
+func TestEmbedding_ResponseBodyOverCap(t *testing.T) {
+	transport := &fixedBodyTransport{body: io.NopCloser(io.LimitReader(zeroReader{}, int64(maxEmbeddingResponseBytes+2)))}
+	client := &http.Client{Transport: transport}
+	model := Embedding("text-embedding-3-small", WithAPIKey("k"), WithBaseURL("http://fake"), WithHTTPClient(client))
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err == nil {
+		t.Fatal("expected error for oversized response body")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want an 'exceeds' over-cap error", err)
+	}
+}
+
+// TestEmbedding_ErrorBodyBounded verifies the error-path bounded read.
+func TestEmbedding_ErrorBodyBounded(t *testing.T) {
+	const tailMarker = "TAIL-MARKER-SHOULD-NOT-APPEAR"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.Copy(w, io.MultiReader(
+			strings.NewReader(`{"error":{"message":"`),
+			io.LimitReader(zeroReader{}, int64(maxEmbeddingErrorBytes+len(tailMarker))),
+			strings.NewReader(tailMarker),
+		))
+	}))
+	defer server.Close()
+
+	model := Embedding("text-embedding-3-small", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *goai.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *goai.APIError", err)
+	}
+	if strings.Contains(apiErr.Message, tailMarker) {
+		t.Errorf("error message contains tail marker; error body was not bounded: %q", apiErr.Message)
 	}
 }

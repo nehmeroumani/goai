@@ -11,6 +11,7 @@ package google
 import (
 	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +21,6 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/internal/gemini"
@@ -29,6 +29,27 @@ import (
 	"github.com/zendev-sh/goai/internal/sse"
 	"github.com/zendev-sh/goai/provider"
 )
+
+// Bounds for reading untrusted HTTP response bodies. Success responses are
+// capped at 64 MiB; error bodies (used only to surface an error message) are
+// capped at 1 MiB to prevent a malicious server from exhausting memory.
+const (
+	maxGoogleSuccessBodyBytes int64 = 64 << 20
+	maxGoogleErrorBodyBytes   int64 = 1 << 20
+)
+
+// readSuccessBody reads a success response body, bounding it to
+// maxGoogleSuccessBodyBytes and returning a clear error if the cap is exceeded.
+func readSuccessBody(reader io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, maxGoogleSuccessBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxGoogleSuccessBodyBytes {
+		return nil, fmt.Errorf("response body exceeds %d byte limit", maxGoogleSuccessBodyBytes)
+	}
+	return data, nil
+}
 
 // Compile-time interface compliance checks.
 var (
@@ -232,7 +253,7 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readSuccessBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -260,26 +281,9 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 	// Keep resp.Request and its serialized request body out of the stream closure.
 	responseBody := resp.Body
 
-	out := make(chan provider.StreamChunk, 64)
-	go func() {
-		var closeOnce sync.Once
-		closeBody := func() { closeOnce.Do(func() { _ = responseBody.Close() }) }
-		defer closeBody()
-		// Close body on context cancellation to unblock scanner.Scan().
-		// Without this, the goroutine leaks if the server stalls mid-stream.
-		done := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				closeBody()
-			case <-done:
-			}
-		}()
-		defer close(done)
-		parseSSE(ctx, responseBody, out)
-	}()
-
-	return &provider.StreamResult{Stream: out}, nil
+return provider.RunStream(ctx, responseBody, func(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk) {
+		parseSSE(ctx, body, out)
+	}), nil
 }
 
 // --- Request building ---
@@ -294,7 +298,6 @@ type geminiRequestBody struct {
 	SafetySettings    any `json:"safetySettings,omitempty"`
 	GenerationConfig  any `json:"generationConfig,omitempty"`
 	CachedContent     any `json:"cachedContent,omitempty"`
-	Labels            any `json:"labels,omitempty"`
 	Contents          any `json:"contents"`
 }
 
@@ -473,10 +476,20 @@ func (m *chatModel) buildRequest(params provider.GenerateParams) (geminiRequestB
 		}
 	}
 
-	// Image config from ProviderOptions.
+	// Image config from ProviderOptions. imageSize is not an official
+	// ImageConfig field -- it belongs at the top level of generationConfig,
+	// so it is hoisted out of imageConfig.
 	if gopts != nil {
 		if ic, ok := gopts["imageConfig"].(map[string]any); ok {
-			genConfig["imageConfig"] = ic
+			hoisted := make(map[string]any, len(ic))
+			for k, v := range ic {
+				if k == "imageSize" {
+					genConfig["imageSize"] = v
+					continue
+				}
+				hoisted[k] = v
+			}
+			genConfig["imageConfig"] = hoisted
 		}
 	}
 
@@ -501,13 +514,6 @@ func (m *chatModel) buildRequest(params provider.GenerateParams) (geminiRequestB
 	if gopts != nil {
 		if cc, ok := gopts["cachedContent"].(string); ok && cc != "" {
 			body.CachedContent = cc
-		}
-	}
-
-	// Labels from ProviderOptions.
-	if gopts != nil {
-		if lb, ok := gopts["labels"].(map[string]any); ok {
-			body.Labels = lb
 		}
 	}
 
@@ -550,6 +556,26 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 				parts = append(parts, textPart)
 
 			case provider.PartImage:
+				if part.RemoteRef != nil {
+					// Remote reference to an uploaded file/image: emit fileData.
+					// Fall back to inlineData when the raw bytes are available.
+					if len(part.RemoteRef.Data) > 0 {
+						parts = append(parts, map[string]any{
+							"inlineData": map[string]any{
+								"mimeType": part.RemoteRef.MediaType,
+								"data":     base64.StdEncoding.EncodeToString(part.RemoteRef.Data),
+							},
+						})
+					} else {
+						parts = append(parts, map[string]any{
+							"fileData": map[string]any{
+								"fileUri":  part.RemoteRef.URI,
+								"mimeType": part.RemoteRef.MediaType,
+							},
+						})
+					}
+					break
+				}
 				mediaType, data, ok := httpc.ParseDataURL(part.URL)
 				if ok {
 					parts = append(parts, map[string]any{
@@ -667,16 +693,7 @@ type geminiResponse struct {
 	ModelVersion string `json:"modelVersion,omitempty"`
 	Candidates   []struct {
 		Content struct {
-			Parts []struct {
-				Text             string `json:"text,omitempty"`
-				Thought          bool   `json:"thought,omitempty"`
-				ThoughtSignature string `json:"thoughtSignature,omitempty"`
-				FunctionCall     *struct {
-					ID   string          `json:"id,omitempty"`
-					Name string          `json:"name"`
-					Args json.RawMessage `json:"args"`
-				} `json:"functionCall,omitempty"`
-			} `json:"parts"`
+			Parts []geminiPart `json:"parts"`
 		} `json:"content"`
 		FinishReason      string             `json:"finishReason,omitempty"`
 		GroundingMetadata *groundingMetadata `json:"groundingMetadata,omitempty"`
@@ -691,6 +708,59 @@ type geminiResponse struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
+}
+
+// geminiPart is a single content part in a Gemini candidate. Besides text,
+// thought and functionCall parts, Gemini can return richer part types
+// (inlineData, executableCode, codeExecutionResult, fileData, videoMetadata)
+// that must not be silently dropped.
+type geminiPart struct {
+	Text             string `json:"text,omitempty"`
+	Thought          bool   `json:"thought,omitempty"`
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
+	FunctionCall     *struct {
+		ID   string          `json:"id,omitempty"`
+		Name string          `json:"name"`
+		Args json.RawMessage `json:"args"`
+	} `json:"functionCall,omitempty"`
+	InlineData *struct {
+		MimeType string `json:"mimeType"`
+		Data     string `json:"data"`
+	} `json:"inlineData,omitempty"`
+	ExecutableCode *struct {
+		Code     string `json:"code"`
+		Language string `json:"language"`
+	} `json:"executableCode,omitempty"`
+	CodeExecutionResult *struct {
+		Output string `json:"output"`
+	} `json:"codeExecutionResult,omitempty"`
+	FileData *struct {
+		FileURI  string `json:"fileUri"`
+		MimeType string `json:"mimeType"`
+	} `json:"fileData,omitempty"`
+	VideoMetadata *struct {
+		VideoDuration string `json:"videoDuration"`
+	} `json:"videoMetadata,omitempty"`
+}
+
+// extraPart returns a structured map for the non-text, non-function parts
+// Gemini can emit (inlineData, executableCode, codeExecutionResult, fileData,
+// videoMetadata), or nil when the part is none of those. It lets callers
+// surface these parts instead of dropping them.
+func (p geminiPart) extraPart() map[string]any {
+	switch {
+	case p.InlineData != nil:
+		return map[string]any{"inlineData": p.InlineData}
+	case p.ExecutableCode != nil:
+		return map[string]any{"executableCode": p.ExecutableCode}
+	case p.CodeExecutionResult != nil:
+		return map[string]any{"codeExecutionResult": p.CodeExecutionResult}
+	case p.FileData != nil:
+		return map[string]any{"fileData": p.FileData}
+	case p.VideoMetadata != nil:
+		return map[string]any{"videoMetadata": p.VideoMetadata}
+	}
+	return nil
 }
 
 func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk) {
@@ -795,6 +865,15 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 				}
 			} else if part.Text != "" {
 				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkText, Text: part.Text, Metadata: meta}) {
+					return
+				}
+			} else if extra := part.extraPart(); extra != nil {
+				// Surface non-text parts (inlineData, executableCode,
+				// codeExecutionResult, fileData, videoMetadata) instead of
+				// dropping them. They arrive as a text chunk carrying the
+				// structured part under metadata.google.part.
+				extraMeta := map[string]any{"google": map[string]any{"part": extra}}
+				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkText, Metadata: extraMeta}) {
 					return
 				}
 			}
@@ -942,6 +1021,7 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 	var textParts []string
 	var reasoningParts []string
 	var providerMeta map[string]any
+	var extraParts []map[string]any
 	var callIndex int
 	for _, part := range candidate.Content.Parts {
 		if part.FunctionCall != nil {
@@ -967,6 +1047,11 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 			reasoningParts = append(reasoningParts, part.Text)
 		} else if !part.Thought && part.Text != "" {
 			textParts = append(textParts, part.Text)
+		} else if extra := part.extraPart(); extra != nil {
+			// Preserve non-text parts (inlineData, executableCode,
+			// codeExecutionResult, fileData, videoMetadata) rather than
+			// dropping them. They surface under metadata.google.parts.
+			extraParts = append(extraParts, extra)
 		}
 		// Preserve thoughtSignature for multi-turn reasoning.
 		if part.ThoughtSignature != "" {
@@ -985,6 +1070,19 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 		result.ProviderMetadata = map[string]map[string]any{
 			"google": providerMeta,
 		}
+	}
+	// Attach non-text parts (inlineData, executableCode, codeExecutionResult,
+	// fileData, videoMetadata) so they are not dropped from the result.
+	if len(extraParts) > 0 {
+		if result.ProviderMetadata == nil {
+			result.ProviderMetadata = map[string]map[string]any{}
+		}
+		gm := result.ProviderMetadata["google"]
+		if gm == nil {
+			gm = map[string]any{}
+			result.ProviderMetadata["google"] = gm
+		}
+		gm["parts"] = extraParts
 	}
 
 	// Extract grounding sources from groundingMetadata.
@@ -1008,17 +1106,20 @@ func (m *chatModel) doHTTP(ctx context.Context, url string, body any, perRequest
 	jsonBody := httpc.MustMarshalJSON(body)
 	req := httpc.MustNewRequest(ctx, "POST", url, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
-	if m.opts.isVertex {
-		req.Header.Set("Authorization", "Bearer "+token)
-	} else {
-		req.Header.Set("x-goog-api-key", token)
-	}
 
+	// Apply caller-supplied headers first, then set the credential LAST so a
+	// caller's header named like the auth header cannot override the real
+	// credential (auth wins).
 	for k, v := range m.opts.headers {
 		req.Header.Set(k, v)
 	}
 	for k, v := range perRequestHeaders {
 		req.Header.Set(k, v)
+	}
+	if m.opts.isVertex {
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		req.Header.Set("x-goog-api-key", token)
 	}
 
 	resp, err := m.httpClient().Do(req)
@@ -1027,7 +1128,7 @@ func (m *chatModel) doHTTP(ctx context.Context, url string, body any, perRequest
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxGoogleErrorBodyBytes))
 		_ = resp.Body.Close()
 		return nil, goai.ParseHTTPErrorWithHeaders("google", resp.StatusCode, respBody, resp.Header)
 	}

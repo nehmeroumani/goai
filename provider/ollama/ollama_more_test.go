@@ -3,14 +3,31 @@ package ollama
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/zendev-sh/goai/provider"
 )
 
 func ptr[T any](v T) *T { return &v }
+
+// jsonEqual reports whether two JSON documents are semantically identical,
+// ignoring field ordering and insignificant whitespace.
+func jsonEqual(t *testing.T, got, want []byte) bool {
+	t.Helper()
+	var gotV, wantV any
+	if err := json.Unmarshal(got, &gotV); err != nil {
+		t.Fatalf("got is not valid JSON: %v\n%s", err, got)
+	}
+	if err := json.Unmarshal(want, &wantV); err != nil {
+		t.Fatalf("want is not valid JSON: %v\n%s", err, want)
+	}
+	return reflect.DeepEqual(gotV, wantV)
+}
 
 func TestConvertMessage_Roles(t *testing.T) {
 	// System.
@@ -69,12 +86,12 @@ func TestConvertMessage_Roles(t *testing.T) {
 		t.Errorf("tool call name = %q, want g", asst[0].ToolCalls[1].Function.Name)
 	}
 
-	// Tool: one Ollama message per result part.
+	// Tool: one Ollama message per result part, each carrying tool_name.
 	tool, err := convertMessage(provider.Message{
 		Role: provider.RoleTool,
 		Content: []provider.Part{
-			{Type: provider.PartToolResult, ToolCallID: "id1", ToolOutput: "out1"},
-			{Type: provider.PartToolResult, ToolCallID: "id2", ToolOutput: "out2"},
+			{Type: provider.PartToolResult, ToolCallID: "id1", ToolOutput: "out1", ToolName: "get_weather"},
+			{Type: provider.PartToolResult, ToolCallID: "id2", ToolOutput: "out2", ToolName: "get_time"},
 		},
 	})
 	if err != nil {
@@ -85,6 +102,12 @@ func TestConvertMessage_Roles(t *testing.T) {
 	}
 	if tool[0].Role != "tool" || tool[0].ToolCallID != "id1" || tool[0].Content != "out1" {
 		t.Errorf("tool message[0] = %+v", tool[0])
+	}
+	if tool[0].ToolName != "get_weather" {
+		t.Errorf("tool message[0].ToolName = %q, want %q", tool[0].ToolName, "get_weather")
+	}
+	if tool[1].ToolName != "get_time" {
+		t.Errorf("tool message[1].ToolName = %q, want %q", tool[1].ToolName, "get_time")
 	}
 
 	// Unsupported role.
@@ -142,14 +165,24 @@ func TestBuildOllamaOptions(t *testing.T) {
 }
 
 func TestExtractThink(t *testing.T) {
-	if extractThink(nil) {
-		t.Error("nil options = true, want false")
+	if extractThink(nil) != false {
+		t.Error("nil options != false")
 	}
-	if !extractThink(map[string]any{"think": true}) {
-		t.Error("think:true = false, want true")
+	if extractThink(map[string]any{"think": true}) != true {
+		t.Error("think:true != true")
 	}
-	if extractThink(map[string]any{"think": "yes"}) {
-		t.Error("non-bool think = true, want false")
+	// Reasoning-effort string levels are accepted and passed through verbatim.
+	for _, level := range []string{"high", "medium", "low", "max"} {
+		if got := extractThink(map[string]any{"think": level}); got != level {
+			t.Errorf("think:%q = %v, want %q", level, got, level)
+		}
+	}
+	// Unrecognized values fall back to false.
+	if extractThink(map[string]any{"think": "yes"}) != false {
+		t.Error("unknown think string != false")
+	}
+	if extractThink(map[string]any{"think": 42}) != false {
+		t.Error("non-bool/non-string think != false")
 	}
 }
 
@@ -513,5 +546,137 @@ func TestConvertMessage_AssistantReasoningToThinking(t *testing.T) {
 	}
 	if msgs[0].Thinking != "because" {
 		t.Errorf("thinking = %q, want %q (reasoning must not merge into content)", msgs[0].Thinking, "because")
+	}
+}
+
+// TestDoGenerate_ToolResultCarriesToolName verifies that a tool-result message
+// is serialized to the wire with the tool_name field populated, so Ollama can
+// resolve the result to the originating tool call across turns.
+func TestDoGenerate_ToolResultCarriesToolName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body ollamaChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		found := false
+		for _, m := range body.Messages {
+			if m.Role == "tool" {
+				found = true
+				if m.ToolName != "get_weather" {
+					t.Errorf("tool message tool_name = %q, want %q", m.ToolName, "get_weather")
+				}
+				if m.ToolCallID != "call_1" {
+					t.Errorf("tool message tool_call_id = %q, want %q", m.ToolCallID, "call_1")
+				}
+			}
+		}
+		if !found {
+			t.Error("no tool message found in request")
+		}
+		chatNDJSON(w, `{"model":"m","message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop"}`)
+	}))
+	defer server.Close()
+
+	model := Chat("m", WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "weather?"}}},
+			{Role: provider.RoleTool, Content: []provider.Part{
+				{Type: provider.PartToolResult, ToolCallID: "call_1", ToolName: "get_weather", ToolOutput: "sunny"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestChat_ThinkMode_StringLevel verifies that a reasoning-effort string level
+// ("high"/"medium"/"low"/"max") is forwarded verbatim in the think field.
+func TestChat_ThinkMode_StringLevel(t *testing.T) {
+	for _, level := range []string{"high", "medium", "low", "max"} {
+		level := level
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body ollamaChatRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			strVal, ok := body.Think.(string)
+			if !ok || strVal != level {
+				t.Errorf("think = %#v, want string %q", body.Think, level)
+			}
+			chatNDJSON(w, `{"model":"m","message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop"}`)
+		}))
+		model := Chat("m", WithBaseURL(server.URL))
+		_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+			Messages:       []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+			ProviderOptions: map[string]any{"think": level},
+		})
+		server.Close()
+		if err != nil {
+			t.Fatalf("level %q: %v", level, err)
+		}
+	}
+}
+
+// TestChat_RequestGolden_ToolResultToolName is a REQUEST-direction golden
+// contract test for audit item #53: a tool-result message must serialize
+// tool_name on the wire so Ollama can associate the result with its originating
+// tool call across turns. It asserts the FULL outgoing request body.
+func TestChat_RequestGolden_ToolResultToolName(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		chatNDJSON(w, `{"model":"m","message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop"}`)
+	}))
+	defer server.Close()
+
+	model := Chat("m", WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "weather?"}}},
+			{Role: provider.RoleTool, Content: []provider.Part{
+				{Type: provider.PartToolResult, ToolCallID: "call_1", ToolName: "get_weather", ToolOutput: "sunny"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := `{"model":"m","messages":[` +
+		`{"role":"user","content":"weather?"},` +
+		`{"role":"tool","content":"sunny","tool_call_id":"call_1","tool_name":"get_weather"}` +
+		`],"stream":false,"think":false}`
+	if !jsonEqual(t, gotBody, []byte(want)) {
+		t.Errorf("request body mismatch:\n got: %s\nwant: %s", gotBody, want)
+	}
+}
+
+// TestChat_RequestGolden_ThinkStringLevel is a REQUEST-direction golden
+// contract test for audit item #54: a reasoning-effort string level
+// ("high"/"medium"/"low"/"max") must be forwarded verbatim in the think field
+// of the FULL outgoing body (not dropped or coerced to a bool).
+func TestChat_RequestGolden_ThinkStringLevel(t *testing.T) {
+	for _, level := range []string{"high", "medium", "low", "max"} {
+		level := level
+		var gotBody []byte
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotBody, _ = io.ReadAll(r.Body)
+			chatNDJSON(w, `{"model":"m","message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop"}`)
+		}))
+		model := Chat("m", WithBaseURL(server.URL))
+		_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+			Messages:       []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+			ProviderOptions: map[string]any{"think": level},
+		})
+		server.Close()
+		if err != nil {
+			t.Fatalf("level %q: %v", level, err)
+		}
+		want := fmt.Sprintf(`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false,"think":%q}`, level)
+		if !jsonEqual(t, gotBody, []byte(want)) {
+			t.Errorf("level %q request body mismatch:\n got: %s\nwant: %s", level, gotBody, want)
+		}
 	}
 }
