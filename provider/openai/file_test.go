@@ -131,3 +131,24 @@ func TestFile_DeleteErrorBodyBounded(t *testing.T) {
 		t.Errorf("error message contains tail marker; error body was not bounded: %q", apiErr.Message)
 	}
 }
+
+// TestFile_UploadSuccessBodyReadError verifies that a read failure on the
+// success body propagates as an error instead of panicking or returning a
+// partially-parsed result.
+func TestFile_UploadSuccessBodyReadError(t *testing.T) {
+	u := &fileUploader{opts: options{
+		baseURL:     "http://localhost",
+		tokenSource: provider.StaticToken("k"),
+		httpClient:  &http.Client{Transport: &errorBodyTransport{}},
+	}}
+	_, err := u.UploadFile(t.Context(), provider.FileUpload{
+		Reader:   strings.NewReader("file contents"),
+		Filename: "notes.txt",
+	})
+	if err == nil {
+		t.Fatal("expected error from read failure")
+	}
+	if !strings.Contains(err.Error(), "reading response") {
+		t.Errorf("error = %q, want it to mention reading the response", err)
+	}
+}
