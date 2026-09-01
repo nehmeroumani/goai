@@ -862,6 +862,41 @@ data: [DONE]
 	}
 }
 
+// A tool call whose arguments arrive but whose name/id never resolve must
+// surface an error at finalize instead of being silently dropped (matches the
+// Vercel AI SDK, which throws in this case).
+func TestParseStream_UnresolvedToolCallEmitsError(t *testing.T) {
+	input := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]},"index":0}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"main.go\"}"}}]},"index":0}]}
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+
+	go ParseStream(t.Context(), scanner, out)
+
+	var gotErr error
+	var gotFinish bool
+	for chunk := range out {
+		switch chunk.Type {
+		case provider.ChunkError:
+			gotErr = chunk.Error
+		case provider.ChunkFinish:
+			gotFinish = true
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected a ChunkError for a tool call whose name/id never resolved")
+	}
+	if !strings.Contains(gotErr.Error(), "never resolved") {
+		t.Errorf("error = %v, want it to mention the unresolved name/id", gotErr)
+	}
+	if gotFinish {
+		t.Error("stream should terminate with an error, not a clean finish")
+	}
+}
+
 func TestParseStream_Reasoning(t *testing.T) {
 	input := `data: {"choices":[{"delta":{"reasoning_content":"Let me think..."},"index":0}]}
 data: {"choices":[{"delta":{"content":"The answer is 42."},"index":0}]}

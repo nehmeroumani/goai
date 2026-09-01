@@ -135,7 +135,7 @@ func bedrockAnthropicBodyTransformer(body map[string]any) map[string]any {
 // translates Bedrock's EventStream binary streaming responses into a plain
 // SSE byte stream that the anthropic provider's parseSSE can consume.
 type bedrockAnthropicTransport struct {
-	base                                                http.RoundTripper
+	base                                                    http.RoundTripper
 	region, accessKey, secretKey, sessionToken, bearerToken string
 }
 
@@ -216,12 +216,12 @@ func (t *bedrockAnthropicTransport) RoundTrip(req *http.Request) (*http.Response
 // Computer-use tools (computer_*/bash_*/text_editor_*) ARE supported on Bedrock
 // and are deliberately not gated here.
 var unsupportedBedrockServerTools = map[string]bool{
-	"web_search_20250305":        true,
-	"web_search_20260209":        true,
-	"web_fetch_20260209":         true,
-	"code_execution_20250522":    true,
-	"code_execution_20250825":    true,
-	"code_execution_20260120":    true,
+	"web_search_20250305":     true,
+	"web_search_20260209":     true,
+	"web_fetch_20260209":      true,
+	"code_execution_20250522": true,
+	"code_execution_20250825": true,
+	"code_execution_20260120": true,
 }
 
 // rejectUnsupportedServerTools scans the outgoing request body's "tools" array
@@ -260,14 +260,14 @@ func splitBetas(header string) []string {
 // Flags not in this set (some that the upstream provider sets by default)
 // cause Bedrock to return "The provided request is not valid".
 var bedrockSupportedBetas = map[string]bool{
-	"web-search-2025-03-05":  true,
-	"computer-use-2024-10-22": true,
-	"computer-use-2025-01-24": true,
-	"computer-use-2025-11-24": true,
-	"code-execution-2025-08-25": true,
-	"code-execution-2025-05-22": true,
+	"web-search-2025-03-05":         true,
+	"computer-use-2024-10-22":       true,
+	"computer-use-2025-01-24":       true,
+	"computer-use-2025-11-24":       true,
+	"code-execution-2025-08-25":     true,
+	"code-execution-2025-05-22":     true,
 	"context-management-2025-06-27": true,
-	"prompt-caching-2024-07-31": true,
+	"prompt-caching-2024-07-31":     true,
 }
 
 func filterBedrockBetas(in []string) []string {

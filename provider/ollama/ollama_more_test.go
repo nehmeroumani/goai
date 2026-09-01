@@ -609,7 +609,7 @@ func TestChat_ThinkMode_StringLevel(t *testing.T) {
 		}))
 		model := Chat("m", WithBaseURL(server.URL))
 		_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
-			Messages:       []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+			Messages:        []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
 			ProviderOptions: map[string]any{"think": level},
 		})
 		server.Close()
@@ -667,7 +667,7 @@ func TestChat_RequestGolden_ThinkStringLevel(t *testing.T) {
 		}))
 		model := Chat("m", WithBaseURL(server.URL))
 		_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
-			Messages:       []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+			Messages:        []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
 			ProviderOptions: map[string]any{"think": level},
 		})
 		server.Close()

@@ -719,7 +719,17 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 	// Finalize any tool call that never saw a finish_reason (item 4): the
 	// accumulated arguments are emitted once as a complete ChunkToolCall.
 	for _, active := range activeTools {
-		if remaining := active.args.String(); remaining != "" && active.started {
+		if remaining := active.args.String(); remaining != "" {
+			// A tool call with buffered arguments whose name/id never resolved
+			// is malformed: surface an error instead of silently dropping it
+			// (matches Vercel AI SDK, which throws in this case).
+			if !active.started {
+				provider.TrySend(ctx, out, provider.StreamChunk{
+					Type:  provider.ChunkError,
+					Error: fmt.Errorf("tool call arguments received but tool name/id never resolved"),
+				})
+				return
+			}
 			if !provider.TrySend(ctx, out, provider.StreamChunk{
 				Type:       provider.ChunkToolCall,
 				ToolCallID: active.id,

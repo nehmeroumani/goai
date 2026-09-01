@@ -154,7 +154,7 @@ func TestEmbedding_ProviderOptions(t *testing.T) {
 		ProviderOptions: map[string]any{
 			"vertex": map[string]any{
 				"taskType":             "RETRIEVAL_QUERY",
-				"title":               "My Doc",
+				"title":                "My Doc",
 				"outputDimensionality": 256,
 				"autoTruncate":         true,
 			},
@@ -487,7 +487,7 @@ func TestEmbedding_APIKeyUsesGeminiBodyShape(t *testing.T) {
 		ProviderOptions: map[string]any{
 			"vertex": map[string]any{
 				"taskType":             "RETRIEVAL_QUERY",
-				"title":               "My Doc",
+				"title":                "My Doc",
 				"outputDimensionality": 256,
 				"autoTruncate":         true,
 			},
@@ -577,7 +577,7 @@ func TestEmbedding_APIKeyGeminiGoldenBody(t *testing.T) {
 		ProviderOptions: map[string]any{
 			"vertex": map[string]any{
 				"taskType":             "RETRIEVAL_QUERY",
-				"title":               "My Doc",
+				"title":                "My Doc",
 				"outputDimensionality": 256,
 				"autoTruncate":         true,
 			},

@@ -37,8 +37,8 @@ var (
 )
 
 const (
-	defaultBaseURL   = "https://api.anthropic.com"
-	apiVersion       = "2023-06-01"
+	defaultBaseURL = "https://api.anthropic.com"
+	apiVersion     = "2023-06-01"
 	// betaFeatures is the baseline anthropic-beta header sent on every request.
 	// It intentionally excludes claude-code-20250219 (only needed when a
 	// feature that depends on it is used, e.g. the container option) so plain
@@ -387,7 +387,7 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-var respBody []byte
+	var respBody []byte
 	if streaming {
 		respBody, err = accumulateStreamedMessage(ctx, resp.Body)
 	} else {
@@ -443,7 +443,7 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 	// Keep resp.Request and its serialized request body out of the stream closure.
 	responseBody := resp.Body
 
-return provider.RunStream(ctx, responseBody, func(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk) {
+	return provider.RunStream(ctx, responseBody, func(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk) {
 		parseSSE(ctx, body, out, rfMode)
 	}), nil
 }
@@ -800,7 +800,7 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 					p := map[string]any{
 						"type": "document",
 						"source": map[string]any{
-							"type":   "file",
+							"type":    "file",
 							"file_id": part.RemoteRef.ID,
 						},
 					}
@@ -1475,18 +1475,18 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 							return
 						}
 					}
-default:
-				if isServerToolResultBlock(cbType) {
-					isResultBlock = true
-					// Anthropic emits the full result block in
-					// content_block_start (no input_json_delta for
-					// these). Capture verbatim for round-trip when
-					// tool_use_id matches a pending call.
-					currentResultUseID, _ = cb["tool_use_id"].(string)
-					if pc, ok := pendingCalls[currentResultUseID]; ok {
-						pc.resultBlock = cb
+				default:
+					if isServerToolResultBlock(cbType) {
+						isResultBlock = true
+						// Anthropic emits the full result block in
+						// content_block_start (no input_json_delta for
+						// these). Capture verbatim for round-trip when
+						// tool_use_id matches a pending call.
+						currentResultUseID, _ = cb["tool_use_id"].(string)
+						if pc, ok := pendingCalls[currentResultUseID]; ok {
+							pc.resultBlock = cb
+						}
 					}
-				}
 				}
 			}
 

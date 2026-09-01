@@ -589,7 +589,7 @@ func (t *trackingReadCloser) Close() error               { t.closed = true; retu
 func TestRejectUnsupportedServerTools_SkipsNonMapElements(t *testing.T) {
 	body := map[string]any{
 		"tools": []any{
-			"not-a-map",                          // non-map element → skipped
+			"not-a-map",                           // non-map element → skipped
 			map[string]any{"type": "custom_tool"}, // supported map element
 		},
 	}

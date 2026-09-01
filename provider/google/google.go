@@ -281,7 +281,7 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 	// Keep resp.Request and its serialized request body out of the stream closure.
 	responseBody := resp.Body
 
-return provider.RunStream(ctx, responseBody, func(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk) {
+	return provider.RunStream(ctx, responseBody, func(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk) {
 		parseSSE(ctx, body, out)
 	}), nil
 }
