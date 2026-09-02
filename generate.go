@@ -547,7 +547,12 @@ func (ts *TextStream) consume(rawOut chan<- provider.StreamChunk, textOut chan<-
 		case provider.ChunkFinish:
 			// Direct assignment (not addUsage): ChunkFinish carries authoritative total usage.
 			ts.usage = chunk.Usage
-			ts.finishReason = chunk.FinishReason
+			// Some adapters (OpenAI Responses, openaicompat) report the finish
+			// reason on ChunkStepFinish only and send a bare ChunkFinish; an
+			// empty reason here must not erase the one the step reported.
+			if chunk.FinishReason != "" {
+				ts.finishReason = chunk.FinishReason
+			}
 			// Preserve existing single-step behavior: extract response, metadata, sources
 			// from the provider's ChunkFinish. For multi-step, the goai-emitted ChunkFinish
 			// does not carry these (they are embedded in ChunkStepFinish metadata instead).

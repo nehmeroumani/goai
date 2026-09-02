@@ -709,6 +709,8 @@ type Usage struct {
 }
 ```
 
+`OutputTokens` is the whole billed output, reasoning included; `ReasoningTokens` is the share of it spent thinking, a breakdown rather than an addition. `InputTokens` likewise excludes `CacheReadTokens`.
+
 ### FinishReason
 
 ```go

@@ -809,11 +809,11 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 			if usage.InputTokens < 0 {
 				usage.InputTokens = 0
 			}
+			// candidatesTokenCount excludes thoughts (Google's total is
+			// prompt + thoughts + candidates), and OutputTokens is the whole
+			// output with ReasoningTokens its thinking share — see Usage.
 			usage.ReasoningTokens = resp.UsageMetadata.ThoughtsTokenCount
-			// candidatesTokenCount is the visible output; thinking is reported
-			// separately in thoughtsTokenCount, so subtracting it zeroed the
-			// output whenever thoughts outgrew the answer.
-			usage.OutputTokens = resp.UsageMetadata.CandidatesTokenCount
+			usage.OutputTokens = resp.UsageMetadata.CandidatesTokenCount + resp.UsageMetadata.ThoughtsTokenCount
 		}
 
 		if len(resp.Candidates) == 0 {
@@ -916,7 +916,9 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 	}
 
 	// Send final finish chunk only on clean stream completion.
-	usage.TotalTokens = usage.InputTokens + usage.OutputTokens + usage.ReasoningTokens
+	// OutputTokens already includes reasoning; CacheReadTokens restores the
+	// prompt tokens InputTokens subtracted, matching Google's own total.
+	usage.TotalTokens = usage.InputTokens + usage.CacheReadTokens + usage.OutputTokens
 	provider.TrySend(ctx, out, provider.StreamChunk{ // terminal send
 		Type:     provider.ChunkFinish,
 		Usage:    usage,
@@ -1004,9 +1006,12 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 		if result.Usage.InputTokens < 0 {
 			result.Usage.InputTokens = 0
 		}
+		// candidatesTokenCount excludes thoughts (Google's total is
+		// prompt + thoughts + candidates), and OutputTokens is the whole
+		// output with ReasoningTokens its thinking share — see Usage.
 		result.Usage.ReasoningTokens = resp.UsageMetadata.ThoughtsTokenCount
-		result.Usage.OutputTokens = resp.UsageMetadata.CandidatesTokenCount
-		result.Usage.TotalTokens = result.Usage.InputTokens + result.Usage.OutputTokens + result.Usage.ReasoningTokens
+		result.Usage.OutputTokens = resp.UsageMetadata.CandidatesTokenCount + resp.UsageMetadata.ThoughtsTokenCount
+		result.Usage.TotalTokens = resp.UsageMetadata.PromptTokenCount + result.Usage.OutputTokens
 	}
 
 	if len(resp.Candidates) == 0 {

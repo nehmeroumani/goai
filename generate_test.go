@@ -6609,3 +6609,34 @@ func TestBuildParams_CacheTTLDefaultsEmpty(t *testing.T) {
 		t.Errorf("CacheTTL = %q, want empty (provider default)", params.CacheTTL)
 	}
 }
+
+// TestStreamText_BareFinishChunkKeepsStepFinishReason pins that a ChunkFinish
+// carrying no finish reason — the shape the OpenAI Responses and openaicompat
+// adapters send, which report the reason on ChunkStepFinish only — does not
+// erase the reason the step reported. Before the guard a length-truncated
+// OpenAI stream surfaced as an empty finish reason.
+func TestStreamText_BareFinishChunkKeepsStepFinishReason(t *testing.T) {
+	model := &mockModel{
+		id: "test",
+		streamFn: func(_ context.Context, _ provider.GenerateParams) (*provider.StreamResult, error) {
+			return streamFromChunks(
+				provider.StreamChunk{Type: provider.ChunkStepFinish, FinishReason: provider.FinishLength},
+				provider.StreamChunk{Type: provider.ChunkFinish, Usage: provider.Usage{InputTokens: 10, OutputTokens: 100, ReasoningTokens: 100}},
+			), nil
+		},
+	}
+
+	stream, err := StreamText(t.Context(), model, WithPrompt("hi"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream.Stream() {
+	}
+	result := stream.Result()
+	if result.FinishReason != provider.FinishLength {
+		t.Fatalf("FinishReason = %q, want %q from the step", result.FinishReason, provider.FinishLength)
+	}
+	if result.TotalUsage.OutputTokens != 100 {
+		t.Fatalf("OutputTokens = %d, want the finish chunk's 100", result.TotalUsage.OutputTokens)
+	}
+}

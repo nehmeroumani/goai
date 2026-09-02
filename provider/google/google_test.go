@@ -205,12 +205,14 @@ func TestChat_Stream_Reasoning(t *testing.T) {
 			gotText = true
 		}
 		if chunk.Type == provider.ChunkFinish {
-			// Thoughts are reported separately, so output keeps candidatesTokenCount.
+			// Thoughts are reported as a share of the output, not apart
+			// from it: candidates exclude thoughts on the wire, so the
+			// whole output is their sum.
 			if chunk.Usage.ReasoningTokens != 3 {
 				t.Errorf("ReasoningTokens = %d, want 3", chunk.Usage.ReasoningTokens)
 			}
-			if chunk.Usage.OutputTokens != 8 {
-				t.Errorf("OutputTokens = %d, want 8 (candidatesTokenCount)", chunk.Usage.OutputTokens)
+			if chunk.Usage.OutputTokens != 11 {
+				t.Errorf("OutputTokens = %d, want 11 (8+3)", chunk.Usage.OutputTokens)
 			}
 		}
 	}
@@ -2799,10 +2801,11 @@ func TestDoHTTP_ConnectionError(t *testing.T) {
 	}
 }
 
-func TestChat_Generate_OutputExcludesThoughts(t *testing.T) {
+func TestChat_Generate_ThoughtsExceedCandidates(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		// thoughtsTokenCount outgrows candidatesTokenCount: subtracting zeroed the output.
+		// More thinking than answer: the whole output is still their sum,
+		// and the total follows Google's own definition.
 		_, _ = fmt.Fprint(w, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"thoughtsTokenCount":5}}`)
 	}))
 	defer server.Close()
@@ -2816,11 +2819,14 @@ func TestChat_Generate_OutputExcludesThoughts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Usage.OutputTokens != 3 {
-		t.Errorf("OutputTokens = %d, want 3 (candidatesTokenCount)", result.Usage.OutputTokens)
+	if result.Usage.OutputTokens != 8 {
+		t.Errorf("OutputTokens = %d, want 8 (3+5)", result.Usage.OutputTokens)
 	}
 	if result.Usage.ReasoningTokens != 5 {
-		t.Errorf("ReasoningTokens = %d, want 5 (thoughtsTokenCount)", result.Usage.ReasoningTokens)
+		t.Errorf("ReasoningTokens = %d, want 5", result.Usage.ReasoningTokens)
+	}
+	if result.Usage.TotalTokens != 18 {
+		t.Errorf("TotalTokens = %d, want 18 (10+3+5)", result.Usage.TotalTokens)
 	}
 }
 
@@ -2886,12 +2892,12 @@ func TestChat_Stream_NegativeTokens(t *testing.T) {
 
 	for chunk := range result.Stream {
 		if chunk.Type == provider.ChunkFinish {
-			// Input still clamps (prompt 5 - cache 10); output keeps candidatesTokenCount.
+			// Input still clamps (prompt 5 - cache 10); output is candidates + thoughts.
 			if chunk.Usage.InputTokens != 0 {
 				t.Errorf("InputTokens = %d, want 0", chunk.Usage.InputTokens)
 			}
-			if chunk.Usage.OutputTokens != 2 {
-				t.Errorf("OutputTokens = %d, want 2 (candidatesTokenCount)", chunk.Usage.OutputTokens)
+			if chunk.Usage.OutputTokens != 7 {
+				t.Errorf("OutputTokens = %d, want 7 (2+5)", chunk.Usage.OutputTokens)
 			}
 		}
 	}

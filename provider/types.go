@@ -617,6 +617,19 @@ func (r *ToolResult) UnmarshalJSON(data []byte) error {
 }
 
 // Usage tracks token consumption for a request.
+//
+// OutputTokens is the WHOLE output the provider billed — visible answer and
+// reasoning alike — and ReasoningTokens is the share of it spent thinking,
+// reported alongside as a breakdown, never in addition. This is what OpenAI
+// and Anthropic report natively (output_tokens with a reasoning/thinking
+// detail); Google reports candidates and thoughts separately and the adapter
+// adds them. A consumer prices output from OutputTokens alone, and shows
+// reasoning from ReasoningTokens without adding the two.
+//
+// InputTokens likewise excludes CacheReadTokens: the fresh prompt tokens,
+// with cached ones alongside. TotalTokens follows each provider's own total
+// and is not normalized across them; a consumer that needs a comparable
+// total derives it from the other fields.
 type Usage struct {
 	InputTokens      int
 	OutputTokens     int
