@@ -139,7 +139,7 @@ result, err := goai.GenerateText(ctx, model,
 
 ### Which errors are retried
 
-An error is retried only if `APIError.IsRetryable` is true. This includes:
+An error is retried if `APIError.IsRetryable` is true or it is a recognized transient network failure. Retryable API errors include:
 
 - HTTP 429 (Too Many Requests)
 - HTTP 503 (Service Unavailable)
@@ -152,7 +152,9 @@ These errors are never retried:
 - HTTP 401 (Unauthorized)
 - HTTP 403 (Forbidden)
 - `ContextOverflowError`
-- Any non-API error (network timeout, context cancellation)
+- Context cancellation and `context.DeadlineExceeded`
+
+Transient `net.Error` values and recognized connection-reset, connection-refused, DNS, TLS-handshake-timeout, and I/O-timeout failures are retried.
 
 ### Backoff strategy
 
@@ -160,7 +162,7 @@ Retries use exponential backoff with jitter:
 
 - Base delay: 2s, 4s, 8s, 16s, ... capped at 60s
 - Jitter: 0.5x to 1.5x of the base delay (max ~90s)
-- Respects `retry-after` / `retry-after-ms` headers (capped at 60s)
+- Respects `retry-after` / `retry-after-ms` headers; large server delays may be replaced by the shorter jittered exponential delay rather than clamped
 - Respects context cancellation during the wait
 
 ### Disabling retries

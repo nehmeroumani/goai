@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -75,12 +76,12 @@ func TestNewChatModel_DoStream(t *testing.T) {
 	defer server.Close()
 
 	m := NewChatModel(ChatModelConfig{
-		ProviderID:           "test",
-		ModelID:              "m",
-		BaseURL:              server.URL,
-		TokenSource:          provider.StaticToken("key"),
-		TokenRequired:        true,
-		IncludeStreamOptions: true,
+		ProviderID:    "test",
+		ModelID:       "m",
+		BaseURL:       server.URL,
+		TokenSource:   provider.StaticToken("key"),
+		TokenRequired: true,
+		RequestConfig: RequestConfig{IncludeStreamOptions: true},
 	})
 	result, err := m.DoStream(t.Context(), testParams())
 	if err != nil {
@@ -179,7 +180,9 @@ func TestNewChatModel_ExtraBody(t *testing.T) {
 		BaseURL:     "http://example.invalid",
 		TokenSource: provider.StaticToken("k"),
 		HTTPClient:  &http.Client{Transport: tr},
-		ExtraBody:   map[string]any{"custom_field": "present"},
+		RequestConfig: RequestConfig{
+			ExtraBody: map[string]any{"custom_field": "present"},
+		},
 	})
 	_, err := m.DoGenerate(t.Context(), testParams())
 	if err != nil {
@@ -187,6 +190,70 @@ func TestNewChatModel_ExtraBody(t *testing.T) {
 	}
 	if !strings.Contains(string(gotBody), "custom_field") {
 		t.Errorf("request body missing extra field: %s", gotBody)
+	}
+}
+
+// TestNewChatModel_RequestConfigKnobsFlowThrough proves the ARCH-1 collapse:
+// ChatModelConfig embeds RequestConfig and DoGenerate / DoStream hand it
+// straight to BuildRequest, so a wire-format knob set on the ChatModelConfig
+// literal reaches the request body with no manual field-by-field copy. If the
+// embed/copy regresses (a knob silently dropped), the wire body falls back to
+// the defaults and this test fails.
+func TestNewChatModel_RequestConfigKnobsFlowThrough(t *testing.T) {
+	// DoGenerate: SeedKey is a RequestConfig-only knob. If the collapse drops
+	// it, the request uses the default "seed" key instead of "random_seed".
+	var genBody []byte
+	genTR := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		genBody, _ = io.ReadAll(req.Body)
+		return okJSONResponse(), nil
+	})
+	gen := NewChatModel(ChatModelConfig{
+		ProviderID:  "test",
+		ModelID:     "m",
+		BaseURL:     "http://example.invalid",
+		TokenSource: provider.StaticToken("k"),
+		HTTPClient:  &http.Client{Transport: genTR},
+		RequestConfig: RequestConfig{
+			SeedKey: "random_seed",
+		},
+	})
+	seed := 7
+	if _, err := gen.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		Seed:     &seed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(genBody), `"random_seed":7`) {
+		t.Errorf("SeedKey not honored via embedded RequestConfig: %s", genBody)
+	}
+	if strings.Contains(string(genBody), `"seed":7`) {
+		t.Errorf("default seed key leaked (RequestConfig knob dropped): %s", genBody)
+	}
+
+	// DoStream: IncludeStreamOptions is a RequestConfig-only knob. If dropped,
+	// stream_options.include_usage is absent from the request body.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), "include_usage") {
+			t.Errorf("stream_options.include_usage missing (RequestConfig knob dropped): %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+	stream := NewChatModel(ChatModelConfig{
+		ProviderID:    "test",
+		ModelID:       "m",
+		BaseURL:       server.URL,
+		TokenSource:   provider.StaticToken("k"),
+		TokenRequired: true,
+		RequestConfig: RequestConfig{IncludeStreamOptions: true},
+	})
+	if _, err := stream.DoStream(t.Context(), testParams()); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -482,10 +549,58 @@ func TestNewEmbeddingModel_Headers(t *testing.T) {
 	}
 }
 
+// TestNewEmbeddingModel_AuthCannotBeOverridden guards SEC-1: the embed path
+// must apply the configured credential AFTER the merged cfg.Headers, so a
+// caller-supplied Authorization header (via WithHeaders) can never strip or
+// replace the provider token. Mirrors httpc.DoJSONRequest's auth-last ordering.
+func TestNewEmbeddingModel_AuthCannotBeOverridden(t *testing.T) {
+	var gotAuth string
+	tr := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		gotAuth = req.Header.Get("Authorization")
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"model":"m","data":[{"embedding":[0.1],"index":0}],"usage":{"prompt_tokens":1,"total_tokens":1}}`)),
+		}, nil
+	})
+	m := NewEmbeddingModel(EmbeddingModelConfig{
+		ProviderID:  "test",
+		ModelID:     "m",
+		BaseURL:     "http://example.invalid",
+		TokenSource: provider.StaticToken("real-key"),
+		Headers:     map[string]string{"Authorization": "Bearer attacker"},
+		HTTPClient:  &http.Client{Transport: tr},
+	})
+	if _, err := m.DoEmbed(t.Context(), []string{"a"}, provider.EmbedParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer real-key" {
+		t.Errorf("Authorization = %q, want configured 'Bearer real-key' (credential must win over cfg.Headers)", gotAuth)
+	}
+}
+
 type errReader struct{}
 
 func (errReader) Read(p []byte) (int, error) { return 0, errors.New("read boom") }
 func (errReader) Close() error               { return nil }
+
+// TestReadResponseBody_MaxInt64NoOverflow guards against the sentinel-byte
+// overflow: when maxResponseBodyBytes is math.MaxInt64, the old
+// maxResponseBodyBytes+1 wrapped negative and LimitReader treated it as EOF,
+// silently returning an empty body. The clamped limit must read the body intact.
+func TestReadResponseBody_MaxInt64NoOverflow(t *testing.T) {
+	orig := maxResponseBodyBytes
+	maxResponseBodyBytes = math.MaxInt64
+	defer func() { maxResponseBodyBytes = orig }()
+
+	data, err := ReadResponseBody(strings.NewReader("small"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "small" {
+		t.Errorf("data = %q, want %q (overflow must not yield an empty body)", data, "small")
+	}
+}
 
 func TestNewChatModel_ReadError(t *testing.T) {
 	tr := roundTripperFunc(func(req *http.Request) (*http.Response, error) {

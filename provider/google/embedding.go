@@ -54,6 +54,9 @@ func (m *embeddingModel) ModelID() string { return m.id }
 func (m *embeddingModel) MaxValuesPerCall() int { return 100 }
 
 func (m *embeddingModel) DoEmbed(ctx context.Context, values []string, params provider.EmbedParams) (*provider.EmbedResult, error) {
+	if err := validateNonChatOptions(m.opts); err != nil {
+		return nil, err
+	}
 	token, err := m.resolveToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("resolving auth token: %w", err)
@@ -80,6 +83,13 @@ func (m *embeddingModel) DoEmbed(ctx context.Context, values []string, params pr
 				req["taskType"] = tt
 			}
 		}
+		// Add title if specified. The Gemini API only accepts a title for
+		// taskType RETRIEVAL_DOCUMENT; it is ignored/forbidden otherwise.
+		if gopts != nil {
+			if title, ok := gopts["title"].(string); ok && title != "" {
+				req["title"] = title
+			}
+		}
 		// Add outputDimensionality if specified.
 		if gopts != nil {
 			if od, ok := gopts["outputDimensionality"]; ok {
@@ -95,11 +105,13 @@ func (m *embeddingModel) DoEmbed(ctx context.Context, values []string, params pr
 	jsonBody := httpc.MustMarshalJSON(body)
 	req := httpc.MustNewRequest(ctx, "POST", reqURL, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", token)
 
 	for k, v := range m.opts.headers {
 		req.Header.Set(k, v)
 	}
+	// Set the credential last so it wins over any caller-supplied header
+	// named like the auth header.
+	req.Header.Set("x-goog-api-key", token)
 
 	resp, err := m.httpClient().Do(req)
 	if err != nil {
@@ -108,11 +120,11 @@ func (m *embeddingModel) DoEmbed(ctx context.Context, values []string, params pr
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxGoogleErrorBodyBytes))
 		return nil, goai.ParseHTTPErrorWithHeaders("google", resp.StatusCode, respBody, resp.Header)
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readSuccessBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}

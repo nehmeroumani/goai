@@ -264,6 +264,16 @@ func modelSupportsTools(modelID string) bool {
 
 const responseFormatToolName = "__json_response"
 
+const (
+	// maxConverseResponseBytes bounds the size of a successful Converse
+	// response body to defend against a malicious/misbehaving server returning
+	// an unbounded payload.
+	maxConverseResponseBytes = 64 << 20 // 64 MiB
+	// maxConverseErrorBytes bounds the size of an error response body read
+	// solely to extract the error message.
+	maxConverseErrorBytes = 1 << 20 // 1 MiB
+)
+
 func (m *chatModel) DoGenerate(ctx context.Context, params provider.GenerateParams) (*provider.GenerateResult, error) {
 	rfMode := params.ResponseFormat != nil
 	if rfMode {
@@ -276,9 +286,12 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxConverseResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if len(respBody) > maxConverseResponseBytes {
+		return nil, fmt.Errorf("bedrock: converse response body exceeds %d bytes", maxConverseResponseBytes)
 	}
 
 	result, parseErr := parseConverseResponse(respBody)
@@ -633,6 +646,15 @@ func (m *chatModel) applyBedrockOptions(body map[string]any, tools []provider.To
 		additional = make(map[string]any)
 	}
 
+	// topK is a model-specific Converse field; Bedrock rejects it under
+	// inferenceConfig (which only accepts maxTokens/stopSequences/temperature/
+	// topP), so it belongs in additionalModelRequestFields.
+	if providerOpts != nil {
+		if topK, ok := providerOpts["topK"]; ok {
+			additional["topK"] = topK
+		}
+	}
+
 	// Resolve reasoning config: per-request ProviderOptions take precedence
 	// over construction-time WithReasoningConfig(). This allows consumers to
 	// pass "reasoningConfig" in ProviderOptions for per-request thinking control.
@@ -797,7 +819,7 @@ func (m *chatModel) doHTTP(ctx context.Context, body map[string]any, streaming b
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxConverseErrorBytes))
 		_ = resp.Body.Close()
 		return nil, goai.ParseHTTPErrorWithHeaders("bedrock", resp.StatusCode, respBody, resp.Header)
 	}

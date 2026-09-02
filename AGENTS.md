@@ -14,7 +14,7 @@ go test ./provider/openai/  # Test single package
 
 ## Architecture
 
-GoAI is a Go SDK for AI applications - one API across 24+ LLM providers. Inspired by Vercel AI SDK, adapted to Go idioms.
+GoAI is a Go SDK for AI applications - one API across 25+ LLM providers. Inspired by Vercel AI SDK, adapted to Go idioms.
 
 ```
 goai/
@@ -22,6 +22,7 @@ goai/
 ├── object.go               # GenerateObject[T], StreamObject[T]
 ├── embed.go                # Embed, EmbedMany
 ├── image.go                # GenerateImage
+├── video.go                # GenerateVideo
 ├── options.go              # WithPrompt, WithTools, etc.
 ├── schema.go               # SchemaFrom[T] - JSON Schema from Go structs
 ├── errors.go               # APIError, ContextOverflowError
@@ -32,7 +33,7 @@ goai/
 ├── hooks.go                # Telemetry hooks
 ├── partial_json.go         # Partial JSON parser for streaming
 ├── provider/
-│   ├── provider.go         # LanguageModel, EmbeddingModel, ImageModel interfaces
+│   ├── provider.go         # LanguageModel, EmbeddingModel, ImageModel, VideoModel interfaces
 │   ├── types.go            # Message, Part, Usage, StreamChunk
 │   ├── token.go            # TokenSource, CachedTokenSource (lock-free fetch)
 │   ├── openai/             # OpenAI (Chat Completions + Responses API)
@@ -44,10 +45,10 @@ goai/
 │   ├── cohere/             # Cohere (Chat v2 + Embed)
 │   ├── minimax/            # MiniMax (Anthropic-compat, delegates to anthropic/)
 │   ├── compat/             # Generic OpenAI-compatible
-│   └── <13 more>/          # Mostly OpenAI-compat (some via compat/ or anthropic/ wrappers)
-│ # tools.go files: 5 files with provider-defined tools: anthropic/ (10 tools), openai/ (4 tools), google/ (3 tools), xai/ (2 tools), groq/ (1 tool)
+│   └── <18 more>/          # Mostly OpenAI-compat (some via compat/ or anthropic/ wrappers)
+│ # tools.go files: 5 files with provider-defined tools: anthropic/ (12 tools), openai/ (4 tools), google/ (4 tools), xai/ (2 tools), groq/ (1 tool)
 ├── internal/
-│   ├── openaicompat/       # Shared codec for 13+ providers
+│   ├── openaicompat/       # Shared codec for 18 provider implementation files
 │   ├── gemini/             # Schema sanitization (Vertex, Google)
 │   ├── sse/                # SSE parser
 │   └── httpc/              # HTTP helpers + ParseDataURL
@@ -55,13 +56,13 @@ goai/
 ├── observability/
 │   ├── langfuse/           # Langfuse observability integration
 │   └── otel/               # OpenTelemetry tracing and metrics (separate go.mod)
-├── examples/               # 26 runnable examples (including 7 MCP examples)
+├── examples/               # 33 runnable examples (including 8 MCP examples)
 └── bench/                  # Performance benchmarks (GoAI vs Vercel AI SDK)
 ```
 
 ## Key Rules
 
-1. **Keep dependencies minimal** - core: direct `golang.org/x/oauth2`, indirect `cloud.google.com/go/compute/metadata` for ADC. Optional submodules (`observability/otel`) use separate `go.mod`.
+1. **Keep dependencies minimal** - core runtime: direct `golang.org/x/oauth2`, indirect `cloud.google.com/go/compute/metadata` for ADC; `go.uber.org/goleak` is test-only. Optional submodules (`observability/otel`) use separate `go.mod`.
 2. **Vercel AI SDK is the reference** - check Vercel source before modifying provider behavior
 3. **90% test coverage** per package - mock HTTP servers, not internals
 4. **Interface compliance checks** - provider structs should include compile-time checks (type name may vary, e.g. `*chatCompletionsModel`)

@@ -80,10 +80,8 @@ type TextResult struct {
 	// For StreamText, check Err() before using , on stream errors, ResponseMessages
 	// may be partial (intermediate tool round-trips lost) or reflect only completed
 	// steps. Do not use ResponseMessages for conversation continuation when Err() != nil.
-	// Reasoning parts (PartReasoning) are included for StreamText (both single-step
-	// and multi-step) but not for GenerateText (which does not expose reasoning).
-	// Reasoning chunks are consolidated into a single PartReasoning part with merged
-	// metadata (e.g. Anthropic/Bedrock signatures).
+	// Reasoning parts (PartReasoning) are included for both GenerateText and
+	// StreamText. Provider-native metadata is preserved for replay when available.
 	ResponseMessages []provider.Message
 }
 
@@ -150,6 +148,89 @@ type StepResult struct {
 	Sources []provider.Source
 }
 
+type reasoningAccumulator struct {
+	parts   []provider.Part
+	current *provider.Part
+	key     string
+}
+
+func (a *reasoningAccumulator) add(chunk provider.StreamChunk) {
+	key, hasKey := reasoningBoundaryKey(chunk.Metadata)
+	if a.current != nil && reasoningBoundaryChanged(a.current, a.key, key, hasKey, chunk) {
+		a.flush()
+	}
+	if a.current == nil {
+		a.current = &provider.Part{Type: provider.PartReasoning, ProviderOptions: map[string]any{}}
+		a.key = key
+	}
+	a.current.Text += chunk.Text
+	for k, v := range chunk.Metadata {
+		if k != "source" {
+			a.current.ProviderOptions[k] = v
+		}
+	}
+}
+
+func reasoningBoundaryChanged(current *provider.Part, currentKey, incomingKey string, incomingHasKey bool, chunk provider.StreamChunk) bool {
+	if currentKey != "" && incomingHasKey && currentKey != incomingKey {
+		return true
+	}
+	if chunk.Text == "" {
+		return false
+	}
+	if (currentKey == "" && incomingHasKey) || (currentKey != "" && !incomingHasKey) {
+		return current.Text != ""
+	}
+	return reasoningSignatureChanged(current.ProviderOptions, chunk.Metadata) || reasoningSignaturePresenceChanged(current.ProviderOptions, chunk.Metadata)
+}
+
+func reasoningBoundaryKey(metadata map[string]any) (string, bool) {
+	for _, name := range []string{"reasoningId", "blockId", "itemId"} {
+		if value, ok := metadata[name].(string); ok && value != "" {
+			return name + ":" + value, true
+		}
+	}
+	return "", false
+}
+
+func (a *reasoningAccumulator) flush() {
+	if a.current == nil {
+		return
+	}
+	if a.current.Text != "" || len(a.current.ProviderOptions) > 0 {
+		a.parts = append(a.parts, *a.current)
+	}
+	a.current = nil
+	a.key = ""
+}
+
+func (a *reasoningAccumulator) finish() []provider.Part {
+	a.flush()
+	parts := a.parts
+	a.parts = nil
+	return parts
+}
+
+func reasoningSignatureChanged(existing, incoming map[string]any) bool {
+	oldSig, oldOK := existing["signature"].(string)
+	newSig, newOK := incoming["signature"].(string)
+	return oldOK && newOK && oldSig != "" && newSig != "" && oldSig != newSig
+}
+
+func reasoningSignaturePresenceChanged(existing, incoming map[string]any) bool {
+	_, oldOK := existing["signature"].(string)
+	_, newOK := incoming["signature"].(string)
+	return oldOK != newOK
+}
+
+func reasoningText(parts []provider.Part) string {
+	var text strings.Builder
+	for _, part := range parts {
+		text.WriteString(part.Text)
+	}
+	return text.String()
+}
+
 // TextStream is a streaming text generation response.
 //
 // Callers must consume the stream (via Stream, TextStream, or Result) or cancel
@@ -196,13 +277,13 @@ type TextStream struct {
 	streamErr        error
 
 	// Multi-step accumulation (written by consume goroutine).
-	steps         []StepResult
-	currentStep   int
-	stepText      strings.Builder
-	stepToolCalls []provider.ToolCall
-	stepSources   []provider.Source
-	reasoningBuf  strings.Builder // consolidated reasoning text (matches drainStep)
-	reasoningMeta map[string]any  // merged reasoning metadata (e.g. Anthropic signature)
+	steps          []StepResult
+	currentStep    int
+	stepText       strings.Builder
+	stepToolCalls  []provider.ToolCall
+	stepSources    []provider.Source
+	reasoning      reasoningAccumulator
+	reasoningParts []provider.Part
 
 	// responseMessages is set by the streamWithToolLoop goroutine before doneCh closes.
 	responseMessages []provider.Message
@@ -377,19 +458,7 @@ func (ts *TextStream) consume(rawOut chan<- provider.StreamChunk, textOut chan<-
 
 		case provider.ChunkReasoning:
 			ts.text.WriteString(chunk.Text) // global accumulator (existing, includes reasoning)
-			// Consolidate reasoning fragments into one Part (matching drainStep behavior).
-			// Text is accumulated; metadata is merged (last chunk carries the signature).
-			if chunk.Text != "" {
-				ts.reasoningBuf.WriteString(chunk.Text)
-			}
-			if chunk.Metadata != nil {
-				if ts.reasoningMeta == nil {
-					ts.reasoningMeta = make(map[string]any)
-				}
-				for k, v := range chunk.Metadata {
-					ts.reasoningMeta[k] = v
-				}
-			}
+			ts.reasoning.add(chunk)
 			if s, ok := chunk.Metadata["source"].(provider.Source); ok {
 				ts.sources = append(ts.sources, s)         // global (preserve existing behavior)
 				ts.stepSources = append(ts.stepSources, s) // per-step
@@ -413,6 +482,7 @@ func (ts *TextStream) consume(rawOut chan<- provider.StreamChunk, textOut chan<-
 			}
 			// GoAI-emitted step boundaries: build per-step StepResult.
 			if stepSource, _ := chunk.Metadata["stepSource"].(string); stepSource == "goai" {
+				stepReasoning := ts.reasoning.finish()
 				ts.currentStep++
 				// Response is set directly on the chunk by the step loop.
 				// ProviderMetadata is embedded in Metadata (no dedicated StreamChunk field).
@@ -423,7 +493,7 @@ func (ts *TextStream) consume(rawOut chan<- provider.StreamChunk, textOut chan<-
 				ts.steps = append(ts.steps, StepResult{
 					Number:           ts.currentStep,
 					Text:             ts.stepText.String(),
-					Reasoning:        ts.reasoningBuf.String(),
+					Reasoning:        reasoningText(stepReasoning),
 					ToolCalls:        ts.stepToolCalls,
 					FinishReason:     chunk.FinishReason,
 					Usage:            chunk.Usage,
@@ -444,10 +514,9 @@ func (ts *TextStream) consume(rawOut chan<- provider.StreamChunk, textOut chan<-
 				ts.stepText.Reset()
 				ts.stepToolCalls = nil
 				ts.stepSources = nil
-				ts.reasoningBuf.Reset()
-				ts.reasoningMeta = nil
 			} else {
 				// Provider-internal step boundary (e.g., Anthropic extended thinking).
+				ts.reasoning.flush()
 				// Preserve existing behavior: extract response, metadata, sources.
 				// This ensures single-step streaming continues to work correctly.
 				// NOTE: Do NOT accumulate usage here with addUsage. Provider-internal
@@ -531,6 +600,7 @@ func (ts *TextStream) consume(rawOut chan<- provider.StreamChunk, textOut chan<-
 			}
 		}
 	}
+	ts.reasoningParts = ts.reasoning.finish()
 }
 
 func (ts *TextStream) buildResult() *TextResult {
@@ -557,7 +627,7 @@ func (ts *TextStream) buildResult() *TextResult {
 		result.Reasoning = reasoningAll.String()
 	} else if text != "" || len(ts.toolCalls) > 0 || ts.finishReason != "" {
 		// Single-step fallback (no multi-step ChunkStepFinish received, but data exists).
-		stepReasoning := ts.reasoningBuf.String()
+		stepReasoning := reasoningText(ts.reasoningParts)
 		result.Steps = []StepResult{{
 			Number:           1,
 			Text:             ts.stepText.String(),
@@ -582,18 +652,7 @@ func (ts *TextStream) buildResult() *TextResult {
 		result.ResponseMessages = ts.responseMessages
 	} else if text != "" || len(result.ToolCalls) > 0 {
 		// Single-step: build a simple assistant message from the result.
-		// Use stepText (text-only, excludes reasoning) for ResponseMessages so reasoning
-		// doesn't get baked into PartText. Pass consolidated reasoning part separately
-		// (matching drainStep: one Part with merged metadata including signatures).
-		var reasoning []provider.Part
-		if ts.reasoningBuf.Len() > 0 || len(ts.reasoningMeta) > 0 {
-			reasoning = []provider.Part{{
-				Type:            provider.PartReasoning,
-				Text:            ts.reasoningBuf.String(),
-				ProviderOptions: ts.reasoningMeta,
-			}}
-		}
-		result.ResponseMessages = buildFinalAssistantMessages(ts.stepText.String(), result.ToolCalls, reasoning)
+		result.ResponseMessages = buildFinalAssistantMessages(ts.stepText.String(), result.ToolCalls, ts.reasoningParts)
 	}
 	return result
 }
@@ -608,6 +667,7 @@ func buildParams(opts options) provider.GenerateParams {
 			InputSchema:            t.InputSchema,
 			ProviderDefinedType:    t.ProviderDefinedType,
 			ProviderDefinedOptions: t.ProviderDefinedOptions,
+			DeferLoading:           t.DeferLoading,
 		})
 	}
 
@@ -620,7 +680,7 @@ func buildParams(opts options) provider.GenerateParams {
 	}
 
 	if opts.PromptCaching {
-		msgs = applyCaching(msgs)
+		msgs = applyCaching(msgs, opts.CacheTTL)
 	}
 
 	return provider.GenerateParams{
@@ -638,8 +698,29 @@ func buildParams(opts options) provider.GenerateParams {
 		Headers:          maps.Clone(opts.Headers),
 		ProviderOptions:  maps.Clone(opts.ProviderOptions),
 		PromptCaching:    opts.PromptCaching,
+		CacheTTL:         opts.CacheTTL,
 		ToolChoice:       opts.ToolChoice,
 	}
+}
+
+func setPreviousResponseID(params *provider.GenerateParams, response provider.ResponseMetadata) {
+	if !strings.HasPrefix(response.ID, "resp_") {
+		return
+	}
+	if params.ProviderOptions == nil {
+		params.ProviderOptions = make(map[string]any)
+	}
+	if store, ok := params.ProviderOptions["store"].(bool); ok && !store {
+		return
+	}
+	if _, ok := params.ProviderOptions["previousResponseId"]; ok {
+		return
+	}
+	if _, ok := params.ProviderOptions["previous_response_id"]; ok {
+		return
+	}
+	params.ProviderOptions["previousResponseId"] = response.ID
+	params.ProviderOptions["goaiAutoPreviousResponseID"] = true
 }
 
 func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o options, toolMap map[string]Tool) (_ *TextStream, err error) {
@@ -925,6 +1006,7 @@ func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o opt
 			totalUsage = addUsage(totalUsage, ds.usage)
 			lastResponse = ds.response
 			lastReasoning = ds.reasoning
+			setPreviousResponseID(&params, ds.response)
 
 			// AgentState: the step's stream has fully drained; tool exec and
 			// stop-predicate evaluation have not started yet. Pollers observing
@@ -969,36 +1051,55 @@ func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o opt
 			// tools" exit therefore cannot be reached here; StopCauseNoExecutableTools
 			// is a sync-only cause (GenerateText). See StopCauseNoExecutableTools
 			// godoc in provider/types.go.
-			if ds.finishReason != provider.FinishToolCalls || len(ds.toolCalls) == 0 {
+			//
+			// Provider/server-executed tools (e.g. OpenRouter web_search) return
+			// finish_reason="tool_calls" with tool_calls=null -- the tool already
+			// ran server-side and there is nothing for the client to execute.
+			// In that case ds.toolCalls is empty but we must NOT exit: the model
+			// is mid-loop and expects us to re-request with the accumulated
+			// messages (including reasoning) so it can produce the final answer.
+			// Issue #112: continue the loop when finish_reason is tool_calls
+			// even when there are no client tool calls, as long as the request
+			// included provider-defined tools (server tools like OpenRouter web_search).
+			if ds.finishReason != provider.FinishToolCalls || (len(ds.toolCalls) == 0 && !hasProviderDefinedTools(params.Tools)) || (len(ds.toolCalls) > 0 && len(toolMap) == 0) {
 				stopCause = provider.StopCauseNatural
 				break
 			}
 
 			// --- Execute tools in parallel ---
-			o.StateRef.set(StepToolExecuting, step)
-			toolMsgs, toolResults := executeToolsParallel(ctx, ds.toolCalls, toolMap, step, toolHooks{
-				sequential:      o.SequentialTools,
-				onToolCallStart: o.OnToolCallStart,
-				onToolCall:      o.OnToolCall,
-				onBeforeExecute: o.OnBeforeToolExecute,
-				onAfterExecute:  o.OnAfterToolExecute,
-				onPanic:         o.OnPanic,
-			})
-			// Attach ToolResults to the step BEFORE the stop predicate sees it
-			// (FIX 7 / Vercel DefaultStepResult parity). steps[-1] is this step.
-			steps[len(steps)-1].ToolResults = toolResults
+			// Provider/server-executed tools (e.g. OpenRouter web_search) return
+			// finish_reason="tool_calls" with tool_calls=null -- the tool already
+			// ran server-side and there is nothing for the client to execute.
+			// Skip tool execution and just append the assistant message so the
+			// loop re-requests with the accumulated context (Issue #112).
+			var toolMsgs []provider.Message
+			var toolResults []provider.ToolResult
+			if len(ds.toolCalls) > 0 {
+				o.StateRef.set(StepToolExecuting, step)
+				toolMsgs, toolResults = executeToolsParallel(ctx, ds.toolCalls, toolMap, step, toolHooks{
+					sequential:      o.SequentialTools,
+					onToolCallStart: o.OnToolCallStart,
+					onToolCall:      o.OnToolCall,
+					onBeforeExecute: o.OnBeforeToolExecute,
+					onAfterExecute:  o.OnAfterToolExecute,
+					onPanic:         o.OnPanic,
+				})
+				// Attach ToolResults to the step BEFORE the stop predicate sees it
+				// (FIX 7 / Vercel DefaultStepResult parity). steps[-1] is this step.
+				steps[len(steps)-1].ToolResults = toolResults
 
-			// Notify the consumer (TextStream.consume) that this step now has
-			// tool results so ts.steps[len-1].ToolResults can be backfilled.
-			// We reuse ChunkStepFinish with a distinguishing stepSource tag so
-			// existing provider-internal ChunkStepFinish handling is untouched.
-			provider.TrySend(ctx, out, provider.StreamChunk{
-				Type: provider.ChunkStepFinish,
-				Metadata: map[string]any{
-					"stepSource":  "goai-tool-results",
-					"toolResults": toolResults,
-				},
-			})
+				// Notify the consumer (TextStream.consume) that this step now has
+				// tool results so ts.steps[len-1].ToolResults can be backfilled.
+				// We reuse ChunkStepFinish with a distinguishing stepSource tag so
+				// existing provider-internal ChunkStepFinish handling is untouched.
+				provider.TrySend(ctx, out, provider.StreamChunk{
+					Type: provider.ChunkStepFinish,
+					Metadata: map[string]any{
+						"stepSource":  "goai-tool-results",
+						"toolResults": toolResults,
+					},
+				})
+			}
 
 			// --- Append messages for next step ---
 			params.Messages = appendToolRoundTrip(params.Messages, ds.text, ds.reasoning, ds.toolCalls, toolMsgs)
@@ -1089,7 +1190,7 @@ func StreamText(ctx context.Context, model provider.LanguageModel, opts ...Optio
 		return nil, err
 	}
 
-	if o.MaxSteps > 1 && len(toolMap) > 0 {
+	if o.MaxSteps > 1 && (len(toolMap) > 0 || hasProviderDefinedTools(o.Tools)) {
 		return streamWithToolLoop(ctx, model, o, toolMap)
 	}
 
@@ -1220,6 +1321,7 @@ func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Opt
 	}
 
 	var totalUsage provider.Usage
+	var lastReasoning []provider.Part
 	var hookStopped bool             // true iff WithStopWhen or OnBeforeStep.Stop broke the loop
 	var stopCause provider.StopCause // classifies how the loop exited (FIX 5)
 
@@ -1310,6 +1412,10 @@ func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Opt
 		}
 		steps = append(steps, stepResult)
 		totalUsage = addUsage(totalUsage, result.Usage)
+		lastReasoning = result.ReasoningParts
+		if len(lastReasoning) == 0 && result.Reasoning != "" {
+			lastReasoning = []provider.Part{{Type: provider.PartReasoning, Text: result.Reasoning}}
+		}
 
 		// AgentState: LLM call for this step is complete; tool exec and
 		// stop-predicate evaluation have not started yet. Pollers observing
@@ -1331,9 +1437,9 @@ func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Opt
 			result.FinishReason = provider.FinishToolCalls
 		}
 
-		if result.FinishReason != provider.FinishToolCalls || len(result.ToolCalls) == 0 || len(toolMap) == 0 {
+		if result.FinishReason != provider.FinishToolCalls || (len(result.ToolCalls) == 0 && !hasProviderDefinedTools(params.Tools)) || (len(result.ToolCalls) > 0 && len(toolMap) == 0) {
 			tr := buildTextResult(steps, totalUsage)
-			tr.ResponseMessages = buildResponseMessages(params.Messages[originalLen:], steps, nil)
+			tr.ResponseMessages = buildResponseMessages(params.Messages[originalLen:], steps, lastReasoning)
 			// Distinguish "model stopped on its own" from "model wants more
 			// tool calls but no tool has Execute" (FIX 11). Both exit cleanly
 			// but mean very different things to consumers.
@@ -1354,21 +1460,33 @@ func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Opt
 		// Clear tool_choice after the first tool step so the model can freely
 		// produce a text response on subsequent steps.
 		params.ToolChoice = ""
-		o.StateRef.set(StepToolExecuting, step)
-		toolMessages, toolResults := executeToolsParallel(ctx, result.ToolCalls, toolMap, step, toolHooks{
-			sequential:      o.SequentialTools,
-			onToolCallStart: o.OnToolCallStart,
-			onToolCall:      o.OnToolCall,
-			onBeforeExecute: o.OnBeforeToolExecute,
-			onAfterExecute:  o.OnAfterToolExecute,
-			onPanic:         o.OnPanic,
-		})
-		// Attach ToolResults to the step BEFORE the stop predicate sees it
-		// (FIX 7 / Vercel DefaultStepResult parity). steps[-1] is this step.
-		steps[len(steps)-1].ToolResults = toolResults
+		// Provider/server-executed tools (e.g. OpenRouter web_search) return
+		// finish_reason="tool_calls" with tool_calls=null -- the tool already
+		// ran server-side and there is nothing for the client to execute.
+		// Skip tool execution and just append the assistant message so the
+		// loop re-requests with the accumulated context (Issue #112).
+		var toolMessages []provider.Message
+		var toolResults []provider.ToolResult
+		if len(result.ToolCalls) > 0 {
+			o.StateRef.set(StepToolExecuting, step)
+			toolMessages, toolResults = executeToolsParallel(ctx, result.ToolCalls, toolMap, step, toolHooks{
+				sequential:      o.SequentialTools,
+				onToolCallStart: o.OnToolCallStart,
+				onToolCall:      o.OnToolCall,
+				onBeforeExecute: o.OnBeforeToolExecute,
+				onAfterExecute:  o.OnAfterToolExecute,
+				onPanic:         o.OnPanic,
+			})
+			// Attach ToolResults to the step BEFORE the stop predicate sees it
+			// (FIX 7 / Vercel DefaultStepResult parity). steps[-1] is this step.
+			steps[len(steps)-1].ToolResults = toolResults
+		}
 
 		// Append assistant message with tool calls + tool result messages.
-		params.Messages = appendToolRoundTrip(params.Messages, result.Text, nil, result.ToolCalls, toolMessages)
+		// For server-executed tools (no client tool calls), pass reasoning
+		// so the model's thinking is preserved in the continuation.
+		params.Messages = appendToolRoundTrip(params.Messages, result.Text, lastReasoning, result.ToolCalls, toolMessages)
+		setPreviousResponseID(&params, result.Response)
 
 		// WithStopWhen (Vercel parity): evaluated AFTER this step's LLM call
 		// AND its tool executions complete. The tool-result messages are
@@ -1401,7 +1519,7 @@ func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Opt
 	var stepsExhausted bool
 	stopCause, stepsExhausted = finalizeStopCause(hookStopped, stopCause, steps, o.MaxSteps)
 	tr.StepsExhausted = stepsExhausted
-	tr.ResponseMessages = buildResponseMessages(params.Messages[originalLen:], steps, nil)
+	tr.ResponseMessages = buildResponseMessages(params.Messages[originalLen:], steps, lastReasoning)
 	fireOnFinish(o.OnPanic, o.OnFinish, FinishInfo{
 		StepsExhausted: tr.StepsExhausted,
 		TotalSteps:     len(steps),
@@ -1494,6 +1612,28 @@ func isProviderExecuted(tc provider.ToolCall) bool {
 	return false
 }
 
+// hasProviderDefinedTools reports whether any tool in the list is a
+// provider-defined tool (e.g. openrouter:web_search). These tools are
+// executed server-side and return finish_reason="tool_calls" with no
+// client tool calls, but the loop must continue (Issue #112).
+func hasProviderDefinedTools(tools any) bool {
+	switch v := tools.(type) {
+	case []provider.ToolDefinition:
+		for _, t := range v {
+			if t.ProviderDefinedType != "" {
+				return true
+			}
+		}
+	case []Tool:
+		for _, t := range v {
+			if t.ProviderDefinedType != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // buildToolMap creates a name→Tool lookup of executable tools from the options.
 //
 // Tool names must be unique across all tools, not just executable ones: the
@@ -1575,7 +1715,13 @@ func executeToolsParallel(
 			// panic prevents Execute from running (the tool should not execute if the
 			// pre-hook crashed). For unknown tools, Execute never runs anyway, so both
 			// hooks fire independently for observability completeness.
-			results[i] = toolOutput{index: i, err: ErrUnknownTool}
+			//
+			// Wrap ErrUnknownTool (preserving errors.Is) with the attempted name and
+			// the registered tools: models occasionally emit corrupted tool names,
+			// and seeing the valid list lets them self-correct in one step.
+			unknownErr := fmt.Errorf("%w %q; available tools: %s",
+				ErrUnknownTool, tc.Name, strings.Join(slices.Sorted(maps.Keys(toolMap)), ", "))
+			results[i] = toolOutput{index: i, err: unknownErr}
 			for _, fn := range hooks.onToolCallStart {
 				func(f func(ToolCallStartInfo)) {
 					defer func() {
@@ -1598,7 +1744,7 @@ func executeToolsParallel(
 						ToolName:   tc.Name,
 						Step:       step,
 						Input:      tc.Input,
-						Error:      ErrUnknownTool,
+						Error:      unknownErr,
 					})
 				}(fn)
 			}
@@ -1945,7 +2091,7 @@ func buildTextResult(steps []StepResult, totalUsage provider.Usage) *TextResult 
 // across multiple messages).
 //
 // The reasoning parameter provides thinking/reasoning parts for the final
-// assistant message (streaming path only; GenerateText passes nil). It is
+// assistant message for both synchronous and streaming generation. It is
 // only applied when the delta is empty or the last step had no tool calls
 // (i.e. when we are actually building the final assistant message here).
 func buildResponseMessages(roundTripDelta []provider.Message, steps []StepResult, reasoning []provider.Part) []provider.Message {
@@ -2034,10 +2180,9 @@ func drainStep(
 	out chan<- provider.StreamChunk,
 ) drainResult {
 	var (
-		textBuf       strings.Builder // ChunkText only (reasoning excluded)
-		reasoningBuf  strings.Builder // accumulated reasoning text
-		reasoningMeta map[string]any  // last metadata (contains signature)
-		dr            drainResult
+		textBuf   strings.Builder // ChunkText only (reasoning excluded)
+		reasoning reasoningAccumulator
+		dr        drainResult
 	)
 
 	for chunk := range source {
@@ -2068,20 +2213,7 @@ func drainStep(
 				dr.sources = append(dr.sources, s)
 			}
 		case provider.ChunkReasoning:
-			// Accumulate into a single buffer. The final chunk carries the
-			// signature (text="", metadata={"signature":"..."}); earlier chunks
-			// carry text fragments. Consolidating produces one complete part.
-			if chunk.Text != "" {
-				reasoningBuf.WriteString(chunk.Text)
-			}
-			if chunk.Metadata != nil {
-				if reasoningMeta == nil {
-					reasoningMeta = make(map[string]any)
-				}
-				for k, v := range chunk.Metadata {
-					reasoningMeta[k] = v
-				}
-			}
+			reasoning.add(chunk)
 			if s, ok := chunk.Metadata["source"].(provider.Source); ok {
 				dr.sources = append(dr.sources, s)
 			}
@@ -2093,6 +2225,7 @@ func drainStep(
 				Metadata: chunk.Metadata,
 			})
 		case provider.ChunkStepFinish:
+			reasoning.flush()
 			// Provider-internal step boundary (e.g., Anthropic extended thinking).
 			// Use direct assignment (last value wins), matching ChunkFinish below.
 			// This is correct for both zero-usage providers (Anthropic: 0 overwrites 0)
@@ -2116,6 +2249,7 @@ func drainStep(
 				dr.response.ProviderMetadata[k] = v
 			}
 		case provider.ChunkFinish:
+			reasoning.flush()
 			// Terminal chunk. Use direct assignment for usage (not addUsage) to avoid
 			// double-counting when providers emit both ChunkStepFinish and ChunkFinish
 			// with the same accumulated usage (e.g., Google).
@@ -2152,17 +2286,8 @@ func drainStep(
 	}
 
 	dr.text = textBuf.String()
-	dr.reasoningText = reasoningBuf.String()
-
-	// Consolidate reasoning fragments into one Part (text + signature metadata)
-	// so the codec serializes a single complete block.
-	if reasoningBuf.Len() > 0 || len(reasoningMeta) > 0 {
-		dr.reasoning = []provider.Part{{
-			Type:            provider.PartReasoning,
-			Text:            reasoningBuf.String(),
-			ProviderOptions: reasoningMeta,
-		}}
-	}
+	dr.reasoning = reasoning.finish()
+	dr.reasoningText = reasoningText(dr.reasoning)
 
 	return dr
 }

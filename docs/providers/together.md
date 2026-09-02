@@ -49,7 +49,7 @@ fmt.Println(result.Text)
 | --------------------- | ---------------------- | ----------------------------------------------------------- |
 | `WithAPIKey(key)`     | `string`               | Set a static API key                                        |
 | `WithTokenSource(ts)` | `provider.TokenSource` | Set a dynamic token source                                  |
-| `WithBaseURL(url)`    | `string`               | Override the default `https://api.together.xyz/v1` endpoint |
+| `WithBaseURL(url)`    | `string`               | Override the default `https://api.together.ai/v1` endpoint |
 | `WithHeaders(h)`      | `map[string]string`    | Set additional HTTP headers                                 |
 | `WithHTTPClient(c)`   | `*http.Client`         | Set a custom `*http.Client`                                 |
 

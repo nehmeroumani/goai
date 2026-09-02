@@ -54,7 +54,7 @@ result, err := goai.GenerateText(ctx, model,
 
 ## Available Tools
 
-### Anthropic (10 tools)
+### Anthropic (12 tools)
 
 Import: `github.com/zendev-sh/goai/provider/anthropic`
 
@@ -70,6 +70,8 @@ Import: `github.com/zendev-sh/goai/provider/anthropic`
 | `anthropic.Tools.WebFetch(opts...)`            | Fetch web content by URL (v20260209)                   |
 | `anthropic.Tools.CodeExecution()`              | Python code execution in sandbox (v20260120)           |
 | `anthropic.Tools.CodeExecution_20250825()`     | Code execution (v20250825, requires beta header)       |
+| `anthropic.Tools.ToolSearchToolRegex()`        | Regex-based deferred tool discovery                    |
+| `anthropic.Tools.ToolSearchToolBM25()`         | BM25-based deferred tool discovery                     |
 
 ```go
 // Each factory returns a provider.ToolDefinition. Wrap with goai.Tool{} before passing to WithTools.
@@ -183,7 +185,7 @@ td := openai.Tools.ImageGeneration(
 | `WithImageQuality(quality string)`             | `string`              | `"auto"`, `"low"`, `"medium"`, `"high"`               |
 | `WithImageSize(size string)`                   | `string`              | `"auto"`, `"1024x1024"`, `"1024x1536"`, `"1536x1024"` |
 
-### Google (3 tools)
+### Google (4 tools)
 
 Import: `github.com/zendev-sh/goai/provider/google`
 
@@ -192,6 +194,7 @@ Import: `github.com/zendev-sh/goai/provider/google`
 | `google.Tools.GoogleSearch(opts...)` | Grounding with Google Search            |
 | `google.Tools.URLContext()`          | Fetch and process web content from URLs |
 | `google.Tools.CodeExecution()`       | Python code execution in sandbox        |
+| `google.Tools.ComputerUse(opts...)`  | Computer use with environment/function controls |
 
 ```go
 // Each factory returns a provider.ToolDefinition. Wrap with goai.Tool{} before passing to WithTools.
@@ -217,6 +220,12 @@ td := google.Tools.URLContext()
 
 // Code execution (no options)
 td := google.Tools.CodeExecution()
+
+// Computer use
+td = google.Tools.ComputerUse(
+    google.WithEnvironment("browser"),
+    google.WithExcludedFunctions("drag_and_drop"),
+)
 ```
 
 ### xAI (2 tools)

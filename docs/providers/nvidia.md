@@ -52,9 +52,7 @@ NVIDIA NIM offers many models. Common choices include:
 ```go
 model := nvidia.Embedding("nvidia/nv-embedqa-e5-v5")
 
-result, err := goai.Embed(context.Background(), model,
-	goai.WithPrompt("Hello world"),
-)
+result, err := goai.Embed(context.Background(), model, "Hello world")
 if err != nil {
 	log.Fatal(err)
 }

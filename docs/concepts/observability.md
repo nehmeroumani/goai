@@ -5,7 +5,7 @@ description: "Trace LLM calls, tool executions, and agent runs in GoAI. Plug-in 
 
 # Observability
 
-GoAI's observability is built on nine lifecycle hooks: `OnRequest`, `OnResponse`, `OnToolCallStart`, `OnToolCall`, `OnStepFinish`, `OnFinish`, `OnBeforeToolExecute`, `OnAfterToolExecute`, and `OnBeforeStep`. Any observability provider can plug into these hooks to trace LLM calls, tool executions, and multi-step agent runs.
+GoAI's observability is built on ten lifecycle hooks: `OnRequest`, `OnResponse`, `OnToolCallStart`, `OnToolCall`, `OnStepFinish`, `OnFinish`, `OnPanic`, `OnBeforeToolExecute`, `OnAfterToolExecute`, and `OnBeforeStep`. Any observability provider can plug into these hooks to trace LLM calls, tool executions, panics, and multi-step agent runs.
 
 ## How It Works
 
@@ -29,12 +29,13 @@ Each hook fires at a specific point in the request lifecycle:
 | `OnToolCallStart` | Before each tool execution | Tool call ID, tool name, step, input        |
 | `OnToolCall`      | After each tool execution  | Tool name, input/output, duration, errors   |
 | `OnStepFinish`    | After each step completes  | Step number, finish reason, tool calls      |
-| `OnFinish`        | After all steps complete   | StepsExhausted, TotalSteps, TotalUsage, FinishReason |
+| `OnFinish`        | After generation terminates | StepsExhausted, TotalSteps, TotalUsage, FinishReason, StoppedBy |
+| `OnPanic`         | When a user callback or stop predicate panics | Phase, recovered value, stack, tool/step context |
 | `OnBeforeToolExecute`* | Before each tool's Execute function | Tool call ID, tool name, step, input; can skip execution |
 | `OnAfterToolExecute`*  | After each tool's Execute function  | Tool call ID, tool name, output, error; can modify output |
 | `OnBeforeStep`*        | Before each LLM call (step 2+)     | Step number, messages; can inject messages or stop loop   |
 
-*\* Interceptor hooks: only one callback supported per hook (setting a second replaces the first). The first six hooks support multiple callbacks.*
+*\* Interceptor hooks: only one callback supported per hook (setting a second replaces the first). The seven observability hooks support multiple callbacks.*
 
 This design means observability never touches the core SDK. Providers are optional imports with zero impact on non-instrumented code.
 

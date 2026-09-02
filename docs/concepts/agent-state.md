@@ -151,13 +151,13 @@ goai.WithStopWhen(func(steps []goai.StepResult) bool {
 The predicate receives a SHALLOW clone of goai's internal steps slice:
 
 - **Top-level slice**: safe to reslice / append / zero. Mutations stay local.
-- **Nested slices** (`StepResult.ToolCalls`, `StepResult.ToolResults`, `StepResult.Content`): aliased into goai's internal state. Writing to an element WILL corrupt the internal record and may produce incorrect `ResponseMessages`.
+- **Nested slices** (`StepResult.ToolCalls`, `StepResult.ToolResults`, `StepResult.Sources`): aliased into goai's internal state. Writing to an element WILL corrupt the internal record and may produce incorrect `ResponseMessages`.
 
 Treat `StepResult` contents as read-only. goai does not enforce this via deep-clone (prohibitive per-step cost).
 
 ### Panics
 
-Panics inside the predicate are recovered and logged. They are treated as "do not stop" so the loop continues.
+Panics inside the predicate produce a `*PanicError` with phase `StopWhen` and stop the loop.
 
 ## Scope
 

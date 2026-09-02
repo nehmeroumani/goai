@@ -4,7 +4,56 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"time"
 )
+
+// ErrFileUploadUnsupported is returned when a provider does not support file upload.
+var ErrFileUploadUnsupported = errors.New("goai: file upload not supported by this provider")
+
+// FileUpload describes a file to upload to a provider's remote storage.
+type FileUpload struct {
+	// Reader is the file content to upload.
+	Reader io.Reader
+	// Filename is the name of the file.
+	Filename string
+	// MediaType is the MIME type of the file (e.g. "application/pdf").
+	MediaType string
+	// Purpose describes the intended use (e.g. "assistants", "vision").
+	Purpose string
+}
+
+// RemoteFileRef is a reference to an uploaded remote file.
+type RemoteFileRef struct {
+	// Provider identifies which provider owns this file.
+	Provider string
+	// ID is the provider-specific file identifier.
+	ID string
+	// URI is the provider-specific file URI (e.g. for Gemini).
+	URI string
+	// Filename is the original file name.
+	Filename string
+	// MediaType is the MIME type of the file.
+	MediaType string
+	// ExpiresAt is when the remote file expires (zero if unknown).
+	ExpiresAt time.Time
+	// Data holds the raw file bytes for fallback on providers without native file APIs.
+	Data []byte
+}
+
+// FileUploader uploads files to a provider's remote storage and manages their lifecycle.
+type FileUploader interface {
+	// UploadFile uploads a file and returns a reference to the remote file.
+	UploadFile(ctx context.Context, upload FileUpload) (*RemoteFileRef, error)
+	// DeleteFile deletes a previously uploaded remote file.
+	DeleteFile(ctx context.Context, ref RemoteFileRef) error
+}
+
+// FileUploadCapableModel is an optional interface that LanguageModel implementations
+// can satisfy to indicate they support remote file upload.
+type FileUploadCapableModel interface {
+	FileUploader() FileUploader
+}
 
 // TrySend sends a chunk to the output channel, returning false if the context
 // is cancelled. This prevents goroutine leaks when the consumer stops reading
@@ -115,6 +164,11 @@ type GenerateParams struct {
 	// PromptCaching enables provider-specific prompt caching.
 	PromptCaching bool
 
+	// CacheTTL sets the ephemeral cache lifetime for Anthropic prompt caching:
+	// "5m" or "1h". Empty preserves the provider default (5m). Applies to every
+	// ephemeral cache_control marker the request emits (system and breakpoints).
+	CacheTTL string
+
 	// ToolChoice controls tool selection: "auto", "none", "required", or a specific tool name.
 	ToolChoice string
 
@@ -134,6 +188,11 @@ type GenerateResult struct {
 	// those remain in ProviderMetadata for replay. Empty when the
 	// provider does not return reasoning or thinking is disabled.
 	Reasoning string
+
+	// ReasoningParts preserves provider-native reasoning blocks for replay.
+	// It is optional; providers that only expose aggregate reasoning may leave
+	// it nil and continue using Reasoning.
+	ReasoningParts []Part
 
 	// ToolCalls requested by the model.
 	ToolCalls []ToolCall
@@ -355,6 +414,10 @@ type Part struct {
 	// CacheControl directive (e.g. "ephemeral") for prompt caching.
 	CacheControl string
 
+	// CacheControlTTL is the ephemeral cache lifetime ("5m"/"1h") attached to
+	// CacheControl. Empty preserves the provider default (5m). Anthropic only.
+	CacheControlTTL string
+
 	// Detail level for image parts ("low", "high", "auto").
 	Detail string
 
@@ -363,6 +426,10 @@ type Part struct {
 
 	// Filename of the content (for PartFile).
 	Filename string
+
+	// RemoteRef is a reference to an uploaded remote file (for PartFile, PartImage).
+	// When set, the provider uses the remote reference instead of inline data.
+	RemoteRef *RemoteFileRef
 
 	// ProviderOptions are provider-specific part parameters.
 	ProviderOptions map[string]any
@@ -387,6 +454,13 @@ type ToolDefinition struct {
 	// ProviderDefinedOptions holds provider-specific tool configuration
 	// (e.g. displayWidthPx for computer use). Providers interpret these as needed.
 	ProviderDefinedOptions map[string]any
+
+	// DeferLoading marks a tool for on-demand loading: it is omitted from the
+	// initial tool set and surfaced only once the model discovers it through a
+	// tool search tool. Providers that support deferred tool loading (Anthropic)
+	// translate it to their wire flag; others ignore it. Has no effect unless a
+	// tool search tool is also present in the request.
+	DeferLoading bool
 }
 
 // ToolCall represents the model's request to invoke a tool.
@@ -566,6 +640,9 @@ type ModelCapabilities struct {
 	// ToolCall indicates the model supports tool/function calling.
 	ToolCall bool
 
+	// FileUpload indicates the model supports remote file upload.
+	FileUpload bool
+
 	// InputModalities lists supported input types.
 	InputModalities ModalitySet
 
@@ -596,6 +673,59 @@ type ResponseMetadata struct {
 	// ProviderMetadata contains provider-specific metadata (e.g. iterations,
 	// context_management, container, citations, reasoning signatures).
 	ProviderMetadata map[string]any
+}
+
+// VideoFrameType identifies the role of an image in video generation.
+type VideoFrameType string
+
+const (
+	VideoFrameFirst VideoFrameType = "first_frame"
+	VideoFrameLast  VideoFrameType = "last_frame"
+)
+
+// MediaData contains inline or remote media used by video generation.
+type MediaData struct {
+	Data      []byte
+	URL       string
+	MediaType string
+}
+
+// VideoFrame provides a role-tagged image for video generation.
+type VideoFrame struct {
+	Image MediaData
+	Type  VideoFrameType
+}
+
+// VideoParams contains provider-independent video generation parameters.
+type VideoParams struct {
+	Prompt          string
+	Image           *MediaData
+	N               int
+	AspectRatio     string
+	Resolution      string
+	Duration        time.Duration
+	FPS             int
+	Seed            *int64
+	FrameImages     []VideoFrame
+	InputReferences []MediaData
+	GenerateAudio   *bool
+	ProviderOptions map[string]any
+	MaxRetries      int
+	PollInterval    time.Duration
+	PollTimeout     time.Duration
+}
+
+// VideoResult is the response from video generation.
+type VideoResult struct {
+	Videos           []VideoData
+	ProviderMetadata map[string]map[string]any
+	Response         ResponseMetadata
+}
+
+// VideoData contains a single generated video.
+type VideoData struct {
+	Data      []byte
+	MediaType string
 }
 
 // ImageParams contains parameters for image generation.

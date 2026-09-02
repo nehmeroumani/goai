@@ -18,8 +18,10 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/internal/httpc"
@@ -29,15 +31,26 @@ import (
 
 // Compile-time interface compliance checks.
 var (
-	_ provider.LanguageModel = (*chatModel)(nil)
-	_ provider.CapableModel  = (*chatModel)(nil)
+	_ provider.LanguageModel          = (*chatModel)(nil)
+	_ provider.CapableModel           = (*chatModel)(nil)
+	_ provider.FileUploadCapableModel = (*chatModel)(nil)
 )
 
 const (
-	defaultBaseURL    = "https://api.anthropic.com"
-	apiVersion        = "2023-06-01"
-	betaFeatures      = "claude-code-20250219,interleaved-thinking-2025-05-14"
-	defaultMaxTokens  = 16384
+	defaultBaseURL = "https://api.anthropic.com"
+	apiVersion     = "2023-06-01"
+	// betaFeatures is the baseline anthropic-beta header sent on every request.
+	// It intentionally excludes claude-code-20250219 (only needed when a
+	// feature that depends on it is used, e.g. the container option) so plain
+	// Messages requests are not gated unnecessarily.
+	betaFeatures     = "interleaved-thinking-2025-05-14"
+	defaultMaxTokens = 16384
+
+	// Feature-gated beta headers, applied only when the corresponding field is
+	// present on the request.
+	betaContextManagement = "context-1m-2025-08-07"
+	betaFastMode          = "fast-mode-2026-02-01"
+	betaClaudeCode        = "claude-code-20250219"
 )
 
 // anthropicHandledKeys lists provider option keys that are explicitly handled
@@ -59,7 +72,7 @@ var anthropicProtectedKeys = map[string]bool{
 	"tools": true, "tool_choice": true,
 	// SDK-internal keys that are never sent on the wire.
 	"structuredOutputMode": true, "sendReasoning": true,
-	"cacheControl": true,
+	"cacheControl": true, "streamingTransport": true,
 }
 
 // Option configures the Anthropic provider.
@@ -91,6 +104,19 @@ type options struct {
 	bodyTransformer BodyTransformer
 	errorProvider   string // provider name for error parsing (default "anthropic")
 	skipEnvResolve  bool   // skip ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL env resolution
+
+	// nativeOutputFormatModels restricts the model IDs for which native
+	// structured output (output_config.format) is enabled in "auto" mode.
+	// nil selects the direct-Anthropic documented list; an empty slice
+	// disables native structured output entirely. Platform adapters set this
+	// to their own documented compatibility set.
+	nativeOutputFormatModels []string
+
+	// autoStreaming enables DoGenerate to transparently issue stream:true and
+	// reassemble the response for long-running (thinking) requests. Enabled by
+	// default for the direct API; adapters whose streaming endpoint needs
+	// extra permissions (Bedrock's InvokeModelWithResponseStream) opt out.
+	autoStreaming bool
 }
 
 // WithAPIKey sets a static API key for authentication.
@@ -166,9 +192,54 @@ func WithSkipEnvResolve() Option {
 	}
 }
 
+// NativeOutputFormatSupport selects which documented model set enables native
+// structured output (output_config.format) in "auto" mode for a platform.
+type NativeOutputFormatSupport int
+
+const (
+	// NativeOutputFormatDirect is the default: the full documented Claude API
+	// compatibility set. Used by the direct API and platforms (Vertex, Azure)
+	// that expose the same set.
+	NativeOutputFormatDirect NativeOutputFormatSupport = iota
+	// NativeOutputFormatBedrock is the narrower documented Amazon Bedrock set.
+	NativeOutputFormatBedrock
+	// NativeOutputFormatDisabled disables native structured output entirely;
+	// the platform does not document support for the field.
+	NativeOutputFormatDisabled
+)
+
+// WithNativeOutputFormatSupport restricts which models enable native
+// structured output (output_config.format) in "auto" mode. Platform adapters
+// whose documented compatibility differs from the direct Claude API set this
+// explicitly (e.g. bedrock.WithNativeOutputFormatSupport(Bedrock),
+// minimax.WithNativeOutputFormatSupport(Disabled)).
+func WithNativeOutputFormatSupport(support NativeOutputFormatSupport) Option {
+	return func(o *options) {
+		switch support {
+		case NativeOutputFormatBedrock:
+			o.nativeOutputFormatModels = bedrockNativeOutputFormatModels
+		case NativeOutputFormatDisabled:
+			o.nativeOutputFormatModels = []string{}
+		default:
+			o.nativeOutputFormatModels = nil
+		}
+	}
+}
+
+// WithAutoStreaming controls whether DoGenerate transparently issues stream:true
+// and reassembles the response for long-running (thinking) requests. Enabled by
+// default for the direct API. Adapters whose streaming endpoint needs extra
+// permissions (Bedrock's InvokeModelWithResponseStream) disable it so existing
+// deployments do not regress by default.
+func WithAutoStreaming(enabled bool) Option {
+	return func(o *options) {
+		o.autoStreaming = enabled
+	}
+}
+
 // Chat creates an Anthropic language model for the given model ID.
 func Chat(modelID string, opts ...Option) provider.LanguageModel {
-	o := options{baseURL: defaultBaseURL}
+	o := options{baseURL: defaultBaseURL, autoStreaming: true}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -199,11 +270,68 @@ type chatModel struct {
 
 func (m *chatModel) ModelID() string { return m.id }
 
-// supportsThinking returns true for Anthropic models that support extended thinking.
+// anthropicModelVersionPattern matches the generation numbers in a
+// current-naming Anthropic model id ("claude-<family>-<major>[-<minor>]").
+//
+// Deliberately unanchored: Bedrock reuses this provider via
+// bedrock.AnthropicChat with a prefixed id ("anthropic.claude-opus-5",
+// "us.anthropic.claude-sonnet-4-6"), and Vertex appends an "@date" suffix
+// ("claude-opus-4-5@20251101"). Legacy family-last ids ("claude-3-7-sonnet",
+// "claude-3-5-sonnet-20241022") do not match and are reported as unversioned.
+var anthropicModelVersionPattern = regexp.MustCompile(`claude-(?:opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d+))?`)
+
+// anthropicModelVersion extracts the major and minor generation numbers from a
+// current-naming Anthropic model id. ok is false when the id carries no
+// parseable version, in which case callers should fall back to legacy handling.
+//
+// A trailing numeric segment is only treated as a minor version when it is one
+// or two digits; longer runs are release dates, not versions, so
+// "claude-sonnet-4-20250514" reports major 4 with no minor rather than minor
+// 20250514.
+func anthropicModelVersion(modelID string) (major, minor int, ok bool) {
+	m := anthropicModelVersionPattern.FindStringSubmatch(strings.ToLower(modelID))
+	if m == nil {
+		return 0, 0, false
+	}
+	major, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	if len(m[2]) > 0 && len(m[2]) <= 2 {
+		// Cannot fail: the pattern matched one or two ASCII digits.
+		minor, _ = strconv.Atoi(m[2])
+	}
+	return major, minor, true
+}
+
+// supportsThinking returns true for Anthropic models that support extended
+// thinking: every model from the Claude 4 generation onward, plus the legacy
+// claude-3-7-sonnet.
+//
+// Version-derived rather than a literal model list, which had gone stale for
+// the 5.x generation (claude-opus-5, claude-sonnet-5, claude-fable-5) and for
+// claude-haiku-4-5, all of which support thinking but matched none of the
+// previous substrings.
 func supportsThinking(modelID string) bool {
-	return strings.Contains(modelID, "claude-3-7-sonnet") ||
-		strings.Contains(modelID, "claude-sonnet-4") ||
-		strings.Contains(modelID, "claude-opus-4")
+	// Legacy and non-versioned aliases that support thinking but carry no
+	// parseable generation number.
+	if strings.Contains(modelID, "claude-3-7-sonnet") || strings.Contains(modelID, "claude-mythos-preview") {
+		return true
+	}
+	major, _, ok := anthropicModelVersion(modelID)
+	return ok && major >= 4
+}
+
+// hasRemoteRef returns true if any message part contains a RemoteRef.
+func hasRemoteRef(msgs []provider.Message) bool {
+	for _, msg := range msgs {
+		for _, part := range msg.Content {
+			if part.RemoteRef != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m *chatModel) Capabilities() provider.ModelCapabilities {
@@ -212,6 +340,7 @@ func (m *chatModel) Capabilities() provider.ModelCapabilities {
 		Reasoning:   supportsThinking(m.id),
 		ToolCall:    true,
 		Attachment:  true,
+		FileUpload:  true,
 		InputModalities: provider.ModalitySet{
 			Text:  true,
 			Image: true,
@@ -221,16 +350,36 @@ func (m *chatModel) Capabilities() provider.ModelCapabilities {
 	}
 }
 
+func (m *chatModel) FileUploader() provider.FileUploader {
+	return &fileUploader{opts: m.opts}
+}
+
 func (m *chatModel) DoGenerate(ctx context.Context, params provider.GenerateParams) (*provider.GenerateResult, error) {
 	useOutputFormat := m.useNativeOutputFormat(params)
 	rfMode := params.ResponseFormat != nil && !useOutputFormat
 	if rfMode {
 		params = injectResponseFormatTool(params)
 	} else if useOutputFormat {
-		params = injectNativeOutputFormat(params)
+		var err error
+		params, err = injectNativeOutputFormat(params)
+		if err != nil {
+			return nil, err
+		}
 	}
-	body := m.buildRequest(params, false)
+	// Long-running requests are issued with stream:true and reassembled
+	// into the same Message document a non-streaming call would have
+	// returned. Transport only — the result is indistinguishable to the
+	// caller. See useStreamingTransport.
+	streaming, err := m.useStreamingTransport(params)
+	if err != nil {
+		return nil, err
+	}
+	body := m.buildRequest(params, streaming)
 	toolBetas := collectToolBetas(params.Tools)
+	toolBetas = append(toolBetas, collectRequestBetas(body)...)
+	if hasRemoteRef(params.Messages) {
+		toolBetas = append(toolBetas, filesBetaHeader)
+	}
 
 	resp, err := m.doHTTP(ctx, body, toolBetas...)
 	if err != nil {
@@ -238,7 +387,21 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	var respBody []byte
+	if streaming {
+		respBody, err = accumulateStreamedMessage(ctx, resp.Body)
+	} else {
+		// Cap the non-streaming response body at 64 MiB so a runaway/hostile
+		// response cannot exhaust memory.
+		const maxNonStreamResponseBytes = 64 << 20 // 64 MiB
+		respBody, err = io.ReadAll(io.LimitReader(resp.Body, maxNonStreamResponseBytes+1))
+		if err != nil {
+			return nil, fmt.Errorf("reading response: %w", err)
+		}
+		if len(respBody) > maxNonStreamResponseBytes {
+			return nil, fmt.Errorf("anthropic: response body exceeds %d bytes", maxNonStreamResponseBytes)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -260,36 +423,29 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 	if rfMode {
 		params = injectResponseFormatTool(params)
 	} else if useOutputFormat {
-		params = injectNativeOutputFormat(params)
+		var err error
+		params, err = injectNativeOutputFormat(params)
+		if err != nil {
+			return nil, err
+		}
 	}
 	body := m.buildRequest(params, true)
 	toolBetas := collectToolBetas(params.Tools)
+	toolBetas = append(toolBetas, collectRequestBetas(body)...)
+	if hasRemoteRef(params.Messages) {
+		toolBetas = append(toolBetas, filesBetaHeader)
+	}
 
 	resp, err := m.doHTTP(ctx, body, toolBetas...)
 	if err != nil {
 		return nil, err
 	}
+	// Keep resp.Request and its serialized request body out of the stream closure.
+	responseBody := resp.Body
 
-	out := make(chan provider.StreamChunk, 64)
-	go func() {
-		var closeOnce sync.Once
-		closeBody := func() { closeOnce.Do(func() { _ = resp.Body.Close() }) }
-		defer closeBody()
-		// Close body on context cancellation to unblock scanner.Scan().
-		// Without this, the goroutine leaks if the server stalls mid-stream.
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			select {
-			case <-ctx.Done():
-				closeBody()
-			case <-done:
-			}
-		}()
-		parseSSE(ctx, resp.Body, out, rfMode)
-	}()
-
-	return &provider.StreamResult{Stream: out}, nil
+	return provider.RunStream(ctx, responseBody, func(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk) {
+		parseSSE(ctx, body, out, rfMode)
+	}), nil
 }
 
 // --- Request building ---
@@ -307,7 +463,7 @@ func (m *chatModel) buildRequest(params provider.GenerateParams, streaming bool)
 	if params.System != "" {
 		systemPart := map[string]any{"type": "text", "text": params.System}
 		if params.PromptCaching {
-			systemPart["cache_control"] = map[string]any{"type": "ephemeral"}
+			systemPart["cache_control"] = ephemeralCacheControl(params.CacheTTL)
 		}
 		body["system"] = []map[string]any{systemPart}
 	}
@@ -330,8 +486,10 @@ func (m *chatModel) buildRequest(params provider.GenerateParams, streaming bool)
 		case "auto":
 			body["tool_choice"] = map[string]any{"type": "auto"}
 		case "none":
-			// Anthropic doesn't have a "none" tool_choice; omit tools instead.
-			delete(body, "tools")
+			// Anthropic supports an explicit "none" tool_choice type that
+			// prevents tool use while keeping tools registered. Send it
+			// instead of deleting the tools array.
+			body["tool_choice"] = map[string]any{"type": "none"}
 		case "required":
 			body["tool_choice"] = map[string]any{"type": "any"}
 		default:
@@ -379,6 +537,19 @@ func (m *chatModel) buildRequest(params provider.GenerateParams, streaming bool)
 			}
 			if len(thinkingReq) > 0 {
 				body["thinking"] = thinkingReq
+			}
+
+			// Extended thinking is incompatible with a forced tool_choice
+			// ("required" / a specific tool). The API rejects the combination,
+			// so downgrade to "auto" so the model may still choose to call a
+			// tool while thinking.
+			if t, _ := tm["type"].(string); t == "enabled" {
+				if tc, ok := body["tool_choice"].(map[string]any); ok {
+					switch tc["type"] {
+					case "any", "tool":
+						body["tool_choice"] = map[string]any{"type": "auto"}
+					}
+				}
 			}
 		}
 	}
@@ -570,22 +741,19 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 					continue
 				}
 				p := map[string]any{"type": "text", "text": part.Text}
-				applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
+				applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 				content = append(content, p)
 
 			case provider.PartReasoning:
-				if part.Text != "" {
-					// Signature is required for replaying thinking blocks.
-					// Skip reasoning from other providers (e.g. Gemini) that lack signatures.
-					var sig string
-					if part.ProviderOptions != nil {
-						sig, _ = part.ProviderOptions["signature"].(string)
-					}
-					if sig == "" {
-						continue
-					}
+				// Signature is required for replaying thinking blocks, including
+				// omitted-display blocks whose thinking text is intentionally empty.
+				var sig string
+				if part.ProviderOptions != nil {
+					sig, _ = part.ProviderOptions["signature"].(string)
+				}
+				if sig != "" {
 					p := map[string]any{"type": "thinking", "thinking": part.Text, "signature": sig}
-					applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
+					applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 					content = append(content, p)
 				} else if part.ProviderOptions != nil {
 					// Redacted thinking (no text, just encrypted data).
@@ -596,6 +764,19 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 				}
 
 			case provider.PartImage:
+				if part.RemoteRef != nil {
+					// A remotely uploaded image is referenced by file ID.
+					p := map[string]any{
+						"type": "image",
+						"source": map[string]any{
+							"type":    "file",
+							"file_id": part.RemoteRef.ID,
+						},
+					}
+					applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
+					content = append(content, p)
+					break
+				}
 				if part.URL == "" {
 					continue
 				}
@@ -611,27 +792,36 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 						"data":       data,
 					},
 				}
-				applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
+				applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 				content = append(content, p)
 
 			case provider.PartFile:
-				if part.URL == "" {
-					continue
+				if part.RemoteRef != nil {
+					p := map[string]any{
+						"type": "document",
+						"source": map[string]any{
+							"type":    "file",
+							"file_id": part.RemoteRef.ID,
+						},
+					}
+					applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
+					content = append(content, p)
+				} else if part.URL != "" {
+					mediaType, data, ok := httpc.ParseDataURL(part.URL)
+					if !ok {
+						continue
+					}
+					p := map[string]any{
+						"type": "document",
+						"source": map[string]any{
+							"type":       "base64",
+							"media_type": mediaType,
+							"data":       data,
+						},
+					}
+					applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
+					content = append(content, p)
 				}
-				mediaType, data, ok := httpc.ParseDataURL(part.URL)
-				if !ok {
-					continue
-				}
-				p := map[string]any{
-					"type": "document",
-					"source": map[string]any{
-						"type":       "base64",
-						"media_type": mediaType,
-						"data":       data,
-					},
-				}
-				applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
-				content = append(content, p)
 
 			case provider.PartToolCall:
 				var input any
@@ -659,11 +849,11 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 					"input": input,
 				}
 				if resultBlock == nil {
-					applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
+					applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 				}
 				content = append(content, p)
 				if resultBlock != nil {
-					applyCacheControl(resultBlock, part.CacheControl, msgCacheControl, isLast)
+					applyCacheControl(resultBlock, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 					content = append(content, resultBlock)
 				}
 
@@ -673,7 +863,7 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 					"tool_use_id": part.ToolCallID,
 					"content":     part.ToolOutput,
 				}
-				applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
+				applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 				content = append(content, p)
 			}
 		}
@@ -700,11 +890,27 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 	return result
 }
 
+// ephemeralCacheControl builds an ephemeral cache_control marker, attaching the
+// TTL ("5m"/"1h") when non-empty. Empty TTL preserves the Anthropic default (5m).
+// The 1h TTL needs no beta header (GA).
+func ephemeralCacheControl(ttl string) map[string]any {
+	cc := map[string]any{"type": "ephemeral"}
+	if ttl != "" {
+		cc["ttl"] = ttl
+	}
+	return cc
+}
+
 // applyCacheControl adds cache_control to a content part.
 // Part-level CacheControl takes precedence; message-level only applies to the last part.
-func applyCacheControl(p map[string]any, partCC string, msgCC map[string]any, isLast bool) {
+// partTTL ("5m"/"1h") is attached to the part-level marker; empty = provider default (5m).
+func applyCacheControl(p map[string]any, partCC, partTTL string, msgCC map[string]any, isLast bool) {
 	if partCC != "" {
-		p["cache_control"] = map[string]any{"type": partCC}
+		cc := map[string]any{"type": partCC}
+		if partTTL != "" {
+			cc["ttl"] = partTTL
+		}
+		p["cache_control"] = cc
 	} else if msgCC != nil && isLast {
 		p["cache_control"] = msgCC
 	}
@@ -726,21 +932,149 @@ func (m *chatModel) useNativeOutputFormat(params provider.GenerateParams) bool {
 	}
 }
 
-// supportsNativeOutputFormat returns true for models that support native output_format.
-// Matches Vercel: claude-sonnet-4-6, claude-opus-4-6, claude-sonnet-4-5, claude-opus-4-5, claude-opus-4-1.
+// directNativeOutputFormatModels is the documented Claude API compatibility set
+// for native structured output (output_config.format), kept explicit so a
+// future model name is not enabled before the platform documentation
+// guarantees it. Release-date aliases (e.g. claude-opus-4-5-20251101) match via
+// modelIDMatches.
+//
+// Source: https://platform.claude.com/docs/en/build-with-claude/structured-outputs#compatibility
+var directNativeOutputFormatModels = []string{
+	"claude-fable-5", "claude-mythos-5", "claude-mythos-preview",
+	"claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+	"claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5",
+	"claude-opus-4-5", "claude-haiku-4-5",
+}
+
+// bedrockNativeOutputFormatModels is the documented Amazon Bedrock subset.
+// Source: https://platform.claude.com/docs/en/build-with-claude/structured-outputs#compatibility
+var bedrockNativeOutputFormatModels = []string{
+	"claude-opus-4-6", "claude-sonnet-4-6", "claude-sonnet-4-5",
+	"claude-opus-4-5", "claude-haiku-4-5",
+}
+
+// supportsNativeOutputFormat reports whether the model supports native
+// structured output. It consults the adapter-provided compatibility list when
+// set (Bedrock, Vertex, Azure, MiniMax), otherwise the direct-Anthropic list.
 func (m *chatModel) supportsNativeOutputFormat() bool {
-	id := m.id
-	return strings.Contains(id, "claude-sonnet-4-6") ||
-		strings.Contains(id, "claude-opus-4-6") ||
-		strings.Contains(id, "claude-sonnet-4-5") ||
-		strings.Contains(id, "claude-opus-4-5") ||
-		strings.Contains(id, "claude-opus-4-1")
+	models := m.opts.nativeOutputFormatModels
+	if models == nil {
+		models = directNativeOutputFormatModels
+	}
+	return modelMatchesAny(m.id, models)
+}
+
+// modelMatchesAny reports whether modelID matches any base model name in
+// models, allowing documented release-date, @date, and -v suffixed aliases but
+// rejecting unknown future numeric families.
+func modelMatchesAny(modelID string, models []string) bool {
+	id := strings.ToLower(modelID)
+	for _, base := range models {
+		if modelIDMatches(id, base) {
+			return true
+		}
+	}
+	return false
+}
+
+func modelIDMatches(id, base string) bool {
+	idx := strings.Index(id, base)
+	if idx < 0 {
+		return false
+	}
+	// The base must be a whole token: preceded by a separator ('.' for Bedrock
+	// prefixes like "anthropic.claude-opus-5") or the start of the string.
+	if idx > 0 {
+		prev := id[idx-1]
+		if prev != '.' && prev != '-' && prev != '/' && prev != ':' {
+			return false
+		}
+	}
+	suffix := id[idx+len(base):]
+	if suffix == "" {
+		return true
+	}
+	// Vertex @date suffix or Bedrock -v versioned suffix.
+	if strings.HasPrefix(suffix, "@") || strings.HasPrefix(suffix, "-v") {
+		return true
+	}
+	// Release-date alias: claude-opus-4-5-20251101.
+	if len(suffix) == 9 && suffix[0] == '-' {
+		for i := 1; i < len(suffix); i++ {
+			if suffix[i] < '0' || suffix[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// useStreamingTransport reports whether DoGenerate should issue its request
+// with stream:true and reassemble the streamed events into a complete
+// Message, instead of waiting on a single non-streaming response.
+//
+// Anthropic's guidance is to stream long-running requests. A non-streaming
+// call holds an HTTP response open with no bytes flowing until the model has
+// finished everything it intends to do, so a request that thinks for minutes
+// is exposed to idle-timeout enforcement — by the client, and by any proxy
+// or load balancer in between. Thinking is where that bites, and since the
+// 5.x generation thinks with no thinking parameter sent at all, it is the
+// common case rather than an opt-in one.
+//
+// This matters most in a tool loop. GenerateObject is the only structured-
+// output entry point that runs tools (StreamObject is single-step by
+// design), and it drives every step through DoGenerate — so before this,
+// native structured output plus tools plus a thinking model was reachable
+// only over the non-streaming transport, which is exactly the combination
+// the guidance warns against.
+//
+// Callers can force the decision either way with
+// ProviderOptions["streamingTransport"] = true / false. A non-boolean value
+// is rejected rather than silently ignored.
+func (m *chatModel) useStreamingTransport(params provider.GenerateParams) (bool, error) {
+	if v, ok := params.ProviderOptions["streamingTransport"]; ok {
+		b, isBool := v.(bool)
+		if !isBool {
+			return false, fmt.Errorf("anthropic: streamingTransport must be a boolean, got %T", v)
+		}
+		return b, nil
+	}
+	if !m.opts.autoStreaming {
+		return false, nil
+	}
+	return m.willThink(params), nil
+}
+
+// willThink reports whether a request is expected to produce thinking, and
+// therefore to run long.
+//
+// Two ways that happens: the caller asked for it (a "thinking" or "effort"
+// provider option), or the model thinks by default with no thinking
+// parameter sent — true from the 5.x generation onward. Opus 4.7/4.8 support
+// adaptive thinking but only when it is requested, so they qualify via the
+// first branch only.
+func (m *chatModel) willThink(params provider.GenerateParams) bool {
+	if !supportsThinking(m.id) {
+		return false
+	}
+	if _, ok := params.ProviderOptions["thinking"]; ok {
+		return true
+	}
+	if _, ok := params.ProviderOptions["effort"]; ok {
+		return true
+	}
+	major, _, ok := anthropicModelVersion(m.id)
+	return ok && major >= 5
 }
 
 // injectNativeOutputFormat stores the structured-output schema in
 // ProviderOptions["output_format"]; buildRequest nests it under
-// output_config.format on the wire.
-func injectNativeOutputFormat(params provider.GenerateParams) provider.GenerateParams {
+// output_config.format on the wire. It returns an error when the response
+// format schema is invalid or cannot be expressed for native structured
+// output, so the caller surfaces it rather than silently dropping the
+// requested output mode.
+func injectNativeOutputFormat(params provider.GenerateParams) (provider.GenerateParams, error) {
 	p := params
 	// Copy the map to avoid mutating the caller's ProviderOptions.
 	newOpts := maps.Clone(p.ProviderOptions)
@@ -749,12 +1083,17 @@ func injectNativeOutputFormat(params provider.GenerateParams) provider.GenerateP
 	}
 	p.ProviderOptions = newOpts
 	if p.ResponseFormat == nil {
-		return params
+		return params, nil
 	}
 	var schema any
 	if len(p.ResponseFormat.Schema) > 0 {
 		if err := json.Unmarshal(p.ResponseFormat.Schema, &schema); err != nil {
-			return params // schema invalid, fall back to tool trick
+			return params, fmt.Errorf("anthropic: invalid response format schema: %w", err)
+		}
+		var err error
+		schema, err = transformNativeOutputSchema(schema)
+		if err != nil {
+			return params, fmt.Errorf("anthropic: invalid response format schema: %w", err)
 		}
 	}
 	p.ProviderOptions["output_format"] = map[string]any{
@@ -763,7 +1102,202 @@ func injectNativeOutputFormat(params provider.GenerateParams) provider.GenerateP
 	}
 	// Clear ResponseFormat so the tool trick is not also applied.
 	p.ResponseFormat = nil
-	return p
+	return p, nil
+}
+
+// supportedNativeFormats lists the string formats Anthropic's native
+// structured-output validator accepts; any other format value is filtered out
+// (and recorded in the description).
+var supportedNativeFormats = map[string]bool{
+	"date-time": true, "time": true, "date": true, "duration": true,
+	"email": true, "hostname": true, "ipv4": true, "ipv6": true,
+	"uuid": true, "uri": true,
+}
+
+// transformNativeOutputSchema mirrors Anthropic's documented SDK schema
+// transformation for native structured output: keep only the keywords the
+// validator supports for the schema's effective type, preserve unsupported
+// constraints in the description, and recurse only into actual subschemas.
+// Literal values (enum members, const, default) are cloned verbatim, never
+// walked as schemas. The input is never mutated.
+//
+// Source: https://platform.claude.com/docs/en/build-with-claude/structured-outputs#how-sdk-transformation-works
+func transformNativeOutputSchema(obj any) (any, error) {
+	m, ok := obj.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("schema must be an object")
+	}
+	remaining := maps.Clone(m)
+	out := make(map[string]any, len(m)+1)
+
+	if defs, ok := remaining["$defs"]; ok {
+		transformed, err := transformSchemaMap(defs)
+		if err != nil {
+			return nil, fmt.Errorf("$defs: %w", err)
+		}
+		out["$defs"] = transformed
+		delete(remaining, "$defs")
+	}
+	if ref, ok := remaining["$ref"]; ok {
+		out["$ref"] = cloneJSONValue(ref)
+		return out, nil
+	}
+
+	typeName, _ := remaining["type"].(string)
+	delete(remaining, "type")
+	var composition string
+	for _, keyword := range []string{"anyOf", "oneOf", "allOf"} {
+		if _, ok := remaining[keyword].([]any); ok {
+			composition = keyword
+			break
+		}
+	}
+	if composition != "" {
+		transformed, err := transformSchemaList(remaining[composition])
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", composition, err)
+		}
+		if composition == "oneOf" {
+			// Anthropic does not support oneOf; express it as anyOf.
+			out["anyOf"] = transformed
+		} else {
+			out[composition] = transformed
+		}
+		delete(remaining, composition)
+	} else if typeName != "" {
+		out["type"] = typeName
+	} else {
+		return nil, fmt.Errorf("schema must have type, anyOf, oneOf, or allOf")
+	}
+
+	// Literal/annotation keywords are carried verbatim (never recursed).
+	for _, keyword := range []string{"enum", "const", "description", "title"} {
+		if value, ok := remaining[keyword]; ok {
+			out[keyword] = cloneJSONValue(value)
+			delete(remaining, keyword)
+		}
+	}
+
+	switch typeName {
+	case "object":
+		if properties, ok := remaining["properties"]; ok {
+			transformed, err := transformSchemaMap(properties)
+			if err != nil {
+				return nil, fmt.Errorf("properties: %w", err)
+			}
+			out["properties"] = transformed
+		} else {
+			out["properties"] = map[string]any{}
+		}
+		delete(remaining, "properties")
+		// Anthropic requires additionalProperties:false on objects.
+		delete(remaining, "additionalProperties")
+		out["additionalProperties"] = false
+		if required, ok := remaining["required"]; ok {
+			out["required"] = cloneJSONValue(required)
+			delete(remaining, "required")
+		}
+	case "array":
+		if items, ok := remaining["items"]; ok {
+			transformed, err := transformNativeOutputSchema(items)
+			if err != nil {
+				return nil, fmt.Errorf("items: %w", err)
+			}
+			out["items"] = transformed
+			delete(remaining, "items")
+		}
+		// Anthropic accepts minItems only as 0 or 1; anything else is
+		// unsupported and falls through to the description.
+		if minItems, ok := remaining["minItems"].(float64); ok && (minItems == 0 || minItems == 1) {
+			out["minItems"] = minItems
+			delete(remaining, "minItems")
+		}
+	case "string":
+		if format, ok := remaining["format"].(string); ok && supportedNativeFormats[format] {
+			out["format"] = format
+			delete(remaining, "format")
+		}
+	case "integer", "number", "boolean", "null", "":
+	default:
+		return nil, fmt.Errorf("unsupported schema type %q", typeName)
+	}
+
+	// Anything left (pattern, patternProperties, dependentSchemas, unsupported
+	// constraints, etc.) is not expressible as a native constraint; record it
+	// in the description so it is not silently dropped.
+	if len(remaining) > 0 {
+		extra := formatUnsupportedSchemaKeywords(remaining)
+		if description, _ := out["description"].(string); description != "" {
+			out["description"] = description + "\n\n" + extra
+		} else {
+			out["description"] = extra
+		}
+	}
+	return out, nil
+}
+
+func transformSchemaMap(value any) (any, error) {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("must be an object")
+	}
+	out := make(map[string]any, len(m))
+	for name, schema := range m {
+		transformed, err := transformNativeOutputSchema(schema)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		out[name] = transformed
+	}
+	return out, nil
+}
+
+func transformSchemaList(value any) (any, error) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("must be an array")
+	}
+	out := make([]any, len(items))
+	for i, schema := range items {
+		transformed, err := transformNativeOutputSchema(schema)
+		if err != nil {
+			return nil, fmt.Errorf("item %d: %w", i, err)
+		}
+		out[i] = transformed
+	}
+	return out, nil
+}
+
+func formatUnsupportedSchemaKeywords(values map[string]any) string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s: %v", key, values[key]))
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+func cloneJSONValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for k, item := range v {
+			out[k] = cloneJSONValue(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = cloneJSONValue(item)
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 const responseFormatToolName = "json_response"
@@ -813,32 +1347,44 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 	var responseMeta provider.ResponseMetadata
 	var finishMeta map[string]any // metadata accumulated for ChunkFinish
 
-	// Pending server_tool_use ChunkToolCall: deferred so we can attach the
-	// matching result block (which arrives in the next content_block) before
-	// emitting. See parseResponse for the non-streaming equivalent.
-	var pendingHasCall bool
-	var pendingCallID, pendingCallName string
-	var pendingCallArgs string
-	var capturedResultBlock map[string]any
+	// Pending server_tool_use ChunkToolCalls keyed by tool_use_id, deferred so
+	// each can be paired with its own result block before emitting. Keyed by ID
+	// (not a single slot) so parallel server tools each keep their result.
+	// See parseResponse for the non-streaming equivalent.
+	type pendingServerCall struct {
+		name        string
+		args        string
+		resultBlock map[string]any
+	}
+	pendingCalls := make(map[string]*pendingServerCall)
+	currentResultUseID := ""
 
-	flushPendingCall := func() bool {
-		if !pendingHasCall {
+	flushPendingCall := func(id string) bool {
+		pc, ok := pendingCalls[id]
+		if !ok {
 			return true
 		}
-		args := cmp.Or(pendingCallArgs, "{}")
+		args := cmp.Or(pc.args, "{}")
 		chunk := provider.StreamChunk{
 			Type:       provider.ChunkToolCall,
-			ToolCallID: pendingCallID,
-			ToolName:   pendingCallName,
+			ToolCallID: id,
+			ToolName:   pc.name,
 			ToolInput:  args,
 		}
-		if capturedResultBlock != nil {
-			chunk.Metadata = map[string]any{"resultBlock": capturedResultBlock}
+		if pc.resultBlock != nil {
+			chunk.Metadata = map[string]any{"resultBlock": pc.resultBlock}
 		}
-		pendingHasCall = false
-		pendingCallID, pendingCallName, pendingCallArgs = "", "", ""
-		capturedResultBlock = nil
+		delete(pendingCalls, id)
 		return provider.TrySend(ctx, out, chunk)
+	}
+
+	flushAllPending := func() bool {
+		for id := range pendingCalls {
+			if !flushPendingCall(id) {
+				return false
+			}
+		}
+		return true
 	}
 
 	for data, ok := sseScanner.Next(); ok; data, ok = sseScanner.Next() {
@@ -876,11 +1422,12 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 			if cb, ok := event["content_block"].(map[string]any); ok {
 				cbType, _ := cb["type"].(string)
 				isResultBlock = false
-				// If a pending server_tool_use awaits a result block and the
-				// next block is NOT its matching result, flush it without
+				// If pending server_tool_use calls await their result blocks and
+				// the next block is neither a result nor another server tool,
+				// their results are not coming this step: flush without
 				// resultBlock attached.
-				if pendingHasCall && !isServerToolResultBlock(cbType) {
-					if !flushPendingCall() {
+				if len(pendingCalls) > 0 && !isServerToolResultBlock(cbType) && cbType != "server_tool_use" {
+					if !flushAllPending() {
 						return
 					}
 				}
@@ -931,15 +1478,13 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 				default:
 					if isServerToolResultBlock(cbType) {
 						isResultBlock = true
-						if pendingHasCall {
-							// Anthropic emits the full result block in
-							// content_block_start (no input_json_delta for
-							// these). Capture verbatim for round-trip when
-							// tool_use_id matches the pending call.
-							useID, _ := cb["tool_use_id"].(string)
-							if useID == pendingCallID {
-								capturedResultBlock = cb
-							}
+						// Anthropic emits the full result block in
+						// content_block_start (no input_json_delta for
+						// these). Capture verbatim for round-trip when
+						// tool_use_id matches a pending call.
+						currentResultUseID, _ = cb["tool_use_id"].(string)
+						if pc, ok := pendingCalls[currentResultUseID]; ok {
+							pc.resultBlock = cb
 						}
 					}
 				}
@@ -1029,17 +1574,18 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 			case isResultBlock:
 				// End of a server tool result block. Flush the deferred
 				// server_tool_use ChunkToolCall with resultBlock attached.
-				if !flushPendingCall() {
+				if !flushPendingCall(currentResultUseID) {
 					return
 				}
 				isResultBlock = false
+				currentResultUseID = ""
 			case isServerTool && currentToolCallID != "":
 				// Defer ChunkToolCall emission so we can attach the matching
 				// result block (next content_block) before flushing.
-				pendingHasCall = true
-				pendingCallID = currentToolCallID
-				pendingCallName = currentToolName
-				pendingCallArgs = currentToolArgs.String()
+				pendingCalls[currentToolCallID] = &pendingServerCall{
+					name: currentToolName,
+					args: currentToolArgs.String(),
+				}
 				currentToolArgs.Reset()
 			case currentToolCallID != "" && !isRFBlock:
 				// Emit accumulated tool call with complete JSON args.
@@ -1064,9 +1610,9 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 		case "message_delta":
 			if delta, ok := event["delta"].(map[string]any); ok {
 				if sr, ok := delta["stop_reason"].(string); ok {
-					// Flush any pending server tool call before signalling
+					// Flush any pending server tool calls before signalling
 					// step finish so consumers see the ChunkToolCall first.
-					if !flushPendingCall() {
+					if !flushAllPending() {
 						return
 					}
 					fr := mapFinishReason(sr)
@@ -1135,8 +1681,8 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 			}
 
 		case "message_stop":
-			// Flush pending server tool call without resultBlock if none arrived.
-			if !flushPendingCall() {
+			// Flush pending server tool calls without resultBlock if none arrived.
+			if !flushAllPending() {
 				return
 			}
 			usage.TotalTokens = usage.InputTokens + usage.OutputTokens
@@ -1170,7 +1716,7 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 		return
 	}
 	// Clean EOF without message_stop: emit finish with accumulated usage and response meta.
-	_ = flushPendingCall()
+	_ = flushAllPending()
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	provider.TrySend(ctx, out, provider.StreamChunk{
 		Type:     provider.ChunkFinish,
@@ -1222,16 +1768,279 @@ func mapFinishReason(reason string) provider.FinishReason {
 // assistant turn -- omitting them causes the API to reject re-sent transcripts
 // with "tool_use ids were found without `tool_result` blocks".
 var serverToolResultBlockTypes = map[string]bool{
-	"web_search_tool_result":                true,
-	"web_fetch_tool_result":                 true,
-	"code_execution_tool_result":            true,
-	"bash_code_execution_tool_result":       true,
+	"web_search_tool_result":                 true,
+	"web_fetch_tool_result":                  true,
+	"code_execution_tool_result":             true,
+	"bash_code_execution_tool_result":        true,
 	"text_editor_code_execution_tool_result": true,
-	"mcp_tool_result":                       true,
+	"mcp_tool_result":                        true,
+	"tool_search_tool_result":                true,
 }
 
 func isServerToolResultBlock(t string) bool {
 	return serverToolResultBlockTypes[t]
+}
+
+// accumulateStreamedMessage reads Anthropic's SSE event stream and
+// reassembles the single Message object those events describe, returning the
+// JSON bytes as though the request had been issued non-streaming.
+//
+// Rebuilding the wire document, rather than mapping events onto
+// provider.GenerateResult directly, is the deliberate part. parseResponse is
+// the one place that knows how to interpret a Message, and it reads several
+// things provider.StreamChunk has no field for: thinking-block signatures
+// (which must be replayed verbatim on the next turn), redacted_thinking
+// payloads, server tool result blocks, citations, and container /
+// context_management metadata. Reassembling the document keeps DoGenerate's
+// two transports identical in everything but transport; mapping events would
+// fork that logic and silently drop whatever a chunk cannot carry.
+//
+// An "error" event is returned as-is: parseResponse already recognises the
+// {"type":"error"} envelope and converts it to an APIError or
+// ContextOverflowError, so error classification stays in one place too.
+// maxStreamedContentBlocks bounds the number of content blocks a reassembled
+// stream may contain, so a hostile index cannot force unbounded allocation.
+const maxStreamedContentBlocks = 500
+
+func accumulateStreamedMessage(ctx context.Context, body io.Reader) ([]byte, error) {
+	scanner := sse.NewScanner(body)
+
+	var message map[string]any
+	var content []map[string]any
+	// Anthropic sends tool input as a JSON string split across
+	// input_json_delta fragments, keyed by content block index. Fragments are
+	// only valid JSON once concatenated, so they are buffered until
+	// content_block_stop.
+	toolInput := map[int]*strings.Builder{}
+	// Lifecycle tracking: message_start must precede every other event,
+	// message_stop must terminate a well-formed stream, and every started
+	// content block must be stopped before the stream ends. Violations are
+	// protocol errors, never partial successes.
+	messageStarted := false
+	messageStopped := false
+	openBlocks := map[int]bool{}
+
+	blockAt := func(idx int) map[string]any {
+		for len(content) <= idx {
+			content = append(content, map[string]any{})
+		}
+		return content[idx]
+	}
+
+	for {
+		ev, ok := scanner.NextEvent()
+		if !ok {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// Bedrock emits event:error with AWS exception payloads that carry no
+		// Anthropic "type" field. Surface it as a protocol error rather than
+		// letting it fall through to a partial success.
+		if ev.Type == "error" {
+			return nil, fmt.Errorf("anthropic: stream error event: %s", string(ev.Data))
+		}
+		var event map[string]any
+		if err := json.Unmarshal(ev.Data, &event); err != nil {
+			return nil, fmt.Errorf("anthropic: malformed stream event: %w", err)
+		}
+
+		switch eventType, _ := event["type"].(string); eventType {
+		case "message_start":
+			if messageStarted {
+				return nil, fmt.Errorf("anthropic: duplicate message_start")
+			}
+			messageStarted = true
+			msg, ok := event["message"].(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("anthropic: message_start missing message")
+			}
+			message = msg
+			// content arrives as separate events; rebuild it from those rather
+			// than trusting the (usually empty) array in the envelope.
+			if existing, ok := msg["content"].([]any); ok {
+				for _, b := range existing {
+					if bm, ok := b.(map[string]any); ok {
+						content = append(content, bm)
+						openBlocks[len(content)-1] = true
+					}
+				}
+			}
+
+		case "content_block_start":
+			if !messageStarted {
+				return nil, fmt.Errorf("anthropic: content_block_start before message_start")
+			}
+			idx, err := streamEventIndex(event)
+			if err != nil {
+				return nil, err
+			}
+			if openBlocks[idx] {
+				return nil, fmt.Errorf("anthropic: duplicate content_block_start at index %d", idx)
+			}
+			block, _ := event["content_block"].(map[string]any)
+			if block == nil {
+				block = map[string]any{}
+			}
+			blockAt(idx)
+			content[idx] = block
+			openBlocks[idx] = true
+
+		case "content_block_delta":
+			if !messageStarted {
+				return nil, fmt.Errorf("anthropic: content_block_delta before message_start")
+			}
+			idx, err := streamEventIndex(event)
+			if err != nil {
+				return nil, err
+			}
+			if !openBlocks[idx] {
+				return nil, fmt.Errorf("anthropic: content_block_delta for unopened block %d", idx)
+			}
+			delta, _ := event["delta"].(map[string]any)
+			if delta == nil {
+				continue
+			}
+			block := blockAt(idx)
+			switch deltaType, _ := delta["type"].(string); deltaType {
+			case "text_delta":
+				appendStringField(block, "text", delta["text"])
+			case "thinking_delta":
+				appendStringField(block, "thinking", delta["thinking"])
+			case "signature_delta":
+				appendStringField(block, "signature", delta["signature"])
+			case "input_json_delta":
+				if fragment, ok := delta["partial_json"].(string); ok {
+					sb := toolInput[idx]
+					if sb == nil {
+						sb = &strings.Builder{}
+						toolInput[idx] = sb
+					}
+					sb.WriteString(fragment)
+				}
+			case "citations_delta":
+				if citation, ok := delta["citation"].(map[string]any); ok {
+					existing, _ := block["citations"].([]any)
+					block["citations"] = append(existing, citation)
+				}
+			}
+
+		case "content_block_stop":
+			if !messageStarted {
+				return nil, fmt.Errorf("anthropic: content_block_stop before message_start")
+			}
+			idx, err := streamEventIndex(event)
+			if err != nil {
+				return nil, err
+			}
+			if !openBlocks[idx] {
+				return nil, fmt.Errorf("anthropic: content_block_stop for unopened block %d", idx)
+			}
+			delete(openBlocks, idx)
+			sb := toolInput[idx]
+			delete(toolInput, idx)
+			if sb == nil {
+				continue
+			}
+			var input any
+			if err := json.Unmarshal([]byte(cmp.Or(sb.String(), "{}")), &input); err != nil {
+				// Fragments that never form valid JSON are a malformed stream;
+				// do not report a partial tool call as success.
+				return nil, fmt.Errorf("anthropic: unparseable tool input for block %d: %w", idx, err)
+			}
+			blockAt(idx)["input"] = input
+
+		case "message_delta":
+			if !messageStarted {
+				return nil, fmt.Errorf("anthropic: message_delta before message_start")
+			}
+			// stop_reason, stop_sequence and container all arrive inside
+			// delta, at the same position they occupy in a complete Message.
+			if delta, ok := event["delta"].(map[string]any); ok {
+				for k, v := range delta {
+					message[k] = v
+				}
+			}
+			// usage and context_management arrive at the event's top level.
+			if u, ok := event["usage"].(map[string]any); ok {
+				existing, _ := message["usage"].(map[string]any)
+				if existing == nil {
+					existing = map[string]any{}
+					message["usage"] = existing
+				}
+				// message_start's usage carries input-side counts; the delta
+				// supersedes the output-side ones it repeats.
+				for k, v := range u {
+					existing[k] = v
+				}
+			}
+			if cm, ok := event["context_management"]; ok {
+				message["context_management"] = cm
+			}
+
+		case "message_stop":
+			if !messageStarted {
+				return nil, fmt.Errorf("anthropic: message_stop before message_start")
+			}
+			messageStopped = true
+
+		case "error":
+			// Anthropic error envelope; hand it to parseResponse unchanged so
+			// error classification stays in one place.
+			return ev.Data, nil
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading stream: %w", err)
+	}
+	if !messageStarted {
+		return nil, &goai.APIError{Message: "anthropic: stream ended before message_start"}
+	}
+	if !messageStopped {
+		return nil, fmt.Errorf("anthropic: stream ended before message_stop")
+	}
+	if len(openBlocks) > 0 {
+		return nil, fmt.Errorf("anthropic: stream ended with %d unclosed content block(s)", len(openBlocks))
+	}
+
+	message["content"] = content
+	out, err := json.Marshal(message)
+	if err != nil {
+		return nil, fmt.Errorf("reassembling streamed message: %w", err)
+	}
+	return out, nil
+}
+
+// streamEventIndex reads and validates an SSE event's content block index. A
+// missing index is treated as 0. Negative, fractional, overflowing, or
+// over-limit indexes are rejected as protocol errors so a hostile index cannot
+// force unbounded allocation.
+func streamEventIndex(event map[string]any) (int, error) {
+	v, ok := event["index"]
+	if !ok {
+		return 0, nil
+	}
+	f, ok := v.(float64)
+	if !ok {
+		return 0, fmt.Errorf("anthropic: content block index is not a number: %T", v)
+	}
+	if f != float64(int(f)) || f < 0 || f > maxStreamedContentBlocks {
+		return 0, fmt.Errorf("anthropic: invalid content block index %v", f)
+	}
+	return int(f), nil
+}
+
+// appendStringField concatenates a streamed delta onto a content block field,
+// creating it when the first fragment arrives.
+func appendStringField(block map[string]any, key string, value any) {
+	fragment, ok := value.(string)
+	if !ok {
+		return
+	}
+	existing, _ := block[key].(string)
+	block[key] = existing + fragment
 }
 
 func parseResponse(body []byte) (*provider.GenerateResult, error) {
@@ -1247,7 +2056,7 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 			Input     json.RawMessage `json:"input,omitempty"`
 			Thinking  string          `json:"thinking,omitempty"`
 			Signature string          `json:"signature,omitempty"`
-			Data      string          `json:"data,omitempty"` // redacted_thinking
+			Data      string          `json:"data,omitempty"`        // redacted_thinking
 			ToolUseID string          `json:"tool_use_id,omitempty"` // for server tool result blocks
 			Citations []struct {
 				Type            string  `json:"type"`
@@ -1334,9 +2143,10 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 	var textParts []string
 	var reasoningParts []string
 	var providerMeta map[string]any
-	// Index of the last server_tool_use ToolCall, for attaching the matching
-	// result block when it appears immediately after.
-	lastServerToolIdx := -1
+	// Map of server_tool_use ToolCall index by tool_use_id, for attaching the
+	// matching result block. Keyed by ID (not a single slot) so parallel
+	// server tools each get their own result block.
+	serverToolIdxByID := make(map[string]int)
 	for i, block := range resp.Content {
 		switch block.Type {
 		case "text":
@@ -1407,24 +2217,26 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 				Name:  block.Name,
 				Input: block.Input,
 			})
-			if block.Type == "server_tool_use" {
-				lastServerToolIdx = len(result.ToolCalls) - 1
-			} else {
-				lastServerToolIdx = -1
+			if block.Type == "server_tool_use" && block.ID != "" {
+				serverToolIdxByID[block.ID] = len(result.ToolCalls) - 1
 			}
 		default:
-			if isServerToolResultBlock(block.Type) && lastServerToolIdx >= 0 && i < len(rawContent.Content) {
+			if isServerToolResultBlock(block.Type) && i < len(rawContent.Content) {
+				idx, ok := serverToolIdxByID[block.ToolUseID]
+				if !ok {
+					continue
+				}
 				// Decode raw block as map[string]any so the request serializer
 				// can re-emit it verbatim alongside the matching server_tool_use.
 				var rb map[string]any
 				if err := json.Unmarshal(rawContent.Content[i], &rb); err == nil {
-					tc := &result.ToolCalls[lastServerToolIdx]
+					tc := &result.ToolCalls[idx]
 					if tc.Metadata == nil {
 						tc.Metadata = map[string]any{}
 					}
 					tc.Metadata["resultBlock"] = rb
 				}
-				lastServerToolIdx = -1
+				delete(serverToolIdxByID, block.ToolUseID)
 			}
 		}
 	}
@@ -1549,14 +2361,6 @@ func (m *chatModel) doHTTP(ctx context.Context, body map[string]any, toolBetas .
 	req := httpc.MustNewRequest(ctx, "POST", reqURL, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
 
-	// Set auth header based on mode.
-	switch m.opts.authMode {
-	case AuthBearer:
-		req.Header.Set("Authorization", "Bearer "+token)
-	default:
-		req.Header.Set("x-api-key", token)
-	}
-
 	req.Header.Set("anthropic-version", apiVersion)
 	// Merge base betas with tool-specific betas.
 	allBetas := betaFeatures
@@ -1581,13 +2385,23 @@ func (m *chatModel) doHTTP(ctx context.Context, body map[string]any, toolBetas .
 		req.Header.Set(k, v)
 	}
 
+	// Set auth header last so per-request headers can never override it.
+	switch m.opts.authMode {
+	case AuthBearer:
+		req.Header.Set("Authorization", "Bearer "+token)
+	default:
+		req.Header.Set("x-api-key", token)
+	}
+
 	resp, err := m.httpClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		// Bound the error-response body read so a hostile/large error payload
+		// cannot exhaust memory.
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 		errProvider := cmp.Or(m.opts.errorProvider, "anthropic")
 		return nil, goai.ParseHTTPErrorWithHeaders(errProvider, resp.StatusCode, respBody, resp.Header)

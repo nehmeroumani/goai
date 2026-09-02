@@ -1,13 +1,16 @@
 package bedrock
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/provider"
 )
 
@@ -739,8 +742,9 @@ func TestEmbedding_BearerToken(t *testing.T) {
 	}
 }
 
-// TestEmbedding_CohereV4_NonFloatEmbeddingType verifies that requesting a non-float
-// embedding type (e.g. int8) returns an error rather than silently returning nil embeddings.
+// TestEmbedding_CohereV4_NonFloatEmbeddingType verifies that a response with
+// only non-float embeddings (e.g. int8) is parsed successfully rather than
+// silently dropping the vectors (fix for #25).
 func TestEmbedding_CohereV4_NonFloatEmbeddingType(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -754,12 +758,15 @@ func TestEmbedding_CohereV4_NonFloatEmbeddingType(t *testing.T) {
 		WithSecretKey("SK"),
 		WithBaseURL(server.URL),
 	)
-	_, err := model.DoEmbed(t.Context(), []string{"hi"}, provider.EmbedParams{})
-	if err == nil {
-		t.Fatal("expected error when float embeddings are absent")
+	result, err := model.DoEmbed(t.Context(), []string{"hi"}, provider.EmbedParams{})
+	if err != nil {
+		t.Fatalf("expected int8 embeddings to be parsed, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "float") {
-		t.Errorf("error = %v", err)
+	if len(result.Embeddings) != 1 || len(result.Embeddings[0]) != 3 {
+		t.Fatalf("unexpected embeddings: %v", result.Embeddings)
+	}
+	if result.Embeddings[0][0] != 1 || result.Embeddings[0][2] != 3 {
+		t.Errorf("embedding = %v, want [1 2 3]", result.Embeddings[0])
 	}
 }
 
@@ -792,5 +799,320 @@ func TestEmbedding_TitanImage_VersionedID(t *testing.T) {
 	// Multimodal format uses embeddingConfig; text-only format uses inputText directly.
 	if _, ok := gotBody["embeddingConfig"]; !ok {
 		t.Error("expected embeddingConfig key — versioned ID should route to doTitanMultimodalEmbed")
+	}
+}
+
+// TestEmbedding_TitanV2_EmbeddingsByType_Binary covers #26: when embeddingTypes
+// includes "binary", Titan V2 returns embeddings under "embeddingsByType"
+// (base64-packed bits) instead of "embedding".
+func TestEmbedding_TitanV2_EmbeddingsByType_Binary(t *testing.T) {
+	// 0b10100000 = bits [1,0,1,0,0,0,0,0].
+	binVec := base64.StdEncoding.EncodeToString([]byte{0xA0})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := json.Marshal(map[string]any{
+			"embeddingsByType":    map[string]any{"binary": binVec},
+			"inputTextTokenCount": 3,
+		})
+		_, _ = w.Write(resp)
+	}))
+	defer server.Close()
+
+	model := Embedding("amazon.titan-embed-text-v2:0",
+		WithAccessKey("AK"),
+		WithSecretKey("SK"),
+		WithBaseURL(server.URL),
+	)
+	result, err := model.DoEmbed(t.Context(), []string{"hi"}, provider.EmbedParams{
+		ProviderOptions: map[string]any{"embeddingTypes": []string{"binary"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Embeddings) != 1 {
+		t.Fatalf("len(Embeddings) = %d, want 1", len(result.Embeddings))
+	}
+	want := []float64{1, 0, 1, 0, 0, 0, 0, 0}
+	if len(result.Embeddings[0]) != len(want) {
+		t.Fatalf("vector len = %d, want %d (%v)", len(result.Embeddings[0]), len(want), result.Embeddings[0])
+	}
+	for i := range want {
+		if result.Embeddings[0][i] != want[i] {
+			t.Errorf("vector[%d] = %v, want %v", i, result.Embeddings[0][i], want[i])
+		}
+	}
+	if result.Usage.InputTokens != 3 {
+		t.Errorf("InputTokens = %d, want 3", result.Usage.InputTokens)
+	}
+}
+
+// TestEmbedding_TitanV2_EmbeddingsByType_Float covers the float branch of
+// embeddingsByType (embeddingTypes includes "float").
+func TestEmbedding_TitanV2_EmbeddingsByType_Float(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := json.Marshal(map[string]any{
+			"embeddingsByType": map[string]any{"float": [][]float64{{0.1, 0.2}}},
+		})
+		_, _ = w.Write(resp)
+	}))
+	defer server.Close()
+
+	model := Embedding("amazon.titan-embed-text-v2:0",
+		WithAccessKey("AK"),
+		WithSecretKey("SK"),
+		WithBaseURL(server.URL),
+	)
+	result, err := model.DoEmbed(t.Context(), []string{"hi"}, provider.EmbedParams{
+		ProviderOptions: map[string]any{"embeddingTypes": []string{"float"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Embeddings) != 1 || result.Embeddings[0][0] != 0.1 {
+		t.Errorf("unexpected embeddings: %v", result.Embeddings)
+	}
+}
+
+// TestEmbedding_CohereV4_Int8 covers #25: Cohere v4 int8 embeddings are parsed
+// and converted to float64.
+func TestEmbedding_CohereV4_Int8(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"embeddings":{"int8":[[1,-2,3],[4,5,-6]]}}`))
+	}))
+	defer server.Close()
+
+	model := Embedding("cohere.embed-v4:0",
+		WithAccessKey("AK"),
+		WithSecretKey("SK"),
+		WithBaseURL(server.URL),
+	)
+	result, err := model.DoEmbed(t.Context(), []string{"a", "b"}, provider.EmbedParams{
+		ProviderOptions: map[string]any{"embedding_types": []string{"int8"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Embeddings) != 2 {
+		t.Fatalf("len(Embeddings) = %d, want 2", len(result.Embeddings))
+	}
+	if result.Embeddings[0][0] != 1 || result.Embeddings[0][1] != -2 || result.Embeddings[0][2] != 3 {
+		t.Errorf("row0 = %v", result.Embeddings[0])
+	}
+	if result.Embeddings[1][2] != -6 {
+		t.Errorf("row1 = %v", result.Embeddings[1])
+	}
+}
+
+// TestEmbedding_CohereV4_Uint8 covers #25: uint8 embeddings are parsed.
+func TestEmbedding_CohereV4_Uint8(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"embeddings":{"uint8":[[10,20],[30,40]]}}`))
+	}))
+	defer server.Close()
+
+	model := Embedding("cohere.embed-v4:0",
+		WithAccessKey("AK"),
+		WithSecretKey("SK"),
+		WithBaseURL(server.URL),
+	)
+	result, err := model.DoEmbed(t.Context(), []string{"a", "b"}, provider.EmbedParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Embeddings) != 2 || result.Embeddings[0][1] != 20 || result.Embeddings[1][0] != 30 {
+		t.Errorf("unexpected embeddings: %v", result.Embeddings)
+	}
+}
+
+// TestEmbedding_CohereV4_Binary covers #25: batched binary embeddings (array of
+// base64-packed bit strings) are decoded.
+func TestEmbedding_CohereV4_Binary(t *testing.T) {
+	v0 := base64.StdEncoding.EncodeToString([]byte{0xC0}) // 11000000
+	v1 := base64.StdEncoding.EncodeToString([]byte{0x03}) // 00000011
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := json.Marshal(map[string]any{
+			"embeddings": map[string]any{"binary": []string{v0, v1}},
+		})
+		_, _ = w.Write(resp)
+	}))
+	defer server.Close()
+
+	model := Embedding("cohere.embed-v4:0",
+		WithAccessKey("AK"),
+		WithSecretKey("SK"),
+		WithBaseURL(server.URL),
+	)
+	result, err := model.DoEmbed(t.Context(), []string{"a", "b"}, provider.EmbedParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Embeddings) != 2 {
+		t.Fatalf("len(Embeddings) = %d, want 2", len(result.Embeddings))
+	}
+	if result.Embeddings[0][0] != 1 || result.Embeddings[0][1] != 1 || result.Embeddings[0][2] != 0 {
+		t.Errorf("row0 = %v", result.Embeddings[0])
+	}
+	if result.Embeddings[1][6] != 1 || result.Embeddings[1][7] != 1 {
+		t.Errorf("row1 = %v", result.Embeddings[1])
+	}
+}
+
+// TestEmbedding_TitanV2_EmbeddingsByType_InvalidFloat covers the error path in
+// doTitanEmbed (lines 132-134): when embeddingsByType is present but contains an
+// unparseable value for the selected type, parseTypedEmbeddings fails and
+// DoEmbed propagates the error (returns nil, err).
+func TestEmbedding_TitanV2_EmbeddingsByType_InvalidFloat(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// embeddingsByType present but "float" holds a string, not [[...]].
+		_, _ = w.Write([]byte(`{"embeddingsByType":{"float":"not-an-array"}}`))
+	}))
+	defer server.Close()
+
+	model := Embedding("amazon.titan-embed-text-v2:0",
+		WithAccessKey("AK"),
+		WithSecretKey("SK"),
+		WithBaseURL(server.URL),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hi"}, provider.EmbedParams{
+		ProviderOptions: map[string]any{"embeddingTypes": []string{"float"}},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid float embeddingsByType, got nil")
+	}
+}
+
+// TestParseTypedEmbeddings_FloatUnmarshalError covers the "float" case
+// json.Unmarshal error (lines 371-373).
+func TestParseTypedEmbeddings_FloatUnmarshalError(t *testing.T) {
+	_, err := parseTypedEmbeddings(json.RawMessage(`{"float":"not-an-array"}`))
+	if err == nil {
+		t.Fatal("expected error for malformed float embeddings, got nil")
+	}
+}
+
+// TestParseTypedEmbeddings_Int8UnmarshalError covers the "int8" case
+// json.Unmarshal error (lines 377-379).
+func TestParseTypedEmbeddings_Int8UnmarshalError(t *testing.T) {
+	_, err := parseTypedEmbeddings(json.RawMessage(`{"int8":"not-an-array"}`))
+	if err == nil {
+		t.Fatal("expected error for malformed int8 embeddings, got nil")
+	}
+}
+
+// TestParseTypedEmbeddings_Uint8UnmarshalError covers the "uint8" case
+// json.Unmarshal error (lines 383-385).
+func TestParseTypedEmbeddings_Uint8UnmarshalError(t *testing.T) {
+	_, err := parseTypedEmbeddings(json.RawMessage(`{"uint8":"not-an-array"}`))
+	if err == nil {
+		t.Fatal("expected error for malformed uint8 embeddings, got nil")
+	}
+}
+
+// TestParseTypedEmbeddings_NoRecognizedType covers the fall-through error
+// (line 391): none of the recognized type keys is present.
+func TestParseTypedEmbeddings_NoRecognizedType(t *testing.T) {
+	_, err := parseTypedEmbeddings(json.RawMessage(`{"other":[[0.1]]}`))
+	if err == nil {
+		t.Fatal("expected error when no recognized type key present, got nil")
+	}
+	if !strings.Contains(err.Error(), "no embeddings in response") {
+		t.Errorf("error = %v, want substring 'no embeddings in response'", err)
+	}
+}
+
+// TestParseBinaryRows_SingleStringDecodeError covers the single-string
+// base64 decode failure (lines 413-415 and 437-439): a valid JSON string that
+// is not valid base64 makes decodeBinaryVector fail.
+func TestParseBinaryRows_SingleStringDecodeError(t *testing.T) {
+	_, err := parseBinaryRows(json.RawMessage(`"%%%"`))
+	if err == nil {
+		t.Fatal("expected error for invalid base64 single string, got nil")
+	}
+	if !strings.Contains(err.Error(), "decoding binary embedding") {
+		t.Errorf("error = %v, want substring 'decoding binary embedding'", err)
+	}
+}
+
+// TestParseBinaryRows_ArrayUnmarshalError covers the array json.Unmarshal
+// error (lines 419-421): the raw value is neither a single string nor an
+// array of strings.
+func TestParseBinaryRows_ArrayUnmarshalError(t *testing.T) {
+	_, err := parseBinaryRows(json.RawMessage(`{"foo":1}`))
+	if err == nil {
+		t.Fatal("expected error for unrecognised binary format, got nil")
+	}
+	if !strings.Contains(err.Error(), "unrecognised binary embedding format") {
+		t.Errorf("error = %v, want substring 'unrecognised binary embedding format'", err)
+	}
+}
+
+// TestParseBinaryRows_ArrayElementDecodeError covers the per-element
+// decodeBinaryVector error inside the array loop (lines 423-427): an array
+// whose first element is valid base64 and whose second is invalid makes the
+// loop fail mid-way.
+func TestParseBinaryRows_ArrayElementDecodeError(t *testing.T) {
+	_, err := parseBinaryRows(json.RawMessage(`["AQI=","%%%"]`))
+	if err == nil {
+		t.Fatal("expected error for invalid base64 array element, got nil")
+	}
+	if !strings.Contains(err.Error(), "decoding binary embedding") {
+		t.Errorf("error = %v, want substring 'decoding binary embedding'", err)
+	}
+}
+
+// TestEmbedding_ResponseBodyOverCap verifies the success-path bounded read in
+// embed.go: a response body larger than maxEmbedResponseBytes is rejected.
+func TestEmbedding_ResponseBodyOverCap(t *testing.T) {
+	transport := &fixedBodyTransport{body: io.NopCloser(io.LimitReader(zeroReader{}, int64(maxEmbedResponseBytes+2)))}
+	model := Embedding("amazon.titan-embed-text-v2:0",
+		WithAccessKey("AK"),
+		WithSecretKey("SK"),
+		WithBaseURL("http://fake"),
+		WithHTTPClient(&http.Client{Transport: transport}),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err == nil {
+		t.Fatal("expected error for oversized response body")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want an 'exceeds' over-cap error", err)
+	}
+}
+
+// TestEmbedding_ErrorBodyBounded verifies the error-path bounded read in
+// embed.go: an error response body larger than maxEmbedErrorBytes is truncated,
+// so the tail marker never reaches the extracted error message.
+func TestEmbedding_ErrorBodyBounded(t *testing.T) {
+	const tailMarker = "TAIL-MARKER-SHOULD-NOT-APPEAR"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.Copy(w, io.MultiReader(
+			strings.NewReader(`{"message":"`),
+			io.LimitReader(zeroReader{}, int64(maxEmbedErrorBytes+len(tailMarker))),
+			strings.NewReader(tailMarker),
+		))
+	}))
+	defer server.Close()
+
+	model := Embedding("amazon.titan-embed-text-v2:0",
+		WithAccessKey("AK"),
+		WithSecretKey("SK"),
+		WithBaseURL(server.URL),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *goai.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *goai.APIError", err)
+	}
+	if strings.Contains(apiErr.Message, tailMarker) {
+		t.Errorf("error message contains tail marker; error body was not bounded: %q", apiErr.Message)
 	}
 }

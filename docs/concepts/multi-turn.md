@@ -51,7 +51,7 @@ The contents depend on what happened during generation:
 | Tool loop (2 steps) | assistant (tool calls) + tool (results) + assistant (final text) |
 | Parallel tool calls | Tool results merged into a single message per round-trip |
 | MaxSteps exhausted | All completed round-trips (no duplicate final message) |
-| Streaming with reasoning | Reasoning consolidated into a single `PartReasoning` with metadata |
+| Streaming with reasoning | Reasoning boundaries preserved as one or more `PartReasoning` values with metadata |
 
 ## Streaming
 
@@ -95,7 +95,7 @@ messages = append(messages, result.ResponseMessages...)
 
 ## Without ResponseMessages
 
-If you prefer manual control, you can build messages from `result.Steps`. But you need to reconstruct the tool call parts and capture tool outputs via `WithOnToolCall`. `ResponseMessages` handles this automatically.
+If you prefer manual control, you can build messages from `result.Steps`. Completed tool outputs are available in `StepResult.ToolResults`; `WithOnToolCall` is only needed for real-time observation. `ResponseMessages` handles reconstruction automatically.
 
 ::: tip
 See [`examples/multi-turn/`](https://github.com/zendev-sh/goai/tree/main/examples/multi-turn) for a runnable example.

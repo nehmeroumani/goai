@@ -1,11 +1,11 @@
 ---
 title: Options
-description: "Reference for all GoAI option functions. Configure prompts, tools, temperature, retries, streaming, structured output, embeddings, and image generation."
+description: "Reference for all GoAI option functions. Configure prompts, tools, temperature, retries, streaming, structured output, embeddings, image generation, and video generation."
 ---
 
 # Options
 
-All option functions for configuring GoAI calls. Options follow the functional options pattern - pass them as variadic arguments to `GenerateText`, `StreamText`, `GenerateObject`, `StreamObject`, `Embed`, or `EmbedMany`.
+All option functions for configuring GoAI calls. Options follow the functional options pattern. Text, object, and embedding calls use `Option`; image and video generation use their dedicated option types.
 
 Import: `github.com/zendev-sh/goai`
 
@@ -33,6 +33,8 @@ func WithPrompt(s string) Option
 
 **Default:** empty.
 
+---
+
 Use `WithPrompt` for simple single-turn requests. Use `WithMessages` for multi-turn conversations.
 
 ### WithMessages
@@ -54,6 +56,16 @@ func WithPromptCaching(b bool) Option
 ```
 
 **Default:** `false`.
+
+### WithCacheTTL
+
+Sets the ephemeral prompt-cache lifetime for Anthropic-family models.
+
+```go
+func WithCacheTTL(ttl string) Option
+```
+
+Use `"5m"` or `"1h"`; an empty value preserves the provider default. Other providers ignore this option.
 
 ### WithOptions
 
@@ -284,10 +296,20 @@ func WithMaxRetries(n int) Option
 | Value     | Behavior                                                                                          |
 | --------- | ------------------------------------------------------------------------------------------------- |
 | `n >= 0`  | Retry up to `n` times.                                                                            |
-| `n == -1` | Unlimited retries (useful when the application manages its own timeout/cancellation via context). |
+| `n == -1` | Sets the finite maximum retry count to `2,147,483,647`; context cancellation should bound the call. |
 | `n < -1`  | Clamped to `0` (no retries).                                                                      |
 
 **Default:** `2`. Retries use exponential backoff. Only retryable errors trigger retry (see [Errors](errors.md)).
+
+### WithRetryObserver
+
+Sets a callback invoked before each retry attempt.
+
+```go
+func WithRetryObserver(fn RetryObserver) Option
+```
+
+The callback receives the zero-based retry attempt, the error that triggered the retry, and the delay before the next attempt.
 
 ### WithTimeout
 
@@ -325,12 +347,20 @@ func WithProviderOptions(opts map[string]any) Option
 
 ## Telemetry Hooks
 
-> **Panic handling:** Hooks use two panic strategies depending on execution context:
+> **Panic handling:** Hook panics are surfaced as `*PanicError` and reported through `WithOnPanic`; tool execution hooks remain resilient with their documented skip/preserve behavior.
 >
-> - **Caller goroutine** (`OnRequest`): panics propagate in `GenerateText`, `GenerateObject`, and `StreamText` first step. In `StreamText` step 2+ (goroutine), each callback is individually recovered.
-> - **Mixed** (`OnResponse`): recovered in `GenerateText`, `GenerateObject`, `StreamObject`, and background goroutines; propagates in `StreamText` first-step error path. See per-hook docs below.
-> - **Worker goroutines** (`OnStepFinish`, `OnToolCallStart`, `OnToolCall`): panics are recovered, logged to stderr, and do not propagate.
-> - **Interceptor hooks** (`OnBeforeToolExecute`, `OnAfterToolExecute`, `OnBeforeStep`): always panic-recovered with hook-specific behavior (skip tool, preserve result, or proceed normally).
+> - `OnBeforeStep` and `OnFinish` panics surface to the caller and stop processing.
+> - Other lifecycle hooks may recover panics according to their execution path; see each hook below.
+
+### WithOnPanic
+
+Registers a callback invoked whenever a user callback or `StopWhen` predicate panics.
+
+```go
+func WithOnPanic(fn func(PanicInfo)) Option
+```
+
+Multiple callbacks run in registration order. A panic inside an `OnPanic` callback is recovered and discarded.
 
 ### WithOnRequest
 
@@ -354,19 +384,19 @@ func WithOnResponse(fn func(ResponseInfo)) Option
 
 **Default:** `nil`.
 
-> **Panic behavior:** In `GenerateText`, all `StreamText` success paths, `GenerateObject`, `StreamObject` (success path), and `StreamObject` (error path), panics are individually recovered and logged to stderr. In `StreamText`'s first-step error path, panics propagate to the caller.
+> **Panic behavior:** A panic is wrapped as `*PanicError` and returned by synchronous calls or exposed through `stream.Err()`; processing on that path stops.
 
 ### WithOnStepFinish
 
-Sets a callback invoked after each generation step completes, including after tool execution.
+Sets a callback invoked after each model call and before that step's tool execution. `StepResult.ToolResults` is empty at callback time.
 
 ```go
 func WithOnStepFinish(fn func(StepResult)) Option
 ```
 
-**Default:** `nil`. Only relevant when `MaxSteps > 1`.
+**Default:** `nil`. Fires for both single-step and multi-step generation.
 
-> **Panic behavior:** Panics are recovered and logged to stderr.
+> **Panic behavior:** A panic is wrapped as `*PanicError` and returned by synchronous calls or exposed through `stream.Err()`.
 
 ### WithOnToolCallStart
 
@@ -378,7 +408,7 @@ func WithOnToolCallStart(fn func(ToolCallStartInfo)) Option
 
 **Default:** `nil`. Relevant when tools with `Execute` are provided.
 
-> **Panic behavior:** If the callback panics, the tool does not execute and the panic is recovered and logged to stderr.
+> **Panic behavior:** If the callback panics, the tool does not execute; the panic is reported through `OnPanic`.
 
 ### WithOnToolCall
 
@@ -392,7 +422,7 @@ func WithOnToolCall(fn func(ToolCallInfo)) Option
 
 > **Note:** When multiple tools execute in a single step, OnToolCall callbacks fire concurrently from separate goroutines. Order is non-deterministic.
 
-> **Panic behavior:** Panics are recovered and logged to stderr.
+> **Panic behavior:** Panics are reported through `OnPanic`; tool-loop execution remains resilient.
 
 ### WithOnBeforeToolExecute
 
@@ -425,9 +455,9 @@ goai.WithOnBeforeStep(func(info goai.BeforeStepInfo) goai.BeforeStepResult {
 })
 ```
 
-Called before each LLM call in a multi-step tool loop (step 2+ only, not step 1). Can inject additional messages or stop the loop early. `info.Ctx` carries the generation context for cancellation checks or external calls. Only one callback supported. Panic-recovered: a panic is logged and the step proceeds normally.
+Called before each LLM call in a multi-step tool loop (step 2+ only, not step 1). Can inject additional messages or stop the loop early. `info.Ctx` carries the generation context for cancellation checks or external calls. Only one callback supported. A panic surfaces as `*PanicError` and stops processing.
 
-> **Panic handling note:** Interceptor hooks (`OnBeforeToolExecute`, `OnAfterToolExecute`, `OnBeforeStep`): always panic-recovered with hook-specific behavior (skip tool, preserve result, or proceed normally).
+> **Panic handling note:** `OnBeforeToolExecute` and `OnAfterToolExecute` remain resilient by skipping the tool or preserving its original result. `OnBeforeStep` panics surface as `*PanicError`.
 
 ### WithOnFinish
 
@@ -437,7 +467,7 @@ goai.WithOnFinish(func(info goai.FinishInfo) {
 })
 ```
 
-Called once after all generation steps complete. Fires in all code paths: `GenerateText`, `StreamText`, `GenerateObject` (including max_steps error), and `StreamObject`. Does NOT fire when DoGenerate/DoStream returns a provider error. Multiple callbacks supported (append). Panic-recovered.
+Called once after generation terminates. `GenerateText` and `GenerateObject` also fire it on `DoGenerate` errors with `StoppedBy: StopCauseAbort`; an initial `DoStream` error returns before stream-level `OnFinish`. Multiple callbacks are supported (append). A panic surfaces as `*PanicError`, and subsequent `OnFinish` callbacks do not run.
 
 `FinishInfo.StepsExhausted` is the authoritative signal for max-steps exhaustion -- it is not available from any per-step hook.
 
@@ -568,3 +598,28 @@ func WithImageProviderOptions(opts map[string]any) ImageOption
 ```
 
 **Default:** empty.
+
+---
+
+## Video Options
+
+These options use the separate `VideoOption` type and apply only to `GenerateVideo`.
+
+| Option | Description | Default |
+| ------ | ----------- | ------- |
+| `WithVideoPrompt(string)` | Text prompt. | Empty |
+| `WithVideoImage(provider.MediaData)` | Initial image for image-to-video. | None |
+| `WithVideoCount(int)` | Number of videos. | `1` |
+| `WithVideoAspectRatio(string)` | Output ratio such as `"16:9"`. | Provider default |
+| `WithVideoResolution(string)` | Provider-supported resolution. | Provider default |
+| `WithVideoDuration(time.Duration)` | Requested duration. | Provider default |
+| `WithVideoFPS(int)` | Frames per second when supported. | Provider default |
+| `WithVideoSeed(int64)` | Deterministic seed when supported. | None |
+| `WithVideoFrameImages(...provider.VideoFrame)` | First/last frame images. | None |
+| `WithVideoInputReferences(...provider.MediaData)` | Reference media. | None |
+| `WithVideoAudio(bool)` | Generate audio with video. | Provider default |
+| `WithVideoProviderOptions(map[string]any)` | Provider-specific parameters. | Empty |
+| `WithVideoMaxRetries(int)` | Retries for rate-limited generation-start requests. Ambiguous network and 5xx failures are not replayed. | `2` |
+| `WithVideoTimeout(time.Duration)` | Overall call timeout. | Context only |
+| `WithVideoPollInterval(time.Duration)` | Operation polling interval. | `5s` |
+| `WithVideoPollTimeout(time.Duration)` | Maximum polling duration. | `10m` |

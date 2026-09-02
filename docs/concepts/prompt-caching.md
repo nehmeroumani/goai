@@ -23,7 +23,7 @@ When enabled, GoAI marks the last content part of each system message with `Cach
 - Bedrock uses a Bedrock-specific `cachePoint` block appended to the system prompt.
 - Other providers may ignore the option and/or print a warning.
 
-This targets system-role entries in `WithMessages(...)` only. The separate `WithSystem(...)` field is passed through unchanged, and conversation/tool messages are not cache-marked.
+This targets system content from both sources. `applyCaching` marks system-role entries in `WithMessages(...)`; Anthropic adds `cache_control` to the separate `WithSystem(...)` block, and Bedrock appends a `cachePoint` after that system block. Conversation and tool messages are not cache-marked.
 
 ## Provider Support
 

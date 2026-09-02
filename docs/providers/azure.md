@@ -168,8 +168,12 @@ When using `WithTokenSource`, the provider sends `Authorization: Bearer {token}`
 | `WithEndpoint(url)`          | `string`               | Azure endpoint URL. Falls back to `AZURE_OPENAI_ENDPOINT`, or constructed from `AZURE_RESOURCE_NAME`. |
 | `WithHeaders(h)`             | `map[string]string`    | Additional HTTP headers.                                                                              |
 | `WithHTTPClient(c)`          | `*http.Client`         | Custom HTTP client.                                                                                   |
+| `WithResponsesStreamIdleTimeout(d)` | `time.Duration` | Maximum wait for a complete Azure OpenAI Responses event. Default: `5m`; `0` disables the watchdog. |
+| `WithResponsesStreamDoneCompatibility(b)` | `bool` | Allow only a non-standard bare `[DONE]` terminal sentinel; event schema validation remains strict. Default: `false`. |
 | `WithAPIVersion(v)`          | `string`               | `api-version` query parameter. Only honoured on the legacy deployment-based path (opt in via `WithDeploymentBasedURLs(true)`); the v1 GA path drops it per Azure spec. Default: `"2025-03-01-preview"`. |
 | `WithDeploymentBasedURLs(b)` | `bool`                 | Use legacy deployment-based URL format. Default: `false`.                                             |
+
+Azure Responses streams use the same event validation as the OpenAI provider: each JSON data event must identify its type through the JSON `type` property or SSE `event:` field, and malformed recognized events terminate the stream. Use SSE comments for keepalives. The `[DONE]` compatibility option does not relax event schema validation.
 
 ### Environment Variables
 

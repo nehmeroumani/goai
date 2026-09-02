@@ -357,3 +357,48 @@ func TestChat_PromptCachingIgnored(t *testing.T) {
 	for range streamResult.Stream {
 	}
 }
+
+// Item 59: Requesty expects the flat {"type":"input_file","file_data":...} shape
+// for PDFs, not the nested {"type":"file","file":{...}} shape.
+func TestChat_PDFUsesFlatInputFile(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("openai/gpt-4o", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{
+			Role: provider.RoleUser,
+			Content: []provider.Part{
+				{Type: provider.PartFile, URL: "data:application/pdf;base64,JVBERi0=", Filename: "doc.pdf", MediaType: "application/pdf"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, ok := gotBody["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("messages = %v", gotBody["messages"])
+	}
+	content, ok := msgs[0].(map[string]any)["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("content = %v", msgs[0])
+	}
+	part := content[0].(map[string]any)
+	if part["type"] != "input_file" {
+		t.Errorf("part type = %v, want input_file", part["type"])
+	}
+	if part["file_data"] != "data:application/pdf;base64,JVBERi0=" {
+		t.Errorf("file_data = %v", part["file_data"])
+	}
+	if _, ok := part["file"]; ok {
+		t.Error("nested file object must not be emitted for Requesty")
+	}
+}

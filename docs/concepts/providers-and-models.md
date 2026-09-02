@@ -1,6 +1,6 @@
 ---
 title: Providers and Models
-description: "Understand GoAI's provider architecture, model interfaces, capabilities system, and the full list of 22+ supported LLM providers."
+description: "Understand GoAI's provider architecture, model interfaces, capabilities system, and the full list of 25+ supported LLM providers."
 ---
 
 # Providers and Models
@@ -25,7 +25,7 @@ result, err := goai.GenerateText(ctx, model,
 
 ## Model Interfaces
 
-GoAI defines three model interfaces in the `provider` package.
+GoAI defines four model interfaces in the `provider` package.
 
 ### LanguageModel
 
@@ -70,6 +70,19 @@ type ImageModel interface {
 
 Used with `GenerateImage`.
 
+### VideoModel
+
+Video generation from text, images, or frame references.
+
+```go
+type VideoModel interface {
+    ModelID() string
+    DoGenerate(ctx context.Context, params VideoParams) (*VideoResult, error)
+}
+```
+
+Used with `GenerateVideo`.
+
 ## Capabilities
 
 Models that implement the optional `CapableModel` interface expose their capabilities. Use `provider.ModelCapabilitiesOf` to query safely (returns zero-value if not implemented):
@@ -92,6 +105,7 @@ The `ModelCapabilities` struct includes:
 | `Reasoning`        | `bool`        | Extended thinking / chain-of-thought      |
 | `Attachment`       | `bool`        | File attachment support                   |
 | `ToolCall`         | `bool`        | Tool / function calling                   |
+| `FileUpload`       | `bool`        | Remote file upload support                |
 | `InputModalities`  | `ModalitySet` | Supported input types (text, image, etc.) |
 | `OutputModalities` | `ModalitySet` | Supported output types                    |
 
@@ -118,7 +132,7 @@ Many providers read credentials from environment variables when explicit auth op
 | ---------- | ----------------------------------------------- | ---------------------------- |
 | OpenAI     | `github.com/zendev-sh/goai/provider/openai`     | `Chat`, `Embedding`, `Image` |
 | Anthropic  | `github.com/zendev-sh/goai/provider/anthropic`  | `Chat`                       |
-| Google     | `github.com/zendev-sh/goai/provider/google`     | `Chat`, `Embedding`, `Image` |
+| Google     | `github.com/zendev-sh/goai/provider/google`     | `Chat`, `Embedding`, `Image`, `Video` |
 | Azure      | `github.com/zendev-sh/goai/provider/azure`      | `Chat`, `Image`              |
 | Vertex AI  | `github.com/zendev-sh/goai/provider/vertex`     | `Chat`, `Embedding`, `Image` |
 | Bedrock    | `github.com/zendev-sh/goai/provider/bedrock`    | `Chat`, `Embedding`          |
@@ -141,6 +155,8 @@ Many providers read credentials from environment variables when explicit auth op
 | Ollama     | `github.com/zendev-sh/goai/provider/ollama`     | `Chat`, `Embedding`          |
 | vLLM       | `github.com/zendev-sh/goai/provider/vllm`       | `Chat`, `Embedding`          |
 | Compat     | `github.com/zendev-sh/goai/provider/compat`     | `Chat`, `Embedding`          |
+| Requesty   | `github.com/zendev-sh/goai/provider/requesty`   | `Chat`                       |
+| llama.cpp  | `github.com/zendev-sh/goai/provider/llamacpp`   | `Chat`, `Embedding`          |
 
 The `compat` provider works with any OpenAI-compatible API. Pass a custom base URL:
 

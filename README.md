@@ -28,34 +28,36 @@
 
 Inspired by the [Vercel AI SDK](https://sdk.vercel.ai). The same clean abstractions, idiomatically adapted for Go with generics, interfaces, and functional options.
 
-## What's New
+## Selected Releases
 
-> **v0.7.2** - New provider: [NVIDIA NIM](https://goai.sh/providers/nvidia) (OpenAI-compatible, chat + embeddings). E2E tested with `meta/llama-3.3-70b-instruct`. [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.9.0** - Provider-neutral file upload and remote file references. `FileUploader` interface + `RemoteFileRef` for OpenAI (Files API), Anthropic (Files API), and Google Gemini (Files API). Compat providers map file parts to native OpenAI shapes. [Changelog →](https://github.com/zendev-sh/goai/releases)
 >
-> **v0.7.0** - New providers: [Cloudflare Workers AI](https://goai.sh/providers/cloudflare) and [FPT Smart Cloud](https://goai.sh/providers/fptcloud) (both OpenAI-compatible, chat + embeddings). [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.8.5** - New provider: [Requesty](https://goai.sh/providers/requesty) (OpenAI-compatible LLM gateway). Plus Anthropic native structured output, per-step `Reasoning`, and Gemini schema sanitization fixes. [Changelog →](https://github.com/zendev-sh/goai/releases)
 >
-> **v0.6.0** - OpenTelemetry tracing + metrics, context propagation via RequestInfo.Ctx, Langfuse data race fix. [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.8.4** - `WithRetryObserver` callback for observing retry attempts, split tool-call stream metadata fix, and Anthropic `redacted_thinking` capture in streaming. [Changelog →](https://github.com/zendev-sh/goai/releases)
 >
-> **v0.5.8** - RunPod provider, Bedrock embeddings, and docs accuracy improvements. [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.8.3** - Native Ollama provider (`/api/chat` + `/api/embed`, think mode, no third-party SDK) and duplicate tool name detection. [Changelog →](https://github.com/zendev-sh/goai/releases)
+>
+> **v0.8.0** - MCP OAuth 2.1 + PKCE for remote servers, `NewTool[In]` typed constructor, and lifecycle hook panics surfaced as `*PanicError` via `WithOnPanic` (breaking). [Changelog →](https://github.com/zendev-sh/goai/releases)
 
 ## Features
 
-- **7 core functions**: `GenerateText`, `StreamText`, `GenerateObject[T]`, `StreamObject[T]`, `Embed`, `EmbedMany`, `GenerateImage`
-- **25+ providers**: OpenAI, Anthropic, Google, Bedrock, Azure, Vertex, Mistral, xAI, Groq, Cohere, DeepSeek, MiniMax, Fireworks, Together, DeepInfra, OpenRouter, Requesty, Perplexity, Cerebras, Ollama, vLLM, RunPod, Cloudflare Workers AI, FPT Smart Cloud, NVIDIA NIM, + generic OpenAI-compatible
+- **8 core functions**: `GenerateText`, `StreamText`, `GenerateObject[T]`, `StreamObject[T]`, `Embed`, `EmbedMany`, `GenerateImage`, `GenerateVideo`
+- **25+ providers**: OpenAI, Anthropic, Google, Bedrock, Azure, Vertex, Mistral, xAI, Groq, Cohere, DeepSeek, MiniMax, Fireworks, Together, DeepInfra, OpenRouter, Requesty, Perplexity, Cerebras, Ollama, vLLM, RunPod, Cloudflare Workers AI, FPT Smart Cloud, NVIDIA NIM, llama.cpp, + generic OpenAI-compatible
 - **Auto tool loop**: Define tools with `Execute` handlers, set `MaxSteps` for `GenerateText` and `StreamText`
 - **Structured output**: `GenerateObject[T]` auto-generates JSON Schema from Go types via reflection
 - **Streaming**: Real-time text and partial object streaming via channels
 - **Dynamic auth**: `TokenSource` interface for OAuth, rotating keys, cloud IAM, with `CachedTokenSource` for TTL-based caching
-- **Prompt caching**: Automatic cache control for supported providers (Anthropic, Bedrock)
+- **Prompt caching**: Automatic cache control for supported providers (Anthropic, Bedrock, MiniMax)
 - **Citations/sources**: Grounding and inline citations from xAI, Perplexity, Google, OpenAI
 - **Web search**: Built-in web search tools for OpenAI, Anthropic, Google, Groq, xAI. Model decides when to search
 - **Code execution**: Server-side Python sandboxes via OpenAI, Anthropic, Google, xAI. No local setup
 - **Computer use**: Anthropic computer, bash, text editor tools for autonomous desktop interaction
-- **20 provider-defined tools**: Web fetch, file search, image generation, X search, and more - [full list](#provider-defined-tools)
+- **23 provider-defined tools**: Web fetch, file search, image generation, X search, and more - [full list](#provider-defined-tools)
 - **MCP client**: Connect to any MCP server (stdio, HTTP, SSE), auto-convert tools for use with GoAI
 - **Observability**: Built-in Langfuse and OpenTelemetry (OTel) integrations for tracing generations, tools, and multi-step loops
 - **Multi-agent orchestration**: For declarative YAML workflows on top of GoAI, see [zenflow](https://github.com/zendev-sh/zenflow)
-- **9 lifecycle hooks**: Observability (`OnRequest`, `OnResponse`, `OnToolCallStart`, `OnToolCall`, `OnStepFinish`, `OnFinish`) and interceptor (`OnBeforeToolExecute`, `OnAfterToolExecute`, `OnBeforeStep`) hooks for permission gates, secret scanning, output transformation, and loop control
+- **10 lifecycle hooks**: Observability (`OnRequest`, `OnResponse`, `OnToolCallStart`, `OnToolCall`, `OnStepFinish`, `OnFinish`, `OnPanic`) and interceptor (`OnBeforeToolExecute`, `OnAfterToolExecute`, `OnBeforeStep`) hooks for permission gates, secret scanning, output transformation, and loop control
 - **Retry/backoff**: Automatic retry with exponential backoff on retryable HTTP errors (429/5xx)
 - **Minimal dependencies**: Core depends on `golang.org/x/oauth2` + one indirect (`cloud.google.com/go/compute/metadata`). Optional `observability/otel` submodule uses separate `go.mod` with OTel SDK.
 
@@ -132,6 +134,18 @@ if err := stream.Err(); err != nil {
 fmt.Printf("\nTokens: %d in, %d out\n",
 	result.TotalUsage.InputTokens, result.TotalUsage.OutputTokens)
 ```
+
+OpenAI Responses streams enforce a five-minute provider-event idle timeout.
+Configure this per model with `openai.WithResponsesStreamIdleTimeout`; pass `0`
+to explicitly disable the watchdog. Premature EOF and a bare `[DONE]` sentinel
+are rejected by default. Non-standard endpoints that require `[DONE]` can opt
+in explicitly with `openai.WithResponsesStreamDoneCompatibility(true)`; this
+option changes only terminal-sentinel handling and does not relax event schema
+validation. Every JSON data event must identify its type through either the JSON
+`type` property or the SSE `event:` field, and malformed recognized events
+terminate the stream. Endpoints should use SSE comments, not untyped data
+frames, for keepalives. Idle and protocol interruptions are exposed as typed
+`openai.StreamIdleTimeoutError` and `openai.StreamProtocolError` values.
 
 Streaming with tools:
 
@@ -326,9 +340,32 @@ os.WriteFile("sunset.png", result.Images[0].Data, 0644)
 
 Also supported: Google Imagen (`google.Image("imagen-4.0-generate-001")`) and Vertex AI (`vertex.Image(...)`).
 
+## Video Generation
+
+Google Veo video generation uses a long-running operation. GoAI starts the operation, polls until completion, and downloads the resulting video bytes.
+
+```go
+ctx := context.Background()
+model := google.Video("veo-3.1-generate-preview")
+
+result, err := goai.GenerateVideo(ctx, model,
+	goai.WithVideoPrompt("A paper plane taking flight at sunrise"),
+	goai.WithVideoAspectRatio("16:9"),
+	goai.WithVideoResolution("720p"),
+	goai.WithVideoDuration(8*time.Second),
+	goai.WithVideoAudio(true),
+)
+if err != nil {
+	log.Fatal(err)
+}
+os.WriteFile("plane.mp4", result.Video.Data, 0644)
+```
+
+Image-to-video is supported with `WithVideoImage`. First/last frames and image references are available through `WithVideoFrameImages` and `WithVideoInputReferences`.
+
 ## Observability
 
-Built-in [Langfuse](https://langfuse.com) and [OpenTelemetry](https://opentelemetry.io) integrations. Nine lifecycle hooks cover the full generation pipeline -- observability providers use them to trace LLM calls, tool executions, and multi-step agent loops:
+Built-in [Langfuse](https://langfuse.com) and [OpenTelemetry](https://opentelemetry.io) integrations. Ten lifecycle hooks cover the full generation pipeline -- observability providers use them to trace LLM calls, tool executions, panics, and multi-step agent loops:
 
 ```go
 import "github.com/zendev-sh/goai/observability/langfuse"
@@ -384,7 +421,7 @@ model := vertex.Chat("gemini-2.5-pro",
 model := bedrock.Chat("anthropic.claude-sonnet-4-6-v1:0")
 
 // Local (Ollama, vLLM)
-model := ollama.Chat("llama3", ollama.WithBaseURL("http://localhost:11434/v1"))
+model := ollama.Chat("llama3", ollama.WithBaseURL("http://localhost:11434"))
 
 result, err := goai.GenerateText(ctx, model, goai.WithPrompt("Hello"))
 ```
@@ -417,6 +454,8 @@ result, err := goai.GenerateText(ctx, model, goai.WithPrompt("Hello"))
 | Cloudflare | `@cf/meta/*`, `@cf/openai/gpt-oss-*`, `@cf/qwen/*`           | `@cf/baai/bge-*`                                           | -             | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_BASE_URL`, TokenSource                | Unit | `provider/cloudflare` |
 | FPT Cloud  | `Qwen3-*`, `Llama-*`, `gpt-oss-*`, `GLM-*`, `gemma-*`        | `bge-*`, `gte-*`, `multilingual-e5-*`                      | -             | `FPT_API_KEY`, `FPT_REGION` (`global`/`jp`), `FPT_BASE_URL`, TokenSource                           | Unit | `provider/fptcloud`   |
 | NVIDIA NIM | `nvidia/llama-*`, `nvidia/nemotron-*`                        | `nvidia/nv-embed-*`                                        | -             | `NVIDIA_API_KEY`, `NVIDIA_BASE_URL`, TokenSource                                                   | Full | `provider/nvidia`     |
+| llama.cpp  | local models                                                 | local models                                               | -             | Optional auth via `WithAPIKey` / `WithTokenSource`                                                 | Unit | `provider/llamacpp`   |
+| Requesty   | `provider/model` (e.g. `openai/gpt-4o-mini`)                 | -                                                          | -             | `REQUESTY_API_KEY`, `REQUESTY_BASE_URL`, TokenSource                                               | Unit | `provider/requesty`   |
 | Compat     | any OpenAI-compatible                                        | any                                                        | -             | configurable                                                                                       | Unit | `provider/compat`     |
 
 **E2E column**: "Full" = tested with real API calls. "Unit" = tested with mock HTTP servers (100% coverage).
@@ -647,13 +686,13 @@ Retry behavior: automatic exponential backoff on retryable HTTP errors (429/5xx,
 
 ## Provider-Defined Tools
 
-Providers expose built-in tools that the model can invoke server-side. GoAI supports 20 provider-defined tools across 5 providers:
+Providers expose built-in tools that the model can invoke server-side. GoAI supports 23 provider-defined tools across 5 providers:
 
 | Provider  | Tools                                                                                                                                                                  | Import               |
 | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| Anthropic | `Computer`, `Computer_20251124`, `Bash`, `TextEditor`, `TextEditor_20250728`, `WebSearch`, `WebSearch_20260209`, `WebFetch`, `CodeExecution`, `CodeExecution_20250825` | `provider/anthropic` |
+| Anthropic | `Computer`, `Computer_20251124`, `Bash`, `TextEditor`, `TextEditor_20250728`, `WebSearch`, `WebSearch_20260209`, `WebFetch`, `CodeExecution`, `CodeExecution_20250825`, `ToolSearchToolRegex`, `ToolSearchToolBM25` | `provider/anthropic` |
 | OpenAI    | `WebSearch`, `CodeInterpreter`, `FileSearch`, `ImageGeneration`                                                                                                        | `provider/openai`    |
-| Google    | `GoogleSearch`, `URLContext`, `CodeExecution`                                                                                                                          | `provider/google`    |
+| Google    | `GoogleSearch`, `URLContext`, `CodeExecution`, `ComputerUse`                                                                                                           | `provider/google`    |
 | xAI       | `WebSearch`, `XSearch`                                                                                                                                                 | `provider/xai`       |
 | Groq      | `BrowserSearch`                                                                                                                                                        | `provider/groq`      |
 
@@ -814,9 +853,9 @@ goai/                       # Core SDK
 │   ├── cohere/             # Cohere (Chat v2 + Embed)
 │   ├── minimax/            # MiniMax (Anthropic-compatible API)
 │   ├── compat/             # Generic OpenAI-compatible
-│   	└── ...                 # 13 more OpenAI-compatible providers
+│   	└── ...                 # 18 OpenAI-compatible provider implementation files
 ├── internal/
-│   ├── openaicompat/       # Shared codec for 13 OpenAI-compat providers
+│   ├── openaicompat/       # Shared codec for 18 OpenAI-compatible provider implementation files
 │   ├── gemini/             # Schema sanitization (Vertex, Google)
 │   ├── sse/                # SSE line parser
 │   └── httpc/              # HTTP utilities

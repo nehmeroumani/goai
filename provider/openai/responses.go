@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/zendev-sh/goai"
-	"github.com/zendev-sh/goai/internal/sse"
 	"github.com/zendev-sh/goai/provider"
 )
 
@@ -46,6 +45,9 @@ func buildResponsesRequest(params provider.GenerateParams, modelID string, strea
 
 	// Messages → Responses API "input" format.
 	body["input"] = convertToResponsesInput(params.Messages)
+	if auto, ok := params.ProviderOptions["goaiAutoPreviousResponseID"].(bool); ok && auto {
+		body["input"] = convertAutoContinuationInput(params.Messages)
+	}
 
 	if params.MaxOutputTokens > 0 {
 		body["max_output_tokens"] = params.MaxOutputTokens
@@ -168,9 +170,10 @@ func applyResponsesProviderOptions(body map[string]any, opts map[string]any) {
 
 	// Known options that should NOT be passed through to the body directly.
 	consumed := map[string]bool{
-		"structuredOutputs": true,
-		"strictJsonSchema":  true,
-		"useResponsesAPI":   true,
+		"structuredOutputs":          true,
+		"strictJsonSchema":           true,
+		"useResponsesAPI":            true,
+		"goaiAutoPreviousResponseID": true,
 	}
 
 	// Item 2: store from ProviderOptions (no longer hardcoded false).
@@ -335,17 +338,41 @@ func convertToResponsesInput(msgs []provider.Message) []map[string]any {
 
 		case provider.RoleAssistant:
 			var items []map[string]any
-			var textParts []string
+			var message map[string]any
+			var messageContent []map[string]any
+			appendText := func(text string) {
+				if text == "" {
+					return
+				}
+				if message == nil {
+					message = map[string]any{
+						"type":    "message",
+						"role":    "assistant",
+						"content": messageContent,
+					}
+					items = append(items, message)
+				}
+				messageContent = append(messageContent, map[string]any{
+					"type":        "output_text",
+					"text":        text,
+					"annotations": []any{},
+				})
+				message["content"] = messageContent
+			}
 
 			for _, part := range msg.Content {
 				switch part.Type {
 				case provider.PartText:
-					textParts = append(textParts, part.Text)
+					appendText(part.Text)
 				case provider.PartReasoning:
-					if part.Text != "" {
-						textParts = append(textParts, part.Text)
+					if item, ok := reasoningInputItem(part); ok {
+						message = nil
+						items = append(items, item)
+					} else if part.Text != "" {
+						appendText(part.Text)
 					}
 				case provider.PartToolCall:
+					message = nil
 					// Server-executed tool items (web_search_call,
 					// file_search_call, ...) round-trip verbatim so the model
 					// sees the same context across turns.
@@ -360,17 +387,6 @@ func convertToResponsesInput(msgs []provider.Message) []map[string]any {
 						"arguments": string(part.ToolInput),
 					})
 				}
-			}
-
-			if len(textParts) > 0 {
-				items = append([]map[string]any{{
-					"type": "message",
-					"role": "assistant",
-					"content": []map[string]any{{
-						"type": "output_text",
-						"text": strings.Join(textParts, "\n"),
-					}},
-				}}, items...)
 			}
 
 			result = append(result, items...)
@@ -393,8 +409,12 @@ func convertToResponsesInput(msgs []provider.Message) []map[string]any {
 					})
 				case provider.PartFile:
 					item := map[string]any{
-						"type":      "input_file",
-						"file_data": part.URL,
+						"type": "input_file",
+					}
+					if part.RemoteRef != nil {
+						item["file_id"] = part.RemoteRef.ID
+					} else {
+						item["file_data"] = part.URL
 					}
 					if part.Filename != "" {
 						item["filename"] = part.Filename
@@ -416,6 +436,39 @@ func convertToResponsesInput(msgs []provider.Message) []map[string]any {
 	}
 
 	return result
+}
+
+func convertAutoContinuationInput(msgs []provider.Message) []map[string]any {
+	var toolMessages []provider.Message
+	for i := len(msgs) - 1; i >= 0 && msgs[i].Role == provider.RoleTool; i-- {
+		toolMessages = append(toolMessages, msgs[i])
+	}
+	slices.Reverse(toolMessages)
+	return convertToResponsesInput(toolMessages)
+}
+
+func reasoningInputItem(part provider.Part) (map[string]any, bool) {
+	openAI, ok := part.ProviderOptions["openai"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	itemID, _ := openAI["itemId"].(string)
+	encryptedContent, _ := openAI["encryptedContent"].(string)
+	if itemID == "" {
+		return nil, false
+	}
+	item := map[string]any{"type": "reasoning"}
+	if itemID != "" {
+		item["id"] = itemID
+	}
+	if encryptedContent != "" {
+		item["encrypted_content"] = encryptedContent
+	}
+	item["summary"] = []map[string]any{}
+	if part.Text != "" {
+		item["summary"] = []map[string]any{{"type": "summary_text", "text": part.Text}}
+	}
+	return item, true
 }
 
 func partsToText(parts []provider.Part) string {
@@ -442,19 +495,61 @@ type responsesToolCall struct {
 // and use the canonical ID from output_item.added.
 type responsesReasoning struct {
 	canonicalID string
+	// lastSummary is the summary_index of the previous delta, or -1 before the
+	// first one. Segments are only delimited by that index, never by the text.
+	lastSummary int
 }
 
-// streamResponses parses SSE from the OpenAI Responses API.
-// Uses sse.Scanner.NextLine because the Responses API has event-typed SSE
-// (event: + data: pairs), unlike Chat Completions (data: only).
-func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provider.StreamChunk) {
-	defer close(out)
-	defer func() { _ = body.Close() }()
+func activeReasoningForEvent(active map[int]*responsesReasoning, current int, itemID string) (int, *responsesReasoning) {
+	for index, reasoning := range active {
+		if reasoning.canonicalID == itemID {
+			return index, reasoning
+		}
+	}
+	if reasoning, ok := active[current]; ok {
+		return current, reasoning
+	}
+	return -1, nil
+}
 
-	scanner := sse.NewScanner(body)
+func openAIReasoningPart(itemID, text, encryptedContent string) provider.Part {
+	openAI := map[string]any{"itemId": itemID}
+	if encryptedContent != "" {
+		openAI["encryptedContent"] = encryptedContent
+	}
+	return provider.Part{
+		Type:            provider.PartReasoning,
+		Text:            text,
+		ProviderOptions: map[string]any{"openai": openAI},
+	}
+}
+
+// summarySeparator delimits consecutive reasoning summaries. Their boundary
+// exists only in summary_index, so concatenating the deltas runs two summaries
+// together and merges the markdown at the seam.
+const summarySeparator = "\n\n"
+
+// streamResponses parses SSE from the OpenAI Responses API with the default
+// event-level idle timeout.
+func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provider.StreamChunk) {
+	streamResponsesWithConfig(ctx, body, out, defaultResponsesStreamConfig())
+}
+
+func streamResponsesWithConfig(
+	ctx context.Context,
+	body io.ReadCloser,
+	out chan<- provider.StreamChunk,
+	config responsesStreamConfig,
+) {
+	defer close(out)
+
+	reader := newResponsesEventReader(ctx, body)
+	defer reader.close()
+
+	idleTimer := newResponsesIdleTimer(config.idleTimeout)
+	defer idleTimer.stop()
 
 	var usage provider.Usage
-	var eventType string
 	var hasFunctionCall bool
 
 	activeTools := make(map[int]*responsesToolCall)
@@ -462,68 +557,135 @@ func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provide
 	currentReasoningIdx := -1
 
 	for {
-		line, ok := scanner.NextLine()
-		if !ok {
-			break
-		}
-
-		if strings.HasPrefix(line, "event: ") {
-			eventType = strings.TrimPrefix(line, "event: ")
-			continue
-		}
-
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		data := strings.TrimPrefix(line, "data: ")
-
-		if data == "[DONE]" {
-			if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkFinish, Usage: usage}) {
+		var read responsesReadResult
+		select {
+		case <-ctx.Done():
+			trySendResponsesError(ctx, out, ctx.Err())
+			return
+		case <-idleTimer.c:
+			if err := ctx.Err(); err != nil {
+				trySendResponsesError(ctx, out, err)
 				return
 			}
+			err := &StreamIdleTimeoutError{
+				Provider: responsesStreamProvider,
+				API:      responsesStreamAPI,
+				Idle:     config.idleTimeout,
+			}
+			trySendResponsesError(ctx, out, err)
+			return
+		case read = <-reader.results:
+		}
+
+		if err := ctx.Err(); err != nil {
+			trySendResponsesError(ctx, out, err)
+			return
+		}
+		if read.err != nil {
+			trySendResponsesError(ctx, out, newStreamProtocolError("", "stream read failed", read.err))
+			return
+		}
+		if read.eof {
+			trySendResponsesError(ctx, out, newStreamProtocolError("", "stream ended before a terminal event", nil))
+			return
+		}
+
+		data := string(read.event.Data)
+
+		if data == "[DONE]" {
+			if config.allowDone {
+				provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkFinish, Usage: usage})
+				return
+			}
+			trySendResponsesError(ctx, out, newStreamProtocolError(read.event.Type, "stream ended with [DONE] before a terminal event", nil))
+			return
+		}
+		eventType, err := responsesEventType(read.event)
+		if err != nil {
+			trySendResponsesError(ctx, out, err)
 			return
 		}
 
 		switch eventType {
 		case "response.output_text.delta":
 			var ev struct {
-				Delta string `json:"delta"`
+				Delta *string `json:"delta"`
 			}
-			if json.Unmarshal([]byte(data), &ev) == nil && ev.Delta != "" {
-				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkText, Text: ev.Delta}) {
+			if err := decodeResponsesEvent(eventType, read.event.Data, &ev); err != nil {
+				trySendResponsesError(ctx, out, err)
+				return
+			}
+			if ev.Delta == nil {
+				trySendResponsesError(ctx, out, missingResponsesEventField(eventType, "delta"))
+				return
+			}
+			if *ev.Delta != "" {
+				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkText, Text: *ev.Delta}) {
 					return
 				}
 			}
 
 		case "response.refusal.delta":
 			var ev struct {
-				Delta string `json:"delta"`
+				Delta *string `json:"delta"`
 			}
-			if json.Unmarshal([]byte(data), &ev) == nil && ev.Delta != "" {
-				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkText, Text: ev.Delta}) {
+			if err := decodeResponsesEvent(eventType, read.event.Data, &ev); err != nil {
+				trySendResponsesError(ctx, out, err)
+				return
+			}
+			if ev.Delta == nil {
+				trySendResponsesError(ctx, out, missingResponsesEventField(eventType, "delta"))
+				return
+			}
+			if *ev.Delta != "" {
+				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkText, Text: *ev.Delta}) {
 					return
 				}
 			}
 
 		case "response.reasoning_summary_text.delta":
 			var ev struct {
-				ItemID       string `json:"item_id"`
-				SummaryIndex int    `json:"summary_index"`
-				Delta        string `json:"delta"`
+				ItemID       *string `json:"item_id"`
+				SummaryIndex *int    `json:"summary_index"`
+				Delta        *string `json:"delta"`
 			}
-			if json.Unmarshal([]byte(data), &ev) == nil && ev.Delta != "" {
+			// Preseeding keeps omitted legacy fields at their zero values while
+			// still letting json.Unmarshal expose an explicit null as nil.
+			ev.ItemID = new(string)
+			ev.SummaryIndex = new(int)
+			if err := decodeResponsesEvent(eventType, read.event.Data, &ev); err != nil {
+				trySendResponsesError(ctx, out, err)
+				return
+			}
+			if ev.ItemID == nil {
+				trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "item_id"))
+				return
+			}
+			if ev.SummaryIndex == nil {
+				trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "summary_index"))
+				return
+			}
+			if ev.Delta == nil {
+				trySendResponsesError(ctx, out, missingResponsesEventField(eventType, "delta"))
+				return
+			}
+			if *ev.Delta != "" {
 				// Use canonical ID from activeReasoning if available.
-				id := ev.ItemID
-				if currentReasoningIdx >= 0 {
-					if ar := activeReasoning[currentReasoningIdx]; ar != nil {
-						id = ar.canonicalID
+				id, text := *ev.ItemID, *ev.Delta
+				if idx, ar := activeReasoningForEvent(activeReasoning, currentReasoningIdx, *ev.ItemID); idx >= 0 {
+					id = ar.canonicalID
+					// A new summary_index opens a separate summary: carry the
+					// boundary in the text, since the deltas never bring it.
+					if ar.lastSummary >= 0 && *ev.SummaryIndex != ar.lastSummary {
+						text = summarySeparator + text
 					}
+					ar.lastSummary = *ev.SummaryIndex
 				}
 				if !provider.TrySend(ctx, out, provider.StreamChunk{
 					Type: provider.ChunkReasoning,
-					Text: ev.Delta,
+					Text: text,
 					Metadata: map[string]any{
-						"reasoningId": fmt.Sprintf("%s:%d", id, ev.SummaryIndex),
+						"reasoningId": fmt.Sprintf("%s:%d", id, *ev.SummaryIndex),
 					},
 				}) {
 					return
@@ -531,70 +693,160 @@ func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provide
 			}
 
 		case "response.reasoning_summary_part.added":
-			// New summary segment within same reasoning item -- no-op for chunk emission
-			// but tracked for canonical ID resolution.
+			var ev struct {
+				ItemID         *string `json:"item_id"`
+				OutputIndex    *int    `json:"output_index"`
+				SummaryIndex   *int    `json:"summary_index"`
+				SequenceNumber *int    `json:"sequence_number"`
+				Part           *struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"part"`
+			}
+			ev.ItemID = new(string)
+			ev.OutputIndex = new(int)
+			ev.SummaryIndex = new(int)
+			ev.SequenceNumber = new(int)
+			ev.Part = &struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}{}
+			if err := decodeResponsesEvent(eventType, read.event.Data, &ev); err != nil {
+				trySendResponsesError(ctx, out, err)
+				return
+			}
+			if ev.ItemID == nil {
+				trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "item_id"))
+				return
+			}
+			if ev.OutputIndex == nil {
+				trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "output_index"))
+				return
+			}
+			if ev.SummaryIndex == nil {
+				trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "summary_index"))
+				return
+			}
+			if ev.SequenceNumber == nil {
+				trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "sequence_number"))
+				return
+			}
+			if ev.Part == nil {
+				trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "part"))
+				return
+			}
+			// New summary segments do not emit chunks, but decoding validates the
+			// recognized event before it counts as stream activity.
 
 		case "response.output_item.added":
 			var ev struct {
-				OutputIndex int `json:"output_index"`
-				Item        struct {
-					Type   string `json:"type"`
-					ID     string `json:"id"`
-					CallID string `json:"call_id"`
-					Name   string `json:"name"`
+				OutputIndex *int `json:"output_index"`
+				Item        *struct {
+					Type   *string `json:"type"`
+					ID     string  `json:"id"`
+					CallID string  `json:"call_id"`
+					Name   string  `json:"name"`
 				} `json:"item"`
 			}
-			if json.Unmarshal([]byte(data), &ev) == nil {
-				switch ev.Item.Type {
-				case "function_call":
-					hasFunctionCall = true
-					activeTools[ev.OutputIndex] = &responsesToolCall{
-						id:   ev.Item.CallID,
-						name: ev.Item.Name,
-					}
-					if !provider.TrySend(ctx, out, provider.StreamChunk{
-						Type:       provider.ChunkToolCallStreamStart,
-						ToolCallID: ev.Item.CallID,
-						ToolName:   ev.Item.Name,
-					}) {
-						return
-					}
-				case "reasoning":
-					activeReasoning[ev.OutputIndex] = &responsesReasoning{
-						canonicalID: ev.Item.ID,
-					}
-					currentReasoningIdx = ev.OutputIndex
+			ev.OutputIndex = new(int)
+			if err := decodeResponsesEvent(eventType, read.event.Data, &ev); err != nil {
+				trySendResponsesError(ctx, out, err)
+				return
+			}
+			if ev.OutputIndex == nil {
+				trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "output_index"))
+				return
+			}
+			if ev.Item == nil {
+				trySendResponsesError(ctx, out, missingResponsesEventField(eventType, "item"))
+				return
+			}
+			if ev.Item.Type == nil || *ev.Item.Type == "" {
+				trySendResponsesError(ctx, out, missingResponsesEventField(eventType, "item.type"))
+				return
+			}
+			switch *ev.Item.Type {
+			case "function_call":
+				hasFunctionCall = true
+				activeTools[*ev.OutputIndex] = &responsesToolCall{
+					id:   ev.Item.CallID,
+					name: ev.Item.Name,
 				}
+				if !provider.TrySend(ctx, out, provider.StreamChunk{
+					Type:       provider.ChunkToolCallStreamStart,
+					ToolCallID: ev.Item.CallID,
+					ToolName:   ev.Item.Name,
+				}) {
+					return
+				}
+			case "reasoning":
+				activeReasoning[*ev.OutputIndex] = &responsesReasoning{
+					canonicalID: ev.Item.ID,
+					lastSummary: -1,
+				}
+				currentReasoningIdx = *ev.OutputIndex
 			}
 
 		case "response.function_call_arguments.delta":
 			var ev struct {
-				OutputIndex int    `json:"output_index"`
-				Delta       string `json:"delta"`
+				OutputIndex *int    `json:"output_index"`
+				Delta       *string `json:"delta"`
 			}
-			if json.Unmarshal([]byte(data), &ev) == nil && ev.Delta != "" {
-				active := activeTools[ev.OutputIndex]
+			ev.OutputIndex = new(int)
+			if err := decodeResponsesEvent(eventType, read.event.Data, &ev); err != nil {
+				trySendResponsesError(ctx, out, err)
+				return
+			}
+			if ev.OutputIndex == nil {
+				trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "output_index"))
+				return
+			}
+			if ev.Delta == nil {
+				trySendResponsesError(ctx, out, missingResponsesEventField(eventType, "delta"))
+				return
+			}
+			if *ev.Delta != "" {
+				active := activeTools[*ev.OutputIndex]
 				if active == nil {
 					active = &responsesToolCall{}
-					activeTools[ev.OutputIndex] = active
+					activeTools[*ev.OutputIndex] = active
 				}
-				active.args.WriteString(ev.Delta)
+				active.args.WriteString(*ev.Delta)
 
 				if !provider.TrySend(ctx, out, provider.StreamChunk{
 					Type:       provider.ChunkToolCallDelta,
 					ToolCallID: active.id,
 					ToolName:   active.name,
-					ToolInput:  ev.Delta,
+					ToolInput:  *ev.Delta,
 				}) {
 					return
 				}
 
-				if accumulated := active.args.String(); json.Valid([]byte(accumulated)) {
+				// The call is resolved on function_call_arguments.done. Finalizing
+				// as soon as the buffer parses assumes no further delta arrives,
+				// and any that does becomes a second, bogus call.
+			}
+
+		case "response.function_call_arguments.done":
+			var ev struct {
+				OutputIndex *int `json:"output_index"`
+			}
+			ev.OutputIndex = new(int)
+			if err := decodeResponsesEvent(eventType, read.event.Data, &ev); err != nil {
+				trySendResponsesError(ctx, out, err)
+				return
+			}
+			if ev.OutputIndex == nil {
+				trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "output_index"))
+				return
+			}
+			if active := activeTools[*ev.OutputIndex]; active != nil {
+				if remaining := active.args.String(); remaining != "" {
 					if !provider.TrySend(ctx, out, provider.StreamChunk{
 						Type:       provider.ChunkToolCall,
 						ToolCallID: active.id,
 						ToolName:   active.name,
-						ToolInput:  accumulated,
+						ToolInput:  remaining,
 					}) {
 						return
 					}
@@ -602,12 +854,124 @@ func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provide
 				}
 			}
 
-		case "response.function_call_arguments.done":
+		case "response.output_item.done":
 			var ev struct {
-				OutputIndex int `json:"output_index"`
+				OutputIndex *int            `json:"output_index"`
+				Item        json.RawMessage `json:"item"`
 			}
-			if json.Unmarshal([]byte(data), &ev) == nil {
-				if active := activeTools[ev.OutputIndex]; active != nil {
+			ev.OutputIndex = new(int)
+			if err := decodeResponsesEvent(eventType, read.event.Data, &ev); err != nil {
+				trySendResponsesError(ctx, out, err)
+				return
+			}
+			if ev.OutputIndex == nil {
+				trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "output_index"))
+				return
+			}
+			var itemHead *struct {
+				Type *string `json:"type"`
+			}
+			if len(ev.Item) > 0 {
+				if err := decodeResponsesEvent(eventType, ev.Item, &itemHead); err != nil {
+					trySendResponsesError(ctx, out, err)
+					return
+				}
+				if itemHead == nil {
+					trySendResponsesError(ctx, out, newStreamProtocolError(eventType, "event payload has null item", nil))
+					return
+				}
+				if itemHead.Type == nil || *itemHead.Type == "" {
+					trySendResponsesError(ctx, out, missingResponsesEventField(eventType, "item.type"))
+					return
+				}
+			}
+			itemType := ""
+			if itemHead != nil {
+				itemType = *itemHead.Type
+			}
+			switch itemType {
+			case "reasoning":
+				var item struct {
+					ID               string `json:"id"`
+					EncryptedContent string `json:"encrypted_content"`
+				}
+				if err := decodeResponsesEvent(eventType, ev.Item, &item); err != nil {
+					trySendResponsesError(ctx, out, err)
+					return
+				}
+				if active := activeReasoning[*ev.OutputIndex]; active != nil && item.EncryptedContent != "" {
+					id := active.canonicalID
+					if id == "" {
+						id = item.ID
+					}
+					index := active.lastSummary
+					if index < 0 {
+						index = 0
+					}
+					if !provider.TrySend(ctx, out, provider.StreamChunk{
+						Type: provider.ChunkReasoning,
+						Metadata: map[string]any{
+							"reasoningId": fmt.Sprintf("%s:%d", id, index),
+							"openai": map[string]any{
+								"itemId":           id,
+								"encryptedContent": item.EncryptedContent,
+							},
+						},
+					}) {
+						return
+					}
+				}
+				delete(activeReasoning, *ev.OutputIndex)
+				if currentReasoningIdx == *ev.OutputIndex {
+					currentReasoningIdx = -1
+				}
+			default:
+				if isServerExecutedItem(itemType) {
+					// Capture the full server-executed item payload and
+					// emit a ChunkToolCall so it round-trips into the
+					// assistant turn via ToolCall.Metadata.
+					var itemIdentity struct {
+						ID   *string `json:"id"`
+						Name *string `json:"name"`
+					}
+					itemIdentity.ID = new(string)
+					itemIdentity.Name = new(string)
+					if err := decodeResponsesEvent(eventType, ev.Item, &itemIdentity); err != nil {
+						trySendResponsesError(ctx, out, err)
+						return
+					}
+					if itemIdentity.ID == nil {
+						trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "item.id"))
+						return
+					}
+					if itemIdentity.Name == nil {
+						trySendResponsesError(ctx, out, nullResponsesEventField(eventType, "item.name"))
+						return
+					}
+					var rawItem map[string]any
+					if err := decodeResponsesEvent(eventType, ev.Item, &rawItem); err != nil {
+						trySendResponsesError(ctx, out, err)
+						return
+					}
+					id := *itemIdentity.ID
+					name := *itemIdentity.Name
+					if name == "" {
+						name = itemType
+					}
+					if !provider.TrySend(ctx, out, provider.StreamChunk{
+						Type:       provider.ChunkToolCall,
+						ToolCallID: id,
+						ToolName:   name,
+						Metadata: map[string]any{
+							"providerExecuted": true,
+							"rawItem":          rawItem,
+						},
+					}) {
+						return
+					}
+				} else if active := activeTools[*ev.OutputIndex]; active != nil {
+					// Safety net for an item closed without its arguments.done.
+					// The normal path resets the buffer, so this stays empty.
 					if remaining := active.args.String(); remaining != "" {
 						if !provider.TrySend(ctx, out, provider.StreamChunk{
 							Type:       provider.ChunkToolCall,
@@ -620,64 +984,20 @@ func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provide
 						active.args.Reset()
 					}
 				}
-			}
-
-		case "response.output_item.done":
-			var ev struct {
-				OutputIndex int             `json:"output_index"`
-				Item        json.RawMessage `json:"item"`
-			}
-			if json.Unmarshal([]byte(data), &ev) == nil {
-				var itemHead struct {
-					Type string `json:"type"`
-				}
-				_ = json.Unmarshal(ev.Item, &itemHead)
-				switch itemHead.Type {
-				case "reasoning":
-					delete(activeReasoning, ev.OutputIndex)
-					if currentReasoningIdx == ev.OutputIndex {
-						currentReasoningIdx = -1
-					}
-				default:
-					if isServerExecutedItem(itemHead.Type) {
-						// Capture the full server-executed item payload and
-						// emit a ChunkToolCall so it round-trips into the
-						// assistant turn via ToolCall.Metadata.
-						var raw map[string]any
-						if err := json.Unmarshal(ev.Item, &raw); err == nil {
-							id, _ := raw["id"].(string)
-							name, _ := raw["name"].(string)
-							if name == "" {
-								name = itemHead.Type
-							}
-							if !provider.TrySend(ctx, out, provider.StreamChunk{
-								Type:       provider.ChunkToolCall,
-								ToolCallID: id,
-								ToolName:   name,
-								Metadata: map[string]any{
-									"providerExecuted": true,
-									"rawItem":          raw,
-								},
-							}) {
-								return
-							}
-						}
-					}
-					delete(activeTools, ev.OutputIndex)
-				}
+				delete(activeTools, *ev.OutputIndex)
 			}
 
 		case "response.completed", "response.incomplete":
 			var ev struct {
-				Response struct {
-					ID    string `json:"id"`
-					Model string `json:"model"`
+				Response *struct {
+					ID                string `json:"id"`
+					Model             string `json:"model"`
 					IncompleteDetails *struct {
 						Reason string `json:"reason"`
 					} `json:"incomplete_details"`
-					Usage struct {
-						InputTokens  int `json:"input_tokens"`
-						OutputTokens int `json:"output_tokens"`
+					Usage *struct {
+						InputTokens         *int `json:"input_tokens"`
+						OutputTokens        *int `json:"output_tokens"`
 						OutputTokensDetails *struct {
 							ReasoningTokens int `json:"reasoning_tokens"`
 						} `json:"output_tokens_details"`
@@ -687,15 +1007,27 @@ func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provide
 					} `json:"usage"`
 				} `json:"response"`
 			}
-			if json.Unmarshal([]byte(data), &ev) == nil {
-				usage.InputTokens = ev.Response.Usage.InputTokens
-				usage.OutputTokens = ev.Response.Usage.OutputTokens
-				usage.TotalTokens = ev.Response.Usage.InputTokens + ev.Response.Usage.OutputTokens
-				if ev.Response.Usage.OutputTokensDetails != nil {
-					usage.ReasoningTokens = ev.Response.Usage.OutputTokensDetails.ReasoningTokens
+			if err := json.Unmarshal(read.event.Data, &ev); err != nil {
+				trySendResponsesError(ctx, out, newStreamProtocolError(eventType, "malformed terminal event", err))
+				return
+			}
+			if ev.Response == nil {
+				trySendResponsesError(ctx, out, newStreamProtocolError(eventType, "terminal event is missing response", nil))
+				return
+			}
+			if responseUsage := ev.Response.Usage; responseUsage != nil {
+				if responseUsage.InputTokens == nil || responseUsage.OutputTokens == nil {
+					trySendResponsesError(ctx, out, newStreamProtocolError(eventType, "terminal event has incomplete response usage", nil))
+					return
 				}
-				if ev.Response.Usage.InputTokensDetails != nil {
-					usage.CacheReadTokens = ev.Response.Usage.InputTokensDetails.CachedTokens
+				usage.InputTokens = *responseUsage.InputTokens
+				usage.OutputTokens = *responseUsage.OutputTokens
+				usage.TotalTokens = *responseUsage.InputTokens + *responseUsage.OutputTokens
+				if responseUsage.OutputTokensDetails != nil {
+					usage.ReasoningTokens = responseUsage.OutputTokensDetails.ReasoningTokens
+				}
+				if responseUsage.InputTokensDetails != nil {
+					usage.CacheReadTokens = responseUsage.InputTokensDetails.CachedTokens
 				}
 				usage.InputTokens -= usage.CacheReadTokens
 			}
@@ -736,17 +1068,23 @@ func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provide
 
 		case "response.failed":
 			var ev struct {
-				Response struct {
+				Response *struct {
 					Error struct {
 						Message string `json:"message"`
 						Code    string `json:"code"`
 					} `json:"error"`
 				} `json:"response"`
 			}
-			if json.Unmarshal([]byte(data), &ev) == nil {
-				if !provider.TrySend(ctx, out, responsesStreamError(data, ev.Response.Error.Message, ev.Response.Error.Code, "response failed")) {
-					return
-				}
+			if err := json.Unmarshal(read.event.Data, &ev); err != nil {
+				trySendResponsesError(ctx, out, newStreamProtocolError(eventType, "malformed terminal event", err))
+				return
+			}
+			if ev.Response == nil {
+				trySendResponsesError(ctx, out, newStreamProtocolError(eventType, "terminal event is missing response", nil))
+				return
+			}
+			if !provider.TrySend(ctx, out, responsesStreamError(data, ev.Response.Error.Message, ev.Response.Error.Code, "response failed")) {
+				return
 			}
 			return
 
@@ -760,30 +1098,33 @@ func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provide
 					Code    string `json:"code"`
 				} `json:"error"`
 			}
-			if json.Unmarshal([]byte(data), &ev) == nil {
-				// Prefer the nested error fields when present, but fall back to
-				// the flat fields per-field so a partial nested object (e.g. a
-				// nested code with no nested message) does not clobber a flat
-				// message/code with an empty string.
-				msg, code := ev.Message, ev.Code
-				if ev.Error != nil {
-					msg = cmp.Or(ev.Error.Message, msg)
-					code = cmp.Or(ev.Error.Code, code)
-				}
-				if !provider.TrySend(ctx, out, responsesStreamError(data, msg, code, "stream error")) {
-					return
-				}
+			if err := json.Unmarshal(read.event.Data, &ev); err != nil {
+				trySendResponsesError(ctx, out, newStreamProtocolError(eventType, "malformed terminal event", err))
+				return
+			}
+			// Prefer the nested error fields when present, but fall back to
+			// the flat fields per-field so a partial nested object (e.g. a
+			// nested code with no nested message) does not clobber a flat
+			// message/code with an empty string.
+			msg, code := ev.Message, ev.Code
+			if ev.Error != nil {
+				msg = cmp.Or(ev.Error.Message, msg)
+				code = cmp.Or(ev.Error.Code, code)
+			}
+			if msg == "" && code == "" {
+				trySendResponsesError(ctx, out, newStreamProtocolError(eventType, "terminal error event is missing error details", nil))
+				return
+			}
+			if !provider.TrySend(ctx, out, responsesStreamError(data, msg, code, "stream error")) {
+				return
 			}
 			return
 		}
 
-		eventType = ""
-	}
-
-	if err := scanner.Err(); err != nil {
-		if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkError, Error: fmt.Errorf("reading stream: %w", err)}) {
-			return
-		}
+		// Projection may block on downstream backpressure. Restart the provider
+		// idle window only after projection completes so consumer latency cannot
+		// be misreported as provider inactivity.
+		idleTimer.reset(config.idleTimeout)
 	}
 }
 
@@ -837,10 +1178,10 @@ type responsesResult struct {
 		Type    string `json:"type"`
 		Role    string `json:"role"`
 		Content []struct {
-			Type        string              `json:"type"`
-			Text        string              `json:"text"`
+			Type        string                `json:"type"`
+			Text        string                `json:"text"`
 			Annotations []responsesAnnotation `json:"annotations,omitempty"`
-			Logprobs    *json.RawMessage    `json:"logprobs,omitempty"`
+			Logprobs    *json.RawMessage      `json:"logprobs,omitempty"`
 		} `json:"content,omitempty"`
 
 		// function_call fields
@@ -849,16 +1190,17 @@ type responsesResult struct {
 		Arguments string `json:"arguments,omitempty"`
 
 		// reasoning fields
-		ID      string `json:"id,omitempty"`
-		Summary []struct {
+		ID               string `json:"id,omitempty"`
+		EncryptedContent string `json:"encrypted_content,omitempty"`
+		Summary          []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"summary,omitempty"`
 	} `json:"output"`
 
 	Usage *struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens         int `json:"input_tokens"`
+		OutputTokens        int `json:"output_tokens"`
 		OutputTokensDetails *struct {
 			ReasoningTokens int `json:"reasoning_tokens"`
 		} `json:"output_tokens_details,omitempty"`
@@ -920,6 +1262,7 @@ func parseResponsesResult(body []byte) (*provider.GenerateResult, error) {
 	// Extract text, tool calls, sources, logprobs from output.
 	var textParts []string
 	var reasoningParts []string
+	var reasoningItems []provider.Part
 	var hasFunctionCall bool
 	providerMeta := map[string]any{}
 	var allLogprobs []any
@@ -959,15 +1302,20 @@ func parseResponsesResult(body []byte) (*provider.GenerateResult, error) {
 				Input: json.RawMessage(item.Arguments),
 			})
 		case "reasoning":
+			var itemText []string
 			for _, s := range item.Summary {
 				if s.Text != "" {
 					reasoningParts = append(reasoningParts, s.Text)
+					itemText = append(itemText, s.Text)
 					reasoning, _ := providerMeta["reasoning"].([]map[string]any)
 					providerMeta["reasoning"] = append(reasoning, map[string]any{
 						"type": s.Type,
 						"text": s.Text,
 					})
 				}
+			}
+			if len(itemText) > 0 || item.EncryptedContent != "" {
+				reasoningItems = append(reasoningItems, openAIReasoningPart(item.ID, strings.Join(itemText, summarySeparator), item.EncryptedContent))
 			}
 		default:
 			if isServerExecutedItem(item.Type) && i < len(rawOutput.Output) {
@@ -992,7 +1340,10 @@ func parseResponsesResult(body []byte) (*provider.GenerateResult, error) {
 	}
 
 	result.Text = strings.Join(textParts, "")
-	result.Reasoning = strings.Join(reasoningParts, "")
+	// Each entry is a distinct summary; joining them bare merges the markdown
+	// at the seam, same as in the streaming path.
+	result.Reasoning = strings.Join(reasoningParts, summarySeparator)
+	result.ReasoningParts = reasoningItems
 
 	if len(allLogprobs) > 0 {
 		providerMeta["logprobs"] = allLogprobs

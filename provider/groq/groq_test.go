@@ -348,6 +348,29 @@ func TestChat_EnvVarNotOverrideExplicit(t *testing.T) {
 	}
 }
 
+func TestChat_MaxCompletionTokens(t *testing.T) {
+	var gotBody map[string]any
+	tr := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		return okResponse(), nil
+	})
+	m := Chat("llama-3.3-70b-versatile", WithAPIKey("k"), WithHTTPClient(&http.Client{Transport: tr}))
+	_, err := m.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages:        []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		MaxOutputTokens: 128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotBody["max_completion_tokens"] != float64(128) {
+		t.Errorf("max_completion_tokens = %v, want 128", gotBody["max_completion_tokens"])
+	}
+	if _, ok := gotBody["max_tokens"]; ok {
+		t.Error("deprecated max_tokens should not be present")
+	}
+}
+
 func TestChat_PromptCachingIgnored(t *testing.T) {
 	// DoGenerate with JSON server
 	genServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -386,5 +409,42 @@ func TestChat_PromptCachingIgnored(t *testing.T) {
 		t.Fatalf("DoStream unexpected error: %v", err)
 	}
 	for range streamResult.Stream {
+	}
+}
+
+// Item 47: groq opts into IncludeReasoningContent, so an assistant message
+// carrying a reasoning part must serialize reasoning_content on the outgoing
+// request body (DeepSeek-style APIs 400 if it is missing).
+func TestChat_RoundTripsReasoningContent(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("llama-3.3-70b-versatile", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{
+			Role: provider.RoleAssistant,
+			Content: []provider.Part{
+				{Type: provider.PartReasoning, Text: "let me think"},
+				{Type: provider.PartText, Text: "answer"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, ok := gotBody["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("messages = %v", gotBody["messages"])
+	}
+	assistant := msgs[0].(map[string]any)
+	if assistant["reasoning_content"] != "let me think" {
+		t.Errorf("reasoning_content = %v, want 'let me think'", assistant["reasoning_content"])
 	}
 }

@@ -346,6 +346,76 @@ func TestDoJSONRequest_ContextCancellation(t *testing.T) {
 	}
 }
 
+// authCapture returns the Authorization header observed by the server.
+func authCapture(t *testing.T, cfg RequestConfig) string {
+	t.Helper()
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	cfg.URL = srv.URL
+	resp, err := DoJSONRequest(t.Context(), cfg, stubErrorParser)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+	return got
+}
+
+func TestDoJSONRequest_TokenOverridesCfgHeaders(t *testing.T) {
+	got := authCapture(t, RequestConfig{
+		Token:   "real-token",
+		Headers: map[string]string{"Authorization": "Bearer forged"},
+		Body:    map[string]any{},
+	})
+	if want := "Bearer real-token"; got != want {
+		t.Errorf("Authorization = %q, want %q (cfg.Headers must not override token)", got, want)
+	}
+}
+
+func TestDoJSONRequest_TokenOverridesReqHeaders(t *testing.T) {
+	got := authCapture(t, RequestConfig{
+		Token: "real-token",
+		Body: map[string]any{
+			"_headers": map[string]string{"Authorization": "Bearer forged"},
+		},
+	})
+	if want := "Bearer real-token"; got != want {
+		t.Errorf("Authorization = %q, want %q (_headers must not override token)", got, want)
+	}
+}
+
+func TestDoJSONRequest_OversizedErrorBodyTruncated(t *testing.T) {
+	big := make([]byte, 4<<20) // 4 MiB, well over the 1 MiB limit
+	for i := range big {
+		big[i] = 'x'
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write(big)
+	}))
+	defer srv.Close()
+
+	_, err := DoJSONRequest(t.Context(), RequestConfig{
+		URL:        srv.URL,
+		Token:      "tok",
+		Body:       map[string]any{},
+		ProviderID: "test",
+	}, stubErrorParser)
+	if err == nil {
+		t.Fatal("expected error for 502 response")
+	}
+	// The truncated error body must be at most the 1 MiB read limit plus the
+	// fixed "test: HTTP 502: " prefix.
+	if len(err.Error()) > (1<<20)+len("test: HTTP 502: ") {
+		t.Errorf("error body not truncated: len(err.Error()) = %d", len(err.Error()))
+	}
+}
+
 // --- helpers ---
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

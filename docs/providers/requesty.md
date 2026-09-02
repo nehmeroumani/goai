@@ -60,7 +60,7 @@ fmt.Println(result.Text)
 
 ## Notes
 
-- Supports image inputs (depends on the underlying model).
+- Declares text-only chat capability; image input support is not exposed by this provider.
 - Sends optional `HTTP-Referer` and `X-Title` analytics headers, as documented by Requesty.
 - Usage reporting is enabled by default (`usage: {include: true}` in request body).
 - Environment variable `REQUESTY_BASE_URL` can override the default endpoint (for example, the EU endpoint `https://router.eu.requesty.ai/v1`).

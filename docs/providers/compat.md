@@ -85,10 +85,12 @@ model := compat.Chat("my-model",
 | `WithHeaders(h)` | `map[string]string` | Set additional HTTP headers |
 | `WithHTTPClient(c)` | `*http.Client` | Set a custom `*http.Client` |
 | `WithProviderID(id)` | `string` | Set a custom provider identifier |
+| `WithMaxCompletionTokens(use)` | `bool` | Explicitly select `max_completion_tokens` (`true`) or `max_tokens` (`false`) when model IDs are opaque |
 
 ## Notes
 
 - Unlike other providers, `compat` has no default base URL. Calls will fail with a clear error message if `WithBaseURL` is not provided.
 - When no API key or token source is configured, the Authorization header is omitted entirely. This is useful for local servers that do not require authentication.
 - Max embedding batch size: 2048 values per call.
-- The `compat` provider is used internally by the `ollama` and `vllm` providers.
+- The `vllm` provider delegates to the shared compatibility implementation; Ollama uses its native `/api/chat` and `/api/embed` implementation.
+- **File upload**: The `compat` provider does not support native file upload. When a `Part.RemoteRef` or `Part.URL` is provided with a recognized media type, it maps to native OpenAI shapes: PDFs become a `file` part, audio becomes an `input_audio` part, and unrecognized types are omitted. This ensures the same code path works across all providers.

@@ -64,9 +64,9 @@ jobs:
           wc -l .zenflow/diff.patch
 
       - name: Run zenflow review
-         env:
-           ZENFLOW_MODEL: fptcloud/Qwen3.6-27B
-           FPT_API_KEY: ${{ secrets.FPT_API_KEY }}
+        env:
+          ZENFLOW_MODEL: fptcloud/Qwen3.6-27B
+          FPT_API_KEY: ${{ secrets.FPT_API_KEY }}
         run: |
           # --sandbox grants the safe tool set (read, write, grep, glob)
           # without bash. Without an explicit permission flag zenflow

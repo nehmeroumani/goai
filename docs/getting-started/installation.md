@@ -5,7 +5,7 @@ head:
   - - script
     - type: application/ld+json
     - |
-      {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is GoAI SDK?","acceptedAnswer":{"@type":"Answer","text":"GoAI SDK is an open-source Go library that provides one unified API for 25+ LLM providers including OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI, Groq, Mistral, Ollama and more. Inspired by the Vercel AI SDK, designed idiomatically for Go with generics and interfaces."}},{"@type":"Question","name":"How do I install GoAI SDK?","acceptedAnswer":{"@type":"Answer","text":"Run: go get github.com/zendev-sh/goai@latest. Requires Go 1.25 or later. API keys are auto-resolved from environment variables."}},{"@type":"Question","name":"How does GoAI SDK compare to LangChainGo?","acceptedAnswer":{"@type":"Answer","text":"GoAI SDK supports 25+ providers vs LangChainGo's fewer native integrations, uses Go generics for type-safe structured output (GenerateObject[T]), and has minimal dependencies (no heavy transitive deps). LangChainGo is a Python LangChain port; GoAI is designed from scratch for Go."}},{"@type":"Question","name":"Does GoAI SDK support streaming?","acceptedAnswer":{"@type":"Answer","text":"Yes. GoAI SDK supports real-time text streaming via StreamText and partial object streaming via StreamObject[T] using Go channels."}},{"@type":"Question","name":"Does GoAI SDK support tool calling?","acceptedAnswer":{"@type":"Answer","text":"Yes. Define tools with Execute handlers, set MaxSteps, and GoAI handles the auto tool loop automatically. Supports 20 provider-defined tools including web search, code execution, computer use, and file search."}}]}
+      {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is GoAI SDK?","acceptedAnswer":{"@type":"Answer","text":"GoAI SDK is an open-source Go library that provides one unified API for 25+ LLM providers including OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI, Groq, Mistral, Ollama and more. Inspired by the Vercel AI SDK, designed idiomatically for Go with generics and interfaces."}},{"@type":"Question","name":"How do I install GoAI SDK?","acceptedAnswer":{"@type":"Answer","text":"Run: go get github.com/zendev-sh/goai@latest. Requires Go 1.25 or later. API keys are auto-resolved from environment variables."}},{"@type":"Question","name":"How does GoAI SDK compare to LangChainGo?","acceptedAnswer":{"@type":"Answer","text":"GoAI SDK supports 25+ providers vs LangChainGo's fewer native integrations, uses Go generics for type-safe structured output (GenerateObject[T]), and has minimal dependencies (no heavy transitive deps). LangChainGo is a Python LangChain port; GoAI is designed from scratch for Go."}},{"@type":"Question","name":"Does GoAI SDK support streaming?","acceptedAnswer":{"@type":"Answer","text":"Yes. GoAI SDK supports real-time text streaming via StreamText and partial object streaming via StreamObject[T] using Go channels."}},{"@type":"Question","name":"Does GoAI SDK support tool calling?","acceptedAnswer":{"@type":"Answer","text":"Yes. Define tools with Execute handlers, set MaxSteps, and GoAI handles the auto tool loop automatically. Supports 23 provider-defined tools including web search, code execution, computer use, and file search."}}]}
 ---
 
 # Installation
@@ -78,7 +78,7 @@ If you see a response from the model, the installation is working.
 
 ## Dependencies
 
-The only external dependency in the core module is `golang.org/x/oauth2`, used by the Vertex AI provider for Application Default Credentials. All other providers use the standard library.
+The only external runtime dependency in the core module is `golang.org/x/oauth2`, used by the Vertex AI provider for Application Default Credentials. The module also uses `go.uber.org/goleak` in tests; all other provider runtime code uses the standard library.
 
 The optional `observability/otel` submodule has its own `go.mod` with OpenTelemetry SDK dependencies. It is not pulled into your project unless you explicitly import it.
 
@@ -98,7 +98,7 @@ Yes. GoAI SDK is released under the MIT License, which allows free commercial us
 
 ### How do I switch between LLM providers?
 
-Change one line — the provider import and model initialization. All 7 core functions (`GenerateText`, `StreamText`, `GenerateObject`, `StreamObject`, `Embed`, `EmbedMany`, `GenerateImage`) work identically across all 25+ providers.
+Change the provider import and model constructor while keeping the same core API. GoAI exposes eight core functions: `GenerateText`, `StreamText`, `GenerateObject`, `StreamObject`, `Embed`, `EmbedMany`, `GenerateImage`, and `GenerateVideo`. Model capabilities vary by provider.
 
 ### Does GoAI SDK work with local models?
 

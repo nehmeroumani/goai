@@ -1,11 +1,11 @@
 ---
 title: Types
-description: "Complete type reference for GoAI and provider packages. Covers TextResult, Message, Part, StreamChunk, Usage, ToolCall, and all public types."
+description: "Reference for commonly used GoAI and provider types, including TextResult, Message, Part, StreamChunk, Usage, and ToolCall."
 ---
 
 # Types
 
-This page documents all public types in the `goai` and `goai/provider` packages.
+This page documents the commonly used public types in the `goai` and `goai/provider` packages. Specialized state and hook types are covered in their dedicated concept/reference pages.
 
 ---
 
@@ -20,6 +20,7 @@ The final result of a text generation call (`GenerateText` or `TextStream.Result
 ```go
 type TextResult struct {
     Text             string                       // Accumulated generated text (includes reasoning text when streaming).
+    Reasoning        string                       // Accumulated reasoning text when provided by the model.
     ToolCalls        []provider.ToolCall           // Tool calls from the final step.
     Steps            []StepResult                 // Results from each generation step.
     TotalUsage       provider.Usage               // Aggregated token usage across all steps.
@@ -40,6 +41,7 @@ The result of a single generation step in a multi-step tool loop.
 type StepResult struct {
     Number       int                      // 1-based step index.
     Text         string                   // Text generated in this step (excludes reasoning text).
+    Reasoning    string                   // Reasoning text for this step when provided by the model.
     ToolCalls    []provider.ToolCall       // Tool calls requested in this step.
     ToolResults  []provider.ToolResult     // Tool results for the requested calls.
     FinishReason provider.FinishReason    // Finish reason for this step.
@@ -128,6 +130,19 @@ type ImageResult struct {
 }
 ```
 
+### VideoResult
+
+The result of video generation. `Video` is the first generated video and `Videos` contains all results.
+
+```go
+type VideoResult struct {
+    Video            provider.VideoData
+    Videos           []provider.VideoData
+    ProviderMetadata map[string]map[string]any
+    Response         provider.ResponseMetadata
+}
+```
+
 ### SchemaFrom
 
 Generates a JSON Schema from a Go struct type `T`. Used by `GenerateObject` and `StreamObject` to describe the expected output structure, and compatible with OpenAI strict-mode schemas.
@@ -162,7 +177,7 @@ schema := goai.SchemaFrom[Recipe]()
 - `time.Time` is converted to `{"type": "string", "format": "date-time"}`.
 - Self-referential named slice types (e.g. `type Foo []Foo`) are detected and produce a schema with `{"type": "array"}` (no items) to avoid infinite recursion.
 - Mutually recursive named slice types (e.g. `type A []B; type B []A`) are not detected and will cause a stack overflow. Use struct wrappers instead of raw named-slice mutual recursion.
-- Pointer types are unwrapped and marked nullable in the schema.
+- Pointer fields are unwrapped and marked nullable; pointer layers on the top-level schema type are unwrapped without a nullable marker.
 
 See [Structured Output](../getting-started/structured-output.md) for full usage.
 
@@ -177,11 +192,12 @@ type Tool struct {
     InputSchema            json.RawMessage                                           // JSON Schema for input parameters.
     ProviderDefinedType    string                                                    // Provider-defined tool type (e.g. "computer_20250124").
     ProviderDefinedOptions map[string]any                                            // Provider-specific tool configuration.
+    DeferLoading           bool                                                      // Defer provider tool loading until selected.
     Execute                func(ctx context.Context, input json.RawMessage) (string, error) // Tool implementation.
 }
 ```
 
-When `Execute` is non-nil and `MaxSteps > 1`, `GenerateText` automatically invokes the tool and feeds results back to the model.
+When `Execute` is non-nil, `GenerateText` invokes requested tools even with the default single step; `MaxSteps > 1` enables a follow-up model call. `StreamText` requires `MaxSteps > 1` for automatic execution/looping.
 
 When using provider-defined tools (web search, code execution, etc.), set `ProviderDefinedType` and leave `Execute` nil - the provider handles execution server-side.
 
@@ -218,6 +234,14 @@ A function that configures an image generation call.
 
 ```go
 type ImageOption func(*imageOptions)
+```
+
+### VideoOption
+
+A function that configures a video generation call.
+
+```go
+type VideoOption func(*videoOptions)
 ```
 
 ### RequestInfo
@@ -371,6 +395,7 @@ type FinishInfo struct {
     TotalSteps     int                // Number of generation steps executed.
     TotalUsage     provider.Usage     // Aggregated token usage across all steps.
     FinishReason   provider.FinishReason // Finish reason from the last step.
+    StoppedBy      provider.StopCause // Why generation terminated.
 }
 ```
 
@@ -443,6 +468,17 @@ type ImageModel interface {
 }
 ```
 
+### VideoModel
+
+Interface for video generation models.
+
+```go
+type VideoModel interface {
+    ModelID() string
+    DoGenerate(ctx context.Context, params VideoParams) (*VideoResult, error)
+}
+```
+
 ### GenerateParams
 
 All parameters for a generation request. Constructed internally by GoAI from options - provider implementations receive this.
@@ -463,6 +499,7 @@ type GenerateParams struct {
     Headers          map[string]string  // Additional HTTP headers.
     ProviderOptions  map[string]any     // Provider-specific parameters.
     PromptCaching    bool               // Enable prompt caching.
+    CacheTTL         string             // Provider cache lifetime hint.
     ToolChoice       string             // Tool selection: "auto", "none", "required", or tool name.
     ResponseFormat   *ResponseFormat    // Structured JSON output schema.
 }
@@ -475,6 +512,8 @@ Response from a non-streaming generation.
 ```go
 type GenerateResult struct {
     Text             string                       // Generated text.
+    Reasoning        string                       // Generated reasoning text.
+    ReasoningParts   []Part                       // Reasoning blocks with preserved boundaries/metadata.
     ToolCalls        []ToolCall                    // Tool calls requested by the model.
     Sources          []Source                      // Citations from response annotations.
     FinishReason     FinishReason                  // Why generation stopped.
@@ -558,9 +597,11 @@ type Part struct {
     ToolInput       json.RawMessage // For PartToolCall.
     ToolOutput      string          // For PartToolResult.
     CacheControl    string          // Cache directive (e.g. "ephemeral").
+    CacheControlTTL string          // Provider cache lifetime for this part.
     Detail          string          // Image detail level ("low", "high", "auto").
     MediaType       string          // Content type (for PartImage, PartFile).
     Filename        string          // For PartFile.
+    RemoteRef       *RemoteFileRef  // Reference to an uploaded remote file (for PartFile, PartImage).
     ProviderOptions map[string]any  // Provider-specific part parameters.
 }
 ```
@@ -604,6 +645,7 @@ type ToolDefinition struct {
     InputSchema            json.RawMessage // JSON Schema for input parameters.
     ProviderDefinedType    string         // Provider-defined tool type.
     ProviderDefinedOptions map[string]any // Provider-specific tool configuration.
+    DeferLoading           bool           // Defer provider tool loading until selected.
 }
 ```
 
@@ -634,6 +676,7 @@ const (
     StopCauseBeforeStep StopCause = "before-step" // Stopped by OnBeforeStep.
     StopCauseAbort      StopCause = "abort"       // Terminated due to error.
     StopCauseEmpty      StopCause = "empty"       // Provider closed stream without chunks.
+    StopCauseNoExecutableTools StopCause = "no-executable-tools" // Model requested tools with no executable handlers.
 )
 ```
 
@@ -691,6 +734,7 @@ type ModelCapabilities struct {
     Reasoning        bool        // Supports extended thinking/reasoning.
     Attachment       bool        // Supports file attachments.
     ToolCall         bool        // Supports tool/function calling.
+    FileUpload       bool        // Supports remote file upload.
     InputModalities  ModalitySet // Supported input types.
     OutputModalities ModalitySet // Supported output types.
 }
@@ -774,6 +818,41 @@ type ImageResult struct {
     Response         ResponseMetadata            // Provider metadata.
 }
 ```
+
+### VideoParams
+
+Provider-independent video generation parameters, including prompt, input media, output settings, and polling configuration.
+
+```go
+type VideoParams struct {
+    Prompt          string
+    Image           *MediaData
+    N               int
+    AspectRatio     string
+    Resolution      string
+    Duration        time.Duration
+    FPS             int
+    Seed            *int64
+    FrameImages     []VideoFrame
+    InputReferences []MediaData
+    GenerateAudio   *bool
+    ProviderOptions map[string]any
+    MaxRetries      int
+    PollInterval    time.Duration
+    PollTimeout     time.Duration
+}
+```
+
+### VideoData
+
+```go
+type VideoData struct {
+    Data      []byte
+    MediaType string
+}
+```
+
+`MediaData` represents inline or remote media inputs. `VideoFrame` tags an image as `VideoFrameFirst` or `VideoFrameLast`.
 
 ### ResponseFormat
 
@@ -869,4 +948,62 @@ Utility for provider implementors. Sends a chunk to a stream channel, returning 
 
 ```go
 func TrySend(ctx context.Context, out chan<- StreamChunk, chunk StreamChunk) bool
+```
+
+### FileUpload
+
+Describes a file to upload to a provider's remote storage.
+
+```go
+type FileUpload struct {
+    Reader    io.Reader // File content to upload.
+    Filename  string    // Name of the file.
+    MediaType string    // MIME type (e.g. "application/pdf").
+    Purpose   string    // Intended use (e.g. "assistants", "vision").
+}
+```
+
+### RemoteFileRef
+
+A reference to an uploaded remote file. Carries raw bytes for fallback on providers without native file APIs.
+
+```go
+type RemoteFileRef struct {
+    Provider  string    // Provider that owns this file.
+    ID        string    // Provider-specific file identifier.
+    URI       string    // Provider-specific file URI (e.g. for Gemini).
+    Filename  string    // Original file name.
+    MediaType string    // MIME type.
+    ExpiresAt time.Time // When the remote file expires (zero if unknown).
+    Data      []byte    // Raw file bytes for compat fallback.
+}
+```
+
+### FileUploader
+
+Interface for uploading and deleting remote files. Providers that support file upload implement `FileUploadCapableModel`.
+
+```go
+type FileUploader interface {
+    UploadFile(ctx context.Context, upload FileUpload) (*RemoteFileRef, error)
+    DeleteFile(ctx context.Context, ref RemoteFileRef) error
+}
+```
+
+### FileUploadCapableModel
+
+Optional interface that `LanguageModel` implementations can satisfy to indicate they support remote file upload. Use `FileUploader()` to get the uploader.
+
+```go
+type FileUploadCapableModel interface {
+    FileUploader() FileUploader
+}
+```
+
+### ErrFileUploadUnsupported
+
+Sentinel error returned by providers that do not support remote file upload. Callers can check for this error to fall back to inline data URIs.
+
+```go
+var ErrFileUploadUnsupported = errors.New("goai: file upload not supported by this provider")
 ```

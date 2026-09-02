@@ -186,7 +186,7 @@ func TestConvertMessages_SystemAndUser(t *testing.T) {
 	msgs := []provider.Message{
 		{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hello"}}},
 	}
-	result := ConvertMessages(msgs, "You are helpful.")
+	result := ConvertMessagesWithConfig(msgs, "You are helpful.", MessagesConfig{})
 
 	if len(result) != 2 {
 		t.Fatalf("got %d messages, want 2", len(result))
@@ -211,7 +211,7 @@ func TestConvertMessages_ToolResults(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -234,7 +234,7 @@ func TestConvertMessages_AssistantWithToolCalls(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -259,7 +259,7 @@ func TestConvertMessages_UserWithImage(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -276,6 +276,333 @@ func TestConvertMessages_UserWithImage(t *testing.T) {
 	}
 	if content[1]["type"] != "image_url" {
 		t.Errorf("second part type = %v", content[1]["type"])
+	}
+}
+
+func TestConvertMessages_UserWithFile_InlineURL(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleUser,
+			Content: []provider.Part{
+				{Type: provider.PartText, Text: "read this"},
+				{Type: provider.PartFile, URL: "data:application/pdf;base64,JVBERi0=", Filename: "doc.pdf", MediaType: "application/pdf"},
+			},
+		},
+	}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
+
+	if len(result) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result))
+	}
+	content, ok := result[0]["content"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected content array, got %T", result[0]["content"])
+	}
+	if len(content) != 2 {
+		t.Fatalf("got %d content parts, want 2", len(content))
+	}
+	if content[0]["type"] != "text" {
+		t.Errorf("first part type = %v", content[0]["type"])
+	}
+	if content[1]["type"] != "file" {
+		t.Fatalf("second part type = file, got %v", content[1]["type"])
+	}
+	file, ok := content[1]["file"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected file object, got %T", content[1]["file"])
+	}
+	if file["filename"] != "doc.pdf" {
+		t.Errorf("filename = %v", file["filename"])
+	}
+	if file["file_data"] != "data:application/pdf;base64,JVBERi0=" {
+		t.Errorf("file_data = %v", file["file_data"])
+	}
+}
+
+func TestConvertMessages_UserWithFile_RemoteRef(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleUser,
+			Content: []provider.Part{
+				{Type: provider.PartText, Text: "read this"},
+				{
+					Type:      provider.PartFile,
+					RemoteRef: &provider.RemoteFileRef{ID: "file-abc", Data: []byte("JVBERi0="), MediaType: "application/pdf"},
+					Filename:  "doc.pdf",
+					MediaType: "application/pdf",
+				},
+			},
+		},
+	}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
+
+	if len(result) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result))
+	}
+	content, ok := result[0]["content"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected content array, got %T", result[0]["content"])
+	}
+	if len(content) != 2 {
+		t.Fatalf("got %d content parts, want 2", len(content))
+	}
+	if content[0]["type"] != "text" {
+		t.Errorf("first part type = %v", content[0]["type"])
+	}
+	if content[1]["type"] != "file" {
+		t.Fatalf("second part type = file, got %v", content[1]["type"])
+	}
+	file, ok := content[1]["file"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected file object, got %T", content[1]["file"])
+	}
+	if file["file_data"] != "data:application/pdf;base64,JVBERi0=" {
+		t.Errorf("file_data = %v", file["file_data"])
+	}
+}
+
+func TestConvertMessages_UserWithFile_AudioFormats(t *testing.T) {
+	cases := []struct {
+		mediaType string
+		format    string
+	}{
+		{"audio/wav", "wav"},
+		{"audio/wave", "wav"},
+		{"audio/mp3", "mp3"},
+		{"audio/mpeg", "mp3"},
+		{"audio/aiff", "aiff"},
+		{"audio/aac", "aac"},
+		{"audio/ogg", "ogg"},
+		{"application/ogg", "ogg"},
+		{"audio/flac", "flac"},
+		{"audio/mp4", "m4a"},
+	}
+	for _, tc := range cases {
+		msgs := []provider.Message{
+			{
+				Role: provider.RoleUser,
+				Content: []provider.Part{
+					{Type: provider.PartFile, URL: "data:" + tc.mediaType + ";base64,QUJD", MediaType: tc.mediaType},
+				},
+			},
+		}
+		result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{IncludeReasoningContent: true})
+		content, ok := result[0]["content"].([]map[string]any)
+		if !ok || len(content) != 1 {
+			t.Fatalf("%s: unexpected content %v", tc.mediaType, result[0]["content"])
+		}
+		if content[0]["type"] != "input_audio" {
+			t.Fatalf("%s: part type = %v, want input_audio", tc.mediaType, content[0]["type"])
+		}
+		audio, ok := content[0]["input_audio"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: expected input_audio object, got %T", tc.mediaType, content[0]["input_audio"])
+		}
+		if audio["format"] != tc.format {
+			t.Errorf("%s: format = %v, want %s", tc.mediaType, audio["format"], tc.format)
+		}
+		if audio["data"] != "QUJD" {
+			t.Errorf("%s: data = %v, want bare base64 without data: prefix", tc.mediaType, audio["data"])
+		}
+	}
+}
+
+func TestConvertMessages_UserWithFile_RemoteRefNoData(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleUser,
+			Content: []provider.Part{
+				{Type: provider.PartFile, RemoteRef: &provider.RemoteFileRef{ID: "file-abc"}},
+			},
+		},
+	}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
+	if len(result) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result))
+	}
+	// No data and no media type: the part is dropped, message stays valid.
+	if content, ok := result[0]["content"].(string); !ok || content != "" {
+		t.Fatalf("content = %v, want empty string", result[0]["content"])
+	}
+}
+
+func TestConvertMessages_UserWithFile_NonDataURL(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleUser,
+			Content: []provider.Part{
+				{Type: provider.PartFile, URL: "https://example.com/doc.pdf"},
+			},
+		},
+	}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
+	if len(result) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result))
+	}
+	// A bare URL without a media type has no wire shape: dropped.
+	if content, ok := result[0]["content"].(string); !ok || content != "" {
+		t.Fatalf("content = %v, want empty string", result[0]["content"])
+	}
+}
+
+func TestConvertMessages_UserWithFile_PDFByURL(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleUser,
+			Content: []provider.Part{
+				{Type: provider.PartFile, URL: "https://example.com/doc.pdf", MediaType: "application/pdf", Filename: "doc.pdf"},
+			},
+		},
+	}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
+	content, ok := result[0]["content"].([]map[string]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("unexpected content: %v", result[0]["content"])
+	}
+	if content[0]["type"] != "file" {
+		t.Fatalf("part type = file, got %v", content[0]["type"])
+	}
+	file, ok := content[0]["file"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected file object, got %T", content[0]["file"])
+	}
+	// Remote PDFs pass the plain URL through file_data (gateways fetch it).
+	if file["file_data"] != "https://example.com/doc.pdf" {
+		t.Errorf("file_data = %v", file["file_data"])
+	}
+}
+
+func TestConvertMessages_UserWithFile_EmptyURL(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleUser,
+			Content: []provider.Part{
+				{Type: provider.PartFile, URL: ""},
+			},
+		},
+	}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
+	if len(result) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result))
+	}
+	// An empty PartFile carries nothing: dropped, message stays valid.
+	if content, ok := result[0]["content"].(string); !ok || content != "" {
+		t.Fatalf("content = %v, want empty string", result[0]["content"])
+	}
+}
+
+func TestConvertMessages_UserWithFileAndImage(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleUser,
+			Content: []provider.Part{
+				{Type: provider.PartText, Text: "describe"},
+				{Type: provider.PartImage, URL: "data:image/png;base64,img123"},
+				{Type: provider.PartFile, URL: "data:application/pdf;base64,pdf456"},
+			},
+		},
+	}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
+
+	if len(result) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result))
+	}
+	content, ok := result[0]["content"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected content array, got %T", result[0]["content"])
+	}
+	if len(content) != 3 {
+		t.Fatalf("got %d content parts, want 3", len(content))
+	}
+	if content[0]["type"] != "text" {
+		t.Errorf("part[0] type = %v", content[0]["type"])
+	}
+	if content[1]["type"] != "image_url" {
+		t.Errorf("part[1] type = %v", content[1]["type"])
+	}
+	if content[2]["type"] != "file" {
+		t.Fatalf("part[2] type = file, got %v", content[2]["type"])
+	}
+	file, ok := content[2]["file"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected file object, got %T", content[2]["file"])
+	}
+	// The media type comes from the data URI; a missing filename falls back.
+	if file["filename"] != "document.pdf" {
+		t.Errorf("filename = %v", file["filename"])
+	}
+	if file["file_data"] != "data:application/pdf;base64,pdf456" {
+		t.Errorf("file_data = %v", file["file_data"])
+	}
+}
+
+func TestConvertMessages_UserWithFileOnly(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleUser,
+			Content: []provider.Part{
+				{Type: provider.PartFile, URL: "data:application/pdf;base64,abc"},
+			},
+		},
+	}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
+	if len(result) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result))
+	}
+	content, ok := result[0]["content"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected content array, got %T", result[0]["content"])
+	}
+	if len(content) != 1 {
+		t.Fatalf("got %d content parts, want 1", len(content))
+	}
+	if content[0]["type"] != "file" {
+		t.Errorf("part type = file, got %v", content[0]["type"])
+	}
+}
+
+func TestConvertMessages_FileWithAssistantRole(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleAssistant,
+			Content: []provider.Part{
+				{Type: provider.PartText, Text: "here is the result"},
+			},
+		},
+	}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
+	if len(result) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result))
+	}
+}
+
+func TestConvertMessages_FileWithSystemRole(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleSystem,
+			Content: []provider.Part{
+				{Type: provider.PartText, Text: "system instruction"},
+			},
+		},
+	}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
+	if len(result) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result))
+	}
+}
+
+func TestConvertMessages_FileWithToolRole(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleTool,
+			Content: []provider.Part{
+				{Type: provider.PartToolResult, ToolCallID: "call_1", ToolOutput: "result"},
+			},
+		},
+	}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
+	if len(result) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result))
 	}
 }
 
@@ -535,6 +862,41 @@ data: [DONE]
 	}
 }
 
+// A tool call whose arguments arrive but whose name/id never resolve must
+// surface an error at finalize instead of being silently dropped (matches the
+// Vercel AI SDK, which throws in this case).
+func TestParseStream_UnresolvedToolCallEmitsError(t *testing.T) {
+	input := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]},"index":0}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"main.go\"}"}}]},"index":0}]}
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+
+	go ParseStream(t.Context(), scanner, out)
+
+	var gotErr error
+	var gotFinish bool
+	for chunk := range out {
+		switch chunk.Type {
+		case provider.ChunkError:
+			gotErr = chunk.Error
+		case provider.ChunkFinish:
+			gotFinish = true
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected a ChunkError for a tool call whose name/id never resolved")
+	}
+	if !strings.Contains(gotErr.Error(), "never resolved") {
+		t.Errorf("error = %v, want it to mention the unresolved name/id", gotErr)
+	}
+	if gotFinish {
+		t.Error("stream should terminate with an error, not a clean finish")
+	}
+}
+
 func TestParseStream_Reasoning(t *testing.T) {
 	input := `data: {"choices":[{"delta":{"reasoning_content":"Let me think..."},"index":0}]}
 data: {"choices":[{"delta":{"content":"The answer is 42."},"index":0}]}
@@ -553,6 +915,31 @@ data: [DONE]
 
 	if chunks[0].Type != provider.ChunkReasoning || chunks[0].Text != "Let me think..." {
 		t.Errorf("reasoning chunk = %+v", chunks[0])
+	}
+	if chunks[1].Type != provider.ChunkText || chunks[1].Text != "The answer is 42." {
+		t.Errorf("text chunk = %+v", chunks[1])
+	}
+}
+
+func TestParseStream_ReasoningFallback(t *testing.T) {
+	// OpenRouter emits reasoning under delta.reasoning (not reasoning_content).
+	input := `data: {"choices":[{"delta":{"reasoning":"Let me think..."},"index":0}]}
+data: {"choices":[{"delta":{"content":"The answer is 42."},"index":0}]}
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+
+	go ParseStream(t.Context(), scanner, out)
+
+	var chunks []provider.StreamChunk
+	for chunk := range out {
+		chunks = append(chunks, chunk)
+	}
+
+	if chunks[0].Type != provider.ChunkReasoning || chunks[0].Text != "Let me think..." {
+		t.Errorf("reasoning chunk = %+v, want ChunkReasoning with 'Let me think...'", chunks[0])
 	}
 	if chunks[1].Type != provider.ChunkText || chunks[1].Text != "The answer is 42." {
 		t.Errorf("text chunk = %+v", chunks[1])
@@ -877,7 +1264,7 @@ func TestConvertMessages_SystemInMessages(t *testing.T) {
 		{Role: provider.RoleSystem, Content: []provider.Part{{Type: provider.PartText, Text: "Be concise."}}},
 		{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hello"}}},
 	}
-	result := ConvertMessages(msgs, "You are helpful.")
+	result := ConvertMessagesWithConfig(msgs, "You are helpful.", MessagesConfig{})
 
 	// Should have: system (from param), system (from messages), user
 	if len(result) != 3 {
@@ -898,7 +1285,7 @@ func TestConvertMessages_AssistantTextOnly(t *testing.T) {
 			{Type: provider.PartText, Text: "World"},
 		}},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if result[0]["content"] != "Hello\nWorld" {
 		t.Errorf("content = %v, want 'Hello\\nWorld'", result[0]["content"])
 	}
@@ -1096,6 +1483,45 @@ func TestBuildRequest_MaxCompletionTokens_NoReasoningEffort(t *testing.T) {
 	}
 }
 
+// TestBuildRequest_UseMaxCompletionTokensOverridesModelID: the model id does not
+// always identify the model. On Azure OpenAI the wire id is the deployment name
+// the user picked, so the id heuristic misfires in both directions and the
+// caller must be able to state the answer.
+func TestBuildRequest_UseMaxCompletionTokensOverridesModelID(t *testing.T) {
+	yes, no := true, false
+	cases := []struct {
+		name    string
+		modelID string
+		flag    *bool
+		want    string
+	}{
+		{"nil keeps the heuristic (reasoning id)", "gpt-5", nil, "max_completion_tokens"},
+		{"nil keeps the heuristic (plain id)", "my-deployment", nil, "max_tokens"},
+		{"true forces the rename on an opaque id", "my-deployment", &yes, "max_completion_tokens"},
+		{"false suppresses it on a reasoning-looking id", "gpt-5-alias", &no, "max_tokens"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			params := provider.GenerateParams{
+				Messages:        []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+				MaxOutputTokens: 1500,
+			}
+			body := BuildRequest(params, tc.modelID, false, RequestConfig{UseMaxCompletionTokens: tc.flag})
+
+			if body[tc.want] != 1500 {
+				t.Errorf("%s = %v, want 1500", tc.want, body[tc.want])
+			}
+			other := "max_tokens"
+			if tc.want == "max_tokens" {
+				other = "max_completion_tokens"
+			}
+			if _, ok := body[other]; ok {
+				t.Errorf("%s must not be sent alongside %s", other, tc.want)
+			}
+		})
+	}
+}
+
 // TestBuildRequest_MaxTokensKeptForNonReasoning: a non-reasoning model
 // keeps the plain max_tokens parameter.
 func TestBuildRequest_MaxTokensKeptForNonReasoning(t *testing.T) {
@@ -1135,7 +1561,7 @@ func TestConvertMessages_AssistantToolCallsNoText(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -1194,7 +1620,7 @@ func TestBF13_ImageURLDetail(t *testing.T) {
 			{Type: provider.PartImage, URL: "data:image/png;base64,abc", Detail: "high"},
 		}},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if len(result) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(result))
 	}
@@ -1223,7 +1649,7 @@ func TestBF13_ImageURLNoDetail(t *testing.T) {
 			{Type: provider.PartImage, URL: "data:image/png;base64,abc"},
 		}},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	content, ok := result[0]["content"].([]map[string]any)
 	if !ok {
 		t.Fatalf("content not array, got %T", result[0]["content"])
@@ -2408,7 +2834,7 @@ func TestConvertMessages_MultipleToolResults(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 2 {
 		t.Fatalf("got %d wire messages, want 2 (one per ToolResult part)", len(result))
@@ -2442,7 +2868,7 @@ func TestConvertMessages_EmptyContent(t *testing.T) {
 	msgs := []provider.Message{
 		{Role: provider.RoleUser, Content: []provider.Part{}},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	// A message with no parts still produces one wire message.
 	if len(result) != 1 {
@@ -2472,7 +2898,7 @@ func TestConvertMessages_ImageOnlyUser(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d wire messages, want 1", len(result))
@@ -2523,6 +2949,31 @@ func TestParseResponse_NullContent(t *testing.T) {
 	}
 }
 
+func TestParseResponse_ReasoningFallback(t *testing.T) {
+	// OpenRouter emits reasoning under message.reasoning (not reasoning_content).
+	body := []byte(`{
+		"id": "chatcmpl-or",
+		"model": "openrouter/test",
+		"choices": [{
+			"index": 0,
+			"message": {"role": "assistant", "content": "Final answer", "reasoning": "Let me think..."},
+			"finish_reason": "stop"
+		}],
+		"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+	}`)
+
+	result, err := ParseResponse(body)
+	if err != nil {
+		t.Fatalf("ParseResponse error: %v", err)
+	}
+	if result.Reasoning != "Let me think..." {
+		t.Errorf("Reasoning = %q, want %q", result.Reasoning, "Let me think...")
+	}
+	if result.Text != "Final answer" {
+		t.Errorf("Text = %q, want %q", result.Text, "Final answer")
+	}
+}
+
 // TestExtractTextContent_NullJSON directly tests that extractTextContent returns
 // an empty string when given the JSON literal "null".
 func TestExtractTextContent_NullJSON(t *testing.T) {
@@ -2550,7 +3001,7 @@ func TestConvertMessages_ToolCallsNoText(t *testing.T) {
 		},
 	}
 
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{})
 	if len(result) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(result))
 	}
@@ -2599,7 +3050,7 @@ func TestConvertMessages_AssistantReasoningRoundtrip(t *testing.T) {
 			},
 		},
 	}
-	result := ConvertMessages(msgs, "")
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{IncludeReasoningContent: true})
 
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
@@ -2621,5 +3072,275 @@ func TestConvertMessages_AssistantReasoningRoundtrip(t *testing.T) {
 	fn := tcs[0]["function"].(map[string]any)
 	if fn["name"] != "do_thing" {
 		t.Errorf("tool call name = %v, want do_thing", fn["name"])
+	}
+}
+
+func TestConvertMessages_ReasoningPolicyCanOmitNonStandardField(t *testing.T) {
+	result := ConvertMessagesWithConfig([]provider.Message{{
+		Role:    provider.RoleAssistant,
+		Content: []provider.Part{{Type: provider.PartReasoning, Text: "think"}},
+	}}, "", MessagesConfig{IncludeReasoningContent: false})
+
+	if _, ok := result[0]["reasoning_content"]; ok {
+		t.Fatalf("reasoning_content = %v, want omitted", result[0]["reasoning_content"])
+	}
+}
+
+// Item 44: Fireworks emits {"type":"json_object","schema":{...}} instead of
+// {"type":"json_schema","json_schema":{...}}.
+func TestBuildRequest_JsonSchemaAsJsonObject(t *testing.T) {
+	params := provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ResponseFormat: &provider.ResponseFormat{
+			Name:   "test_schema",
+			Schema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}}}`),
+		},
+	}
+	body := BuildRequest(params, "gpt-4o", false, RequestConfig{JsonSchemaAsJsonObject: true})
+
+	rf, ok := body["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("response_format not set or wrong type: %T", body["response_format"])
+	}
+	if rf["type"] != "json_object" {
+		t.Errorf("response_format.type = %v, want json_object", rf["type"])
+	}
+	if _, ok := rf["schema"].(map[string]any); !ok {
+		t.Errorf("response_format.schema missing or wrong type: %v", rf["schema"])
+	}
+	if _, ok := rf["json_schema"]; ok {
+		t.Error("json_schema must not be emitted when JsonSchemaAsJsonObject is set")
+	}
+}
+
+// Item 55: Perplexity Sonar only accepts text/json_schema, so schema-less JSON
+// mode becomes a generic {"type":"json_schema","json_schema":{...}} object.
+func TestBuildRequest_JsonObjectAsJsonSchema(t *testing.T) {
+	params := provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		// No schema: would normally fall back to json_object.
+		ResponseFormat: &provider.ResponseFormat{Name: "my_format"},
+	}
+	body := BuildRequest(params, "gpt-4o", false, RequestConfig{JsonObjectAsJsonSchema: true})
+
+	rf, ok := body["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("response_format not set or wrong type: %T", body["response_format"])
+	}
+	if rf["type"] != "json_schema" {
+		t.Errorf("response_format.type = %v, want json_schema", rf["type"])
+	}
+	js, ok := rf["json_schema"].(map[string]any)
+	if !ok {
+		t.Fatalf("json_schema not set or wrong type: %T", rf["json_schema"])
+	}
+	if js["name"] != "my_format" {
+		t.Errorf("json_schema.name = %v, want my_format", js["name"])
+	}
+	if _, ok := js["schema"].(map[string]any); !ok {
+		t.Errorf("json_schema.schema missing or wrong type: %v", js["schema"])
+	}
+}
+
+// TestBuildRequest_JsonObjectAsJsonSchema_DefaultName verifies that when
+// JsonObjectAsJsonSchema is set and ResponseFormat.Name is empty, the emitted
+// json_schema name defaults to "json_schema" (openaicompat.go lines 244-246).
+func TestBuildRequest_JsonObjectAsJsonSchema_DefaultName(t *testing.T) {
+	params := provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		// Empty Name on purpose: exercises the default-name branch.
+		ResponseFormat: &provider.ResponseFormat{},
+	}
+	body := BuildRequest(params, "gpt-4o", false, RequestConfig{JsonObjectAsJsonSchema: true})
+
+	rf, ok := body["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("response_format not set or wrong type: %T", body["response_format"])
+	}
+	if rf["type"] != "json_schema" {
+		t.Errorf("response_format.type = %v, want json_schema", rf["type"])
+	}
+	js, ok := rf["json_schema"].(map[string]any)
+	if !ok {
+		t.Fatalf("json_schema not set or wrong type: %T", rf["json_schema"])
+	}
+	if js["name"] != "json_schema" {
+		t.Errorf("json_schema.name = %v, want default json_schema", js["name"])
+	}
+	if _, ok := js["schema"].(map[string]any); !ok {
+		t.Errorf("json_schema.schema missing or wrong type: %v", js["schema"])
+	}
+}
+
+// Item 57: the seed wire key is configurable (Mistral uses random_seed).
+func TestBuildRequest_SeedKey(t *testing.T) {
+	seed := 42
+	params := provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		Seed:     &seed,
+	}
+
+	// Default key is "seed".
+	defBody := BuildRequest(params, "gpt-4o", false, RequestConfig{})
+	if defBody["seed"] != 42 {
+		t.Errorf("seed = %v, want 42", defBody["seed"])
+	}
+
+	// Mistral overrides to "random_seed".
+	mistralBody := BuildRequest(params, "gpt-4o", false, RequestConfig{SeedKey: "random_seed"})
+	if mistralBody["random_seed"] != 42 {
+		t.Errorf("random_seed = %v, want 42", mistralBody["random_seed"])
+	}
+	if _, ok := mistralBody["seed"]; ok {
+		t.Error("seed must not be set when SeedKey is random_seed")
+	}
+}
+
+// Item 59: FlatInputFile makes PDF parts serialize as the flat
+// {"type":"input_file","file_data":...} shape (Requesty).
+func TestConvertMessages_FlatInputFile(t *testing.T) {
+	msgs := []provider.Message{{
+		Role: provider.RoleUser,
+		Content: []provider.Part{
+			{Type: provider.PartFile, URL: "data:application/pdf;base64,JVBERi0=", Filename: "doc.pdf", MediaType: "application/pdf"},
+		},
+	}}
+	result := ConvertMessagesWithConfig(msgs, "", MessagesConfig{FlatInputFile: true})
+
+	content, ok := result[0]["content"].([]map[string]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("unexpected content: %v", result[0]["content"])
+	}
+	if content[0]["type"] != "input_file" {
+		t.Fatalf("part type = %v, want input_file", content[0]["type"])
+	}
+	if content[0]["file_data"] != "data:application/pdf;base64,JVBERi0=" {
+		t.Errorf("file_data = %v", content[0]["file_data"])
+	}
+	if _, ok := content[0]["file"]; ok {
+		t.Error("nested file object must not be emitted when FlatInputFile is set")
+	}
+}
+
+// Item 46: top-level prompt_cache_hit_tokens (Together/DeepInfra/DeepSeek) is
+// parsed into CacheReadTokens when prompt_tokens_details.cached_tokens is absent.
+func TestParseStream_TopLevelCacheHitTokens(t *testing.T) {
+	input := `data: {"choices":[{"delta":{"content":"hi"},"index":0}]}
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_cache_hit_tokens":60,"prompt_cache_miss_tokens":40}}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+	go ParseStream(t.Context(), scanner, out)
+
+	var finishChunk provider.StreamChunk
+	for chunk := range out {
+		if chunk.Type == provider.ChunkFinish {
+			finishChunk = chunk
+		}
+	}
+	if finishChunk.Usage.CacheReadTokens != 60 {
+		t.Errorf("CacheReadTokens = %d, want 60", finishChunk.Usage.CacheReadTokens)
+	}
+	if finishChunk.Usage.InputTokens != 40 {
+		t.Errorf("InputTokens = %d, want 40 (100-60)", finishChunk.Usage.InputTokens)
+	}
+}
+
+// Item 46: OpenRouter's top-level cached_tokens is parsed into CacheReadTokens.
+func TestParseStream_OpenRouterCachedTokens(t *testing.T) {
+	input := `data: {"choices":[{"delta":{"content":"hi"},"index":0}]}
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":90,"completion_tokens":10,"cached_tokens":50}}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+	go ParseStream(t.Context(), scanner, out)
+
+	var finishChunk provider.StreamChunk
+	for chunk := range out {
+		if chunk.Type == provider.ChunkFinish {
+			finishChunk = chunk
+		}
+	}
+	if finishChunk.Usage.CacheReadTokens != 50 {
+		t.Errorf("CacheReadTokens = %d, want 50", finishChunk.Usage.CacheReadTokens)
+	}
+	if finishChunk.Usage.InputTokens != 40 {
+		t.Errorf("InputTokens = %d, want 40 (90-50)", finishChunk.Usage.InputTokens)
+	}
+}
+
+// Item 46: non-streaming response top-level cache counters (DeepSeek).
+func TestParseResponse_TopLevelCacheHitTokens(t *testing.T) {
+	body := []byte(`{
+		"id": "x", "model": "deepseek-chat",
+		"choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+		"usage": {"prompt_tokens": 100, "completion_tokens": 10, "prompt_cache_hit_tokens": 70, "prompt_cache_miss_tokens": 30}
+	}`)
+	result, err := ParseResponse(body)
+	if err != nil {
+		t.Fatalf("ParseResponse error: %v", err)
+	}
+	if result.Usage.CacheReadTokens != 70 {
+		t.Errorf("CacheReadTokens = %d, want 70", result.Usage.CacheReadTokens)
+	}
+	if result.Usage.InputTokens != 30 {
+		t.Errorf("InputTokens = %d, want 30 (100-70)", result.Usage.InputTokens)
+	}
+}
+
+// Item 4: a complete JSON fragment arriving early must not finalize the tool
+// call. Only ONE ChunkToolCall is emitted, at the finish reason, with the full
+// accumulated arguments.
+func TestParseStream_NoPrematureToolCallFinalize(t *testing.T) {
+	input := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"main.go\"}"}}]},"index":0}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":",\"mode\":\"fast\"}"}}]},"index":0}]}
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+	go ParseStream(t.Context(), scanner, out)
+
+	var toolCalls []provider.StreamChunk
+	for chunk := range out {
+		if chunk.Type == provider.ChunkToolCall {
+			toolCalls = append(toolCalls, chunk)
+		}
+	}
+
+	if len(toolCalls) != 1 {
+		t.Fatalf("got %d ChunkToolCall chunks, want exactly 1 (finalized once at finish)", len(toolCalls))
+	}
+	// The first fragment was valid JSON on its own but more followed; the
+	// finalized call must carry the complete accumulated arguments, not the
+	// prematurely-finalized first fragment.
+	if toolCalls[0].ToolInput != `{"path":"main.go"},"mode":"fast"}` {
+		t.Errorf("final tool input = %q, want the full accumulated arguments", toolCalls[0].ToolInput)
+	}
+}
+
+// Item 4: a tool call that never receives a finish_reason is still finalized
+// once at stream end.
+func TestParseStream_ToolCallFinalizeOnStreamEnd(t *testing.T) {
+	input := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"main.go\"}"}}]},"index":0}]}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+	go ParseStream(t.Context(), scanner, out)
+
+	var toolCalls []provider.StreamChunk
+	for chunk := range out {
+		if chunk.Type == provider.ChunkToolCall {
+			toolCalls = append(toolCalls, chunk)
+		}
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("got %d ChunkToolCall chunks, want 1 (finalized at stream end)", len(toolCalls))
+	}
+	if toolCalls[0].ToolInput != `{"path":"main.go"}` {
+		t.Errorf("final tool input = %q, want {\"path\":\"main.go\"}", toolCalls[0].ToolInput)
 	}
 }

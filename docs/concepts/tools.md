@@ -118,7 +118,7 @@ goai.WithToolChoice("get_weather")
 
 ## Step Callbacks
 
-`WithOnStepFinish` is called after each step completes, including after tool execution. Use it for logging or progress tracking:
+`WithOnStepFinish` is called after each model call and before that step's tool execution. At callback time `StepResult.ToolResults` is empty. Use it for model-step logging or progress tracking:
 
 ```go
 result, err := goai.GenerateText(ctx, model,
@@ -170,8 +170,10 @@ goai.WithOnToolCall(func(info goai.ToolCallInfo) {
 | `Output`       | `string`          | String result returned by the tool (empty if the tool errored)     |
 | `OutputObject` | `any`             | Parsed JSON value of Output when valid JSON; nil otherwise         |
 | `StartTime`    | `time.Time`       | When the tool execution began                                      |
-| `Duration`     | `time.Duration`   | Time taken to execute the tool                                     |
+| `Duration`     | `time.Duration`   | Time from before `Execute` through completion of `OnAfterToolExecute` |
 | `Error`        | `error`           | Error returned by the tool, if any                                 |
+| `Skipped`      | `bool`            | Whether `OnBeforeToolExecute` skipped execution                    |
+| `Metadata`     | `map[string]any`  | Metadata returned by `OnAfterToolExecute`                          |
 
 > **Note:** When multiple tools execute in a single step, OnToolCall callbacks fire concurrently from separate goroutines. Order is non-deterministic.
 
@@ -189,7 +191,9 @@ Each step in a multi-step tool loop produces a `goai.StepResult`:
 | ------------------ | --------------------------- | ------------------------------------ |
 | `Number`           | `int`                       | 1-based step index                   |
 | `Text`             | `string`                    | Text generated in this step          |
+| `Reasoning`        | `string`                    | Reasoning generated in this step     |
 | `ToolCalls`        | `[]provider.ToolCall`       | Tool calls requested in this step    |
+| `ToolResults`      | `[]provider.ToolResult`     | Completed tool results for this step |
 | `FinishReason`     | `provider.FinishReason`     | Why this step stopped                |
 | `Usage`            | `provider.Usage`            | Token usage for this step            |
 | `Response`         | `provider.ResponseMetadata` | Provider metadata for this step      |

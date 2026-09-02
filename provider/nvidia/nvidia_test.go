@@ -1,6 +1,8 @@
 package nvidia
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -325,5 +327,42 @@ func TestEmbedding_EnvVarResolution(t *testing.T) {
 	}
 	if gotAuth != "Bearer env-key" {
 		t.Errorf("auth = %q, want Bearer env-key", gotAuth)
+	}
+}
+
+// Item 47: nvidia opts into IncludeReasoningContent, so an assistant message
+// carrying a reasoning part must serialize reasoning_content on the outgoing
+// request body.
+func TestChat_RoundTripsReasoningContent(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("meta/llama-3.3-70b-instruct", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{
+			Role: provider.RoleAssistant,
+			Content: []provider.Part{
+				{Type: provider.PartReasoning, Text: "let me think"},
+				{Type: provider.PartText, Text: "answer"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, ok := gotBody["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("messages = %v", gotBody["messages"])
+	}
+	assistant := msgs[0].(map[string]any)
+	if assistant["reasoning_content"] != "let me think" {
+		t.Errorf("reasoning_content = %v, want 'let me think'", assistant["reasoning_content"])
 	}
 }

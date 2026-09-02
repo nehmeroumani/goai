@@ -7,7 +7,7 @@ description: "GoAI SDK supports 25+ LLM providers: OpenAI, Anthropic, Google Gem
 
 GoAI SDK supports 25+ LLM providers with a single unified API. Most hosted providers auto-resolve credentials from environment variables; local/custom providers (for example `ollama`, `vllm`, `compat`) typically use explicit options.
 
-All 7 core functions — `GenerateText`, `StreamText`, `GenerateObject[T]`, `StreamObject[T]`, `Embed`, `EmbedMany`, and `GenerateImage` — work identically across all providers.
+The core functions — `GenerateText`, `StreamText`, `GenerateObject[T]`, `StreamObject[T]`, `Embed`, `EmbedMany`, `GenerateImage`, and `GenerateVideo` — share one API, but provider capabilities vary.
 
 ## Tier 1
 
@@ -16,11 +16,11 @@ Dedicated implementations with extended API support.
 | Provider                  | Chat                       | Embed                                | Image            | Provider Tools | Auth Env Var                                                                          |
 | ------------------------- | -------------------------- | ------------------------------------ | ---------------- | -------------- | ------------------------------------------------------------------------------------- |
 | [OpenAI](openai.md)       | ✅ `gpt-4o`, `o3`          | ✅ `text-embedding-3-*`              | ✅ `gpt-image-1` | 4 tools        | `OPENAI_API_KEY`                                                                      |
-| [Anthropic](anthropic.md) | ✅ `claude-*`              | —                                    | —                | 10 tools       | `ANTHROPIC_API_KEY`                                                                   |
-| [Google](google.md)       | ✅ `gemini-*`              | ✅ `text-embedding-004`              | ✅ `imagen-*`    | 3 tools        | `GOOGLE_GENERATIVE_AI_API_KEY` or `GEMINI_API_KEY`                                    |
+| [Anthropic](anthropic.md) | ✅ `claude-*`              | —                                    | —                | 12 tools       | `ANTHROPIC_API_KEY`                                                                   |
+| [Google](google.md)       | ✅ `gemini-*`              | ✅ `text-embedding-004`              | ✅ `imagen-*`    | 4 tools        | `GOOGLE_GENERATIVE_AI_API_KEY` or `GEMINI_API_KEY`                                    |
 | [Bedrock](bedrock.md)     | ✅ `anthropic.*`, `meta.*` | ✅ `titan-embed-*`, `cohere.embed-*` | —                | —              | `AWS_ACCESS_KEY_ID`                                                                   |
 | [Azure](azure.md)         | ✅ `gpt-4o`, `claude-*`    | —                                    | ✅               | —              | `AZURE_OPENAI_API_KEY`                                                                |
-| [Vertex AI](vertex.md)    | ✅ `gemini-*`              | ✅                                   | ✅               | —              | ADC, or `GOOGLE_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_GENERATIVE_AI_API_KEY` fallback |
+| [Vertex AI](vertex.md)    | ✅ `gemini-*`, `claude-*`  | ✅                                   | ✅               | —              | ADC/OAuth; API-key fallback applies only outside native Gemini mode                    |
 
 ## Tier 2
 
@@ -55,7 +55,8 @@ Most use the shared `internal/openaicompat` codec (some wrappers delegate via `p
 
 | Provider                        | Default Endpoint     | Auth          | Features                       |
 | ------------------------------- | -------------------- | ------------- | ------------------------------ |
-| [Ollama](ollama.md)             | `localhost:11434/v1` | None required | Embedding support              |
+| [Ollama](ollama.md)             | `localhost:11434` | None required | Embedding support              |
+| llama.cpp (`provider/llamacpp`) | `localhost:8080`    | Optional    | Chat and embedding support     |
 | [vLLM](vllm.md)                 | `localhost:8000/v1`  | Optional      | Embedding support              |
 | [Generic Compatible](compat.md) | (required)           | Configurable  | Any OpenAI-compatible endpoint |
 

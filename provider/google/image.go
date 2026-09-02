@@ -61,6 +61,14 @@ func Image(modelID string, opts ...Option) provider.ImageModel {
 		}
 	}
 	if isImagenModel(modelID) {
+		// Imagen models on the Gemini API are deprecated and scheduled for
+		// shutdown on 2026-08-17. Keep them functional until then, but warn so
+		// callers migrate to the Gemini image path (gemini-*-flash-image via
+		// generateContent) ahead of the cutoff.
+		fmt.Fprintf(os.Stderr,
+			"goai: google: %s is deprecated on the Gemini API and will be shut down on 2026-08-17; "+
+				"migrate to a Gemini image model (e.g. google.Image(\"gemini-2.5-flash-image\")) before then\n",
+			modelID)
 		return &imagenModel{id: modelID, opts: o}
 	}
 	return &geminiImageModel{id: modelID, opts: o}
@@ -81,6 +89,9 @@ type imagenModel struct {
 func (m *imagenModel) ModelID() string { return m.id }
 
 func (m *imagenModel) DoGenerate(ctx context.Context, params provider.ImageParams) (*provider.ImageResult, error) {
+	if err := validateNonChatOptions(m.opts); err != nil {
+		return nil, err
+	}
 	token, err := m.resolveToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("resolving auth token: %w", err)
@@ -113,11 +124,13 @@ func (m *imagenModel) DoGenerate(ctx context.Context, params provider.ImageParam
 	jsonBody := httpc.MustMarshalJSON(body)
 	req := httpc.MustNewRequest(ctx, "POST", reqURL, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", token)
 
 	for k, v := range m.opts.headers {
 		req.Header.Set(k, v)
 	}
+	// Set the credential last so it wins over any caller-supplied header
+	// named like the auth header.
+	req.Header.Set("x-goog-api-key", token)
 
 	resp, err := m.httpClient().Do(req)
 	if err != nil {
@@ -126,11 +139,11 @@ func (m *imagenModel) DoGenerate(ctx context.Context, params provider.ImageParam
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxGoogleErrorBodyBytes))
 		return nil, goai.ParseHTTPErrorWithHeaders("google", resp.StatusCode, respBody, resp.Header)
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readSuccessBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -188,6 +201,9 @@ type geminiImageModel struct {
 func (m *geminiImageModel) ModelID() string { return m.id }
 
 func (m *geminiImageModel) DoGenerate(ctx context.Context, params provider.ImageParams) (*provider.ImageResult, error) {
+	if err := validateNonChatOptions(m.opts); err != nil {
+		return nil, err
+	}
 	token, err := m.resolveToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("resolving auth token: %w", err)
@@ -198,13 +214,15 @@ func (m *geminiImageModel) DoGenerate(ctx context.Context, params provider.Image
 	}
 
 	// Map params.N to numberOfImages in the generation config.
-	// Gemini's generateContent supports numberOfImages to request multiple images.
+	// Gemini's generateContent supports numberOfImages (top-level GenerationConfig
+	// field) to request multiple images.
 	if params.N > 1 {
 		genConfig["numberOfImages"] = params.N
 	}
 
 	// Note: params.Size is not supported by the Gemini generateContent endpoint.
-	// Use provider options {"google": {"imageConfig": {"imageSize": "1K"}}} instead.
+	// Use provider options {"google": {"imageSize": "1K"}} instead (top-level
+	// GenerationConfig field, not nested under imageConfig).
 
 	// Build imageConfig from params and provider options.
 	imageConfig := map[string]any{}
@@ -215,11 +233,21 @@ func (m *geminiImageModel) DoGenerate(ctx context.Context, params provider.Image
 	}
 
 	// Extract google-specific options for image config (overrides params).
+	// imageSize is not an official ImageConfig field -- it belongs at the
+	// top level of generationConfig, so it is hoisted out of imageConfig.
 	if gopts, ok := params.ProviderOptions["google"].(map[string]any); ok {
 		if ic, ok := gopts["imageConfig"].(map[string]any); ok {
 			for k, v := range ic {
+				if k == "imageSize" {
+					genConfig["imageSize"] = v
+					continue
+				}
 				imageConfig[k] = v
 			}
+		}
+		// Support a top-level imageSize provider option as well.
+		if sz, ok := gopts["imageSize"].(string); ok && sz != "" {
+			genConfig["imageSize"] = sz
 		}
 	}
 
@@ -244,11 +272,13 @@ func (m *geminiImageModel) DoGenerate(ctx context.Context, params provider.Image
 	jsonBody := httpc.MustMarshalJSON(body)
 	req := httpc.MustNewRequest(ctx, "POST", reqURL, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", token)
 
 	for k, v := range m.opts.headers {
 		req.Header.Set(k, v)
 	}
+	// Set the credential last so it wins over any caller-supplied header
+	// named like the auth header.
+	req.Header.Set("x-goog-api-key", token)
 
 	resp, err := m.httpClient().Do(req)
 	if err != nil {
@@ -257,11 +287,11 @@ func (m *geminiImageModel) DoGenerate(ctx context.Context, params provider.Image
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxGoogleErrorBodyBytes))
 		return nil, goai.ParseHTTPErrorWithHeaders("google", resp.StatusCode, respBody, resp.Header)
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readSuccessBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}

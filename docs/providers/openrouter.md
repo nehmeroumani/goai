@@ -55,10 +55,13 @@ fmt.Println(result.Text)
 | `WithBaseURL(url)` | `string` | Override the default `https://openrouter.ai/api/v1` endpoint |
 | `WithHeaders(h)` | `map[string]string` | Set additional HTTP headers |
 | `WithHTTPClient(c)` | `*http.Client` | Set a custom `*http.Client` |
+| `WithProviderRouting(prefs...)` | `...string` | Set provider routing preferences (e.g. `"Anthropic"`, `"Auto"`). Sent as the body `provider` field with the given order and fallbacks disabled. |
+| `WithRoute(route)` | `string` | Pin the request to a specific OpenRouter route (e.g. `"fallback"`). Sent as the body `route` field. |
+| `WithSessionID(id)` | `string` | Attach a session identifier for session-based pricing and analytics. Sent as the body `session_id` field. |
 
 ## Notes
 
-- Supports image inputs (depends on the underlying model).
+- Declares text-only chat capability; image input support is not exposed by this provider.
 - Automatically sends `HTTP-Referer` and `X-Title` headers as recommended by OpenRouter's API.
 - Usage reporting is enabled by default (`usage: {include: true}` in request body).
 - Environment variable `OPENROUTER_BASE_URL` can override the default endpoint.

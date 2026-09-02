@@ -90,14 +90,21 @@ func buildConverseRequest(params provider.GenerateParams, modelID string) map[st
 	if len(params.StopSequences) > 0 {
 		inferenceConfig["stopSequences"] = params.StopSequences
 	}
-	// TopK from provider options.
-	if params.ProviderOptions != nil {
-		if topK, ok := params.ProviderOptions["topK"]; ok {
-			inferenceConfig["topK"] = topK
-		}
-	}
 	if len(inferenceConfig) > 0 {
 		body["inferenceConfig"] = inferenceConfig
+	}
+
+	// Model-specific request fields from provider options.
+	// guardrailConfig and promptVariables are top-level Converse request
+	// fields (not under inferenceConfig, which only accepts
+	// maxTokens/stopSequences/temperature/topP).
+	if params.ProviderOptions != nil {
+		if v, ok := params.ProviderOptions["guardrailConfig"]; ok {
+			body["guardrailConfig"] = v
+		}
+		if v, ok := params.ProviderOptions["promptVariables"]; ok {
+			body["promptVariables"] = v
+		}
 	}
 
 	// Per-request headers (extracted in transport layer before JSON marshaling).

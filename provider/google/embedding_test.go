@@ -313,6 +313,34 @@ func TestEmbedding_WithHeaders(t *testing.T) {
 	}
 }
 
+func TestEmbedding_AuthHeaderWinsOverWithHeaders(t *testing.T) {
+	// A caller-supplied WithHeaders header named like the auth header must
+	// NOT override the real credential. The credential is set after the
+	// headers loop.
+	var gotKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("x-goog-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"embeddings": []map[string]any{{"values": []float64{0.1}}},
+		})
+	}))
+	defer srv.Close()
+
+	model := Embedding("text-embedding-004",
+		WithAPIKey("real-key"),
+		WithBaseURL(srv.URL),
+		WithHeaders(map[string]string{"x-goog-api-key": "spoofed-key"}),
+	)
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotKey != "real-key" {
+		t.Errorf("x-goog-api-key = %q, want real-key (credential must win over WithHeaders)", gotKey)
+	}
+}
+
 func TestEmbedding_SendRequestError(t *testing.T) {
 	model := Embedding("text-embedding-004",
 		WithAPIKey("test-key"),
@@ -402,6 +430,46 @@ func TestEmbedding_TaskType(t *testing.T) {
 	}
 	if len(result.Embeddings) != 1 {
 		t.Fatalf("expected 1 embedding, got %d", len(result.Embeddings))
+	}
+}
+
+func TestEmbedding_Title(t *testing.T) {
+	// The Gemini API accepts a title for taskType RETRIEVAL_DOCUMENT. It must
+	// be forwarded on each request.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+
+		requests := req["requests"].([]any)
+		first := requests[0].(map[string]any)
+		if first["taskType"] != "RETRIEVAL_DOCUMENT" {
+			t.Errorf("taskType = %v, want RETRIEVAL_DOCUMENT", first["taskType"])
+		}
+		if first["title"] != "Quarterly Report 2026" {
+			t.Errorf("title = %v, want Quarterly Report 2026", first["title"])
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"embeddings": []map[string]any{
+				{"values": []float64{0.1}},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	model := Embedding("text-embedding-004", WithAPIKey("test-key"), WithBaseURL(srv.URL))
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{
+		ProviderOptions: map[string]any{
+			"google": map[string]any{
+				"taskType": "RETRIEVAL_DOCUMENT",
+				"title":    "Quarterly Report 2026",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -506,5 +574,38 @@ func TestEmbedding_ResponseModelPopulated(t *testing.T) {
 	}
 	if result.Response.Model != "text-embedding-004" {
 		t.Errorf("Response.Model = %q, want %q", result.Response.Model, "text-embedding-004")
+	}
+}
+
+func TestEmbedding_ResponseBodyTooLarge(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Body larger than maxGoogleSuccessBodyBytes (64 MiB) must be rejected.
+		_, _ = w.Write(make([]byte, maxGoogleSuccessBodyBytes+1))
+	}))
+	defer srv.Close()
+
+	model := Embedding("text-embedding-004", WithAPIKey("test-key"), WithBaseURL(srv.URL))
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err == nil {
+		t.Fatal("expected error for oversized success response")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want it to mention the size limit", err.Error())
+	}
+}
+
+func TestEmbedding_ErrorBodyTooLarge(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		// Error body larger than maxGoogleErrorBodyBytes (1 MiB) must be bounded.
+		_, _ = w.Write(make([]byte, maxGoogleErrorBodyBytes+1))
+	}))
+	defer srv.Close()
+
+	model := Embedding("text-embedding-004", WithAPIKey("test-key"), WithBaseURL(srv.URL))
+	_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+	if err == nil {
+		t.Fatal("expected error for HTTP 500 response")
 	}
 }

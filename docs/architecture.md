@@ -13,18 +13,18 @@ GoAI is a Go SDK that provides one unified API across 25+ LLM providers. This do
 ┌─────────────────────────────────────────────────────────────────┐
 │                        User Application                         │
 │  goai.GenerateText / StreamText / GenerateObject / StreamObject │
-│  goai.Embed / EmbedMany / GenerateImage                         │
+│  goai.Embed / EmbedMany / GenerateImage / GenerateVideo         │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
                     options, retry, caching
                                │
 ┌──────────────────────────────▼──────────────────────────────────┐
 │                     Provider Interfaces                         │
-│         LanguageModel · EmbeddingModel · ImageModel             │
+│    LanguageModel · EmbeddingModel · ImageModel · VideoModel     │
 └──┬─────────┬──────────┬──────────┬──────────┬─────────┬──────────┘
    │         │          │          │          │         │
 ┌──▼───┐ ┌───▼───┐ ┌───▼───┐ ┌───▼────┐ ┌───▼──┐ ┌───▼────────┐
-│OpenAI│ │Anthro.│ │Google │ │Bedrock │ │Cohere│ │13 compat   │
+│OpenAI│ │Anthro.│ │Google │ │Bedrock │ │Cohere│ │18 compat   │
 │      │ │       │ │       │ │        │ │      │ │providers   │
 └──┬───┘ └───┬───┘ └───┬───┘ └───┬────┘ └───┬──┘ └───┬────────┘
    │         │         │         │          │        │
@@ -37,7 +37,7 @@ GoAI is a Go SDK that provides one unified API across 25+ LLM providers. This do
                             │
                ┌────────────▼─────────────┐
                │  internal/openaicompat   │
-               │  Shared codec for 13     │
+               │  Shared codec for 18     │
                │  OpenAI-compatible APIs  │
                └────────────┬─────────────┘
                             │
@@ -59,7 +59,7 @@ GoAI is structured as three layers:
 
 ### 1. Core SDK (`goai` package)
 
-The top-level `goai` package exposes 7 core functions — the only public API that users interact with:
+The top-level `goai` package exposes 8 primary core functions, alongside public options, state, hooks, message builders, and result types:
 
 | Function            | File          | Description                                                |
 | ------------------- | ------------- | ---------------------------------------------------------- |
@@ -70,6 +70,7 @@ The top-level `goai` package exposes 7 core functions — the only public API th
 | `Embed`             | `embed.go`    | Single text embedding                                      |
 | `EmbedMany`         | `embed.go`    | Batch embeddings with auto-chunking and parallel execution |
 | `GenerateImage`     | `image.go`    | Image generation                                           |
+| `GenerateVideo`     | `video.go`    | Video generation with long-running operation polling       |
 
 Supporting modules in the core:
 
@@ -83,7 +84,7 @@ Supporting modules in the core:
 
 ### 2. Provider Interfaces (`provider` package)
 
-The `provider` package defines three model interfaces that all providers implement:
+The `provider` package defines four model interfaces that providers implement as applicable:
 
 ```go
 type LanguageModel interface {
@@ -102,9 +103,14 @@ type ImageModel interface {
     ModelID() string
     DoGenerate(ctx context.Context, params ImageParams) (*ImageResult, error)
 }
+
+type VideoModel interface {
+    ModelID() string
+    DoGenerate(ctx context.Context, params VideoParams) (*VideoResult, error)
+}
 ```
 
-The provider package also defines all shared types: `Message`, `Part`, `StreamChunk`, `Usage`, `ToolDefinition`, `ToolCall`, `Source`, and `ResponseMetadata`.
+The provider package also defines all shared types: `Message`, `Part`, `StreamChunk`, `Usage`, `ToolDefinition`, `ToolCall`, `Source`, `ResponseMetadata`, `VideoParams`, and `VideoData`.
 
 An optional `CapableModel` interface allows providers to declare feature support (temperature, reasoning, attachment, tool calling, modalities).
 
@@ -112,7 +118,7 @@ An optional `CapableModel` interface allows providers to declare feature support
 
 | Package                 | Description                                                                                                                                                                                                    |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/openaicompat` | Shared request building and response parsing for all OpenAI-compatible APIs. `BuildRequest` constructs the wire format, `ParseStream`/`ParseResponse` decode responses into GoAI types. Used by 14 packages directly. |
+| `internal/openaicompat` | Shared request building and response parsing for all OpenAI-compatible APIs. `BuildRequest` constructs the wire format, `ParseStream`/`ParseResponse` decode responses into GoAI types. Used by 18 provider implementation files directly. |
 | `internal/gemini`       | Gemini schema sanitization (`SanitizeSchema`). Used by the Vertex and Google providers to conform JSON Schemas to Gemini's stricter requirements.                                                                     |
 | `internal/sse`          | Minimal SSE (Server-Sent Events) scanner. Handles `data:` prefix, blank lines, `[DONE]` sentinel. JSON deserialization is left to the caller.                                                                         |
 | `internal/httpc`        | HTTP utilities: `MustMarshalJSON`, `MustNewRequest`, `ParseDataURL`. Shared across all providers.                                                                                                                     |
@@ -135,26 +141,27 @@ These providers implement their own request/response codec because their APIs di
 
 ### OpenAI-Compatible Providers (shared codec)
 
-14 packages directly import `internal/openaicompat` (including `openai` for its Chat Completions path). Each thin wrapper:
+18 provider implementation files directly import `internal/openaicompat` (including `openai` for its Chat Completions path). Each thin wrapper:
 
 1. Sets the correct base URL and auth headers
 2. Resolves credentials from environment variables
 3. Delegates to `openaicompat.BuildRequest` / `ParseStream` / `ParseResponse`
 
 ```
-Direct openaicompat importers (14):
+Direct openaicompat importers (18 provider files):
 ├── openai/      ← Chat Completions path uses openaicompat; Responses path is native
 ├── vertex/      ← Uses OAuth2 ADC for auth
 ├── mistral/     ├── groq/       ├── xai/
 ├── deepseek/    ├── fireworks/  ├── together/
 ├── deepinfra/   ├── openrouter/ ├── perplexity/
-├── cerebras/    ├── runpod/
+├── cerebras/    ├── runpod/      ├── cloudflare/
+├── fptcloud/    ├── nvidia/      ├── requesty/
 └── compat/      ← Generic, user-configured endpoint
 
 Indirect users (via delegation):
 ├── azure/       ← Delegates to openai/ (OpenAI models), anthropic/ (Claude), AI Services (others)
 ├── minimax/     ← Delegates to anthropic/ (Anthropic-compatible API)
-├── ollama/      ← Wraps compat/ (localhost:11434)
+├── ollama/      ← Native /api/chat + /api/embed (localhost:11434)
 └── vllm/        ← Wraps compat/ (localhost:8000)
 ```
 
@@ -205,7 +212,7 @@ User calls goai.StreamText(ctx, model, opts...)
   │   │   └─ Inside provider DoStream:
   │   │       ├─ Build HTTP request (provider-specific)
   │   │       ├─ Send HTTP POST (streaming)
-  │   │       ├─ Create channel (cap 64)
+  │   │       ├─ Create buffered channel (capacity is provider-specific)
   │   │       ├─ Launch goroutine: parse SSE → emit StreamChunks
   │   │       └─ Return StreamResult{Stream: <-chan StreamChunk}
   │   └─ Wrap in TextStream
@@ -262,7 +269,7 @@ Each step fires `OnStepFinish` and `OnToolCall` callbacks. Usage is aggregated a
 
 ## Streaming Architecture
 
-Streaming uses Go channels (`<-chan StreamChunk`) with a buffer size of 64. Each provider launches a goroutine that:
+Streaming uses buffered Go channels (`<-chan StreamChunk`); capacity is provider-specific (most use 64, while native Ollama uses 32). Each provider launches a goroutine that:
 
 1. Reads SSE events from the HTTP response body
 2. Parses each event into `StreamChunk` structs
@@ -281,7 +288,7 @@ Streaming uses Go channels (`<-chan StreamChunk`) with a buffer size of 64. Each
 
 ### TokenSource Interface
 
-All providers accept either a static API key or a dynamic `TokenSource`:
+Hosted providers generally accept a static API key, a dynamic `TokenSource`, or provider-specific cloud credentials. Local Ollama requires no auth:
 
 ```go
 type TokenSource interface {
@@ -338,7 +345,7 @@ HTTP error response
 `withRetry[T]` is a generic retry wrapper used by all core functions:
 
 - Attempts: `maxRetries + 1` (default `maxRetries = 2`, so 3 total attempts)
-- Only retries on `APIError.IsRetryable` (429, 5xx; also OpenAI 404)
+- Retries `APIError.IsRetryable` failures (429, 5xx; also OpenAI 404) and recognized transient network failures
 - Respects `Retry-After-ms` (OpenAI) and `Retry-After` (standard) headers
 - Falls back to exponential backoff: base 2s, factor 2x, jitter 0.5–1.5x, cap 60s
 - Context cancellation aborts retries immediately
@@ -348,7 +355,7 @@ HTTP error response
 `SchemaFrom[T]()` generates JSON Schema from Go types via reflection, compatible with OpenAI strict mode:
 
 - All properties are `required` (pointer types become `nullable` via `type: ["<base>", "null"]`)
-- `additionalProperties: false` on all objects
+- `additionalProperties: false` on struct schemas; string-keyed maps use their element schema as `additionalProperties`
 - Supports struct tags: `json:"name"` for naming, `jsonschema:"description=...,enum=a|b|c"` for metadata
 - Flattens embedded structs
 - Handles all Go primitive types, slices, maps, and nested structs
@@ -359,7 +366,7 @@ When enabled via `WithPromptCaching(true)`, `applyCaching` copies messages (neve
 
 ## Design Principles
 
-1. **Minimal dependencies** — core requires only `golang.org/x/oauth2` for Vertex AI ADC. Optional submodules (`observability/otel`) use separate `go.mod` files.
+1. **Minimal dependencies** — core runtime code requires only `golang.org/x/oauth2` for Vertex AI ADC (`go.uber.org/goleak` is test-only). Optional submodules (`observability/otel`) use separate `go.mod` files.
 2. **Vercel AI SDK is the reference** — wire formats, option names, and behaviors match Vercel
 3. **No input mutation** — all functions copy slices/maps before modifying
 4. **Mutex-free network calls** — never hold a mutex during I/O
@@ -376,8 +383,8 @@ Key architectural decisions that shape the SDK:
 - **Token caching without blocking**: `CachedTokenSource` releases mutex before network calls, accepting brief double‑fetch to avoid goroutine deadlock.
 - **Cross‑provider error pattern matching**: 14 regex patterns detect "context overflow" across 25+ providers' inconsistent error messages, enabling uniform `ContextOverflowError`.
 - **Bedrock AWS independence**: Manual SigV4 signing and EventStream binary protocol parsing avoid AWS SDK dependency.
-- **Provider‑defined tools scale**: 20 tools across 5 providers, each with options structs, version handling, and provider‑specific serialization (~1200 LOC).
-- **Structured output multi‑strategy**: Anthropic uses native `output_format` (Opus 4.1+, Sonnet 4.5+: claude‑opus‑4‑1, claude‑sonnet‑4‑5, claude‑opus‑4‑5, claude‑sonnet‑4‑6, claude‑opus‑4‑6) or tool trick (older models), adapting to varying provider capabilities.
+- **Provider‑defined tools scale**: 23 tools across 5 providers, each with options structs, version handling, and provider‑specific serialization.
+- **Structured output multi‑strategy**: Anthropic uses native `output_format` (claude‑opus‑4‑5/4‑6/4‑7/4‑8, claude‑sonnet‑4‑5/4‑6, claude‑haiku‑4‑5, claude‑opus‑5, claude‑sonnet‑5, claude‑fable‑5, claude‑mythos‑5) or tool trick (older models), adapting to varying provider capabilities.
 
 These decisions maintain a single API surface while supporting diverse provider implementations.
 
@@ -389,6 +396,7 @@ goai/
 ├── object.go               # GenerateObject[T], StreamObject[T], ObjectStream
 ├── embed.go                # Embed, EmbedMany (auto-chunking, parallel)
 ├── image.go                # GenerateImage
+├── video.go                # GenerateVideo
 ├── options.go              # Functional options (WithPrompt, WithTools, etc.)
 ├── schema.go               # SchemaFrom[T] — JSON Schema from Go structs
 ├── errors.go               # APIError, ContextOverflowError, overflow detection
@@ -396,7 +404,7 @@ goai/
 ├── caching.go              # Prompt cache control
 │
 ├── provider/
-│   ├── provider.go         # LanguageModel, EmbeddingModel, ImageModel interfaces
+│   ├── provider.go         # LanguageModel, EmbeddingModel, ImageModel, VideoModel interfaces
 │   ├── types.go            # Message, Part, StreamChunk, Usage, ToolDefinition, etc.
 │   ├── token.go            # TokenSource, CachedTokenSource, StaticToken
 │   │
@@ -418,6 +426,6 @@ goai/
 │   ├── sse/                # SSE line parser (data: prefix, [DONE] sentinel)
 │   └── httpc/              # HTTP helpers (MustMarshalJSON, MustNewRequest, ParseDataURL)
 │
-├── examples/               # 26 runnable examples (including 7 MCP examples)
+├── examples/               # 33 runnable examples (including 8 MCP examples)
 └── bench/                  # Performance benchmarks (GoAI vs Vercel AI SDK)
 ```

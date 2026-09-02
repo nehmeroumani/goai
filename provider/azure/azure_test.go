@@ -3,12 +3,15 @@ package azure
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zendev-sh/goai/provider"
 	"github.com/zendev-sh/goai/provider/openai"
@@ -65,6 +68,112 @@ func TestChat_Stream(t *testing.T) {
 	}
 	if len(texts) != 1 || texts[0] != "Hello" {
 		t.Errorf("texts = %v, want [Hello]", texts)
+	}
+}
+
+func TestChat_ResponsesStreamDataOnlyFraming(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "\xef\xbb\xbfdata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\r\r")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\r\r")
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-5", WithAPIKey("test-key"), WithEndpoint(server.URL))
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var text string
+	var gotFinish bool
+	for chunk := range result.Stream {
+		if chunk.Type == provider.ChunkError {
+			t.Fatalf("unexpected stream error: %v", chunk.Error)
+		}
+		if chunk.Type == provider.ChunkText {
+			text += chunk.Text
+		}
+		gotFinish = gotFinish || chunk.Type == provider.ChunkFinish
+	}
+	if text != "Hello" || !gotFinish {
+		t.Fatalf("text = %q, finish = %v; want Hello and finish", text, gotFinish)
+	}
+}
+
+func TestChat_ResponsesStreamIdleTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	model := Chat(
+		"gpt-5",
+		WithAPIKey("test-key"),
+		WithEndpoint(server.URL),
+		WithResponsesStreamIdleTimeout(25*time.Millisecond),
+	)
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var streamErr error
+	for chunk := range result.Stream {
+		if chunk.Type == provider.ChunkError {
+			streamErr = chunk.Error
+		}
+	}
+	var idleErr *openai.StreamIdleTimeoutError
+	if !errors.As(streamErr, &idleErr) || idleErr.Idle != 25*time.Millisecond {
+		t.Fatalf("stream error = %T %v, want Azure-forwarded idle timeout", streamErr, streamErr)
+	}
+}
+
+func TestChat_ResponsesStreamDoneCompatibility(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	model := Chat(
+		"gpt-5",
+		WithAPIKey("test-key"),
+		WithEndpoint(server.URL),
+		WithResponsesStreamDoneCompatibility(true),
+	)
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var gotFinish bool
+	for chunk := range result.Stream {
+		if chunk.Type == provider.ChunkError {
+			t.Fatalf("unexpected stream error: %v", chunk.Error)
+		}
+		gotFinish = gotFinish || chunk.Type == provider.ChunkFinish
+	}
+	if !gotFinish {
+		t.Fatal("Azure [DONE] compatibility option did not finish the stream")
 	}
 }
 
@@ -502,6 +611,111 @@ func TestRequestHeaders(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestChat_WithHeadersCannotOverrideAzureKey verifies SEC-2: a caller's
+// WithHeaders({"api-key": ...}) / WithHeaders({"Authorization": ...}) must NOT
+// override the configured Azure credential on the chat path. The Azure auth is
+// applied after custom headers so it always wins.
+func TestChat_WithHeadersCannotOverrideAzureKey(t *testing.T) {
+	var gotAPIKey, gotAuth, gotCustom string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAPIKey = r.Header.Get("api-key")
+		gotAuth = r.Header.Get("Authorization")
+		gotCustom = r.Header.Get("X-Custom")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, okResponsesJSON)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o",
+		WithAPIKey("real-azure-key"),
+		WithEndpoint(server.URL),
+		WithHeaders(map[string]string{
+			"api-key":       "spoofed-key",
+			"Authorization": "Bearer spoofed-token",
+			"X-Custom":      "still-passed",
+		}),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAPIKey != "real-azure-key" {
+		t.Errorf("api-key = %q, want %q (caller WithHeaders must not override Azure key)", gotAPIKey, "real-azure-key")
+	}
+	if gotAuth != "" {
+		t.Errorf("Authorization = %q, want empty (Azure api-key auth wins)", gotAuth)
+	}
+	if gotCustom != "still-passed" {
+		t.Errorf("X-Custom = %q, want %q (non-auth custom headers must still flow through)", gotCustom, "still-passed")
+	}
+}
+
+// TestImage_WithHeadersCannotOverrideAzureKey verifies SEC-2 on the image path
+// (also served by azureRoundTripper).
+func TestImage_WithHeadersCannotOverrideAzureKey(t *testing.T) {
+	var gotAPIKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAPIKey = r.Header.Get("api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"data":[{"b64_json":"aGVsbG8="}]}`)
+	}))
+	defer server.Close()
+
+	model := Image("dall-e-3",
+		WithAPIKey("real-azure-key"),
+		WithEndpoint(server.URL),
+		WithHeaders(map[string]string{"api-key": "spoofed-key"}),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "a cat", N: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAPIKey != "real-azure-key" {
+		t.Errorf("api-key = %q, want %q (caller WithHeaders must not override Azure key)", gotAPIKey, "real-azure-key")
+	}
+}
+
+// TestAIServices_WithHeadersCannotOverrideAzureKey verifies SEC-2 on the Azure
+// AI Services round-tripper (non-OpenAI models such as DeepSeek/Llama/Phi).
+func TestAIServices_WithHeadersCannotOverrideAzureKey(t *testing.T) {
+	var gotAPIKey, gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAPIKey = r.Header.Get("api-key")
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, okChatJSON)
+	}))
+	defer server.Close()
+
+	transport := &aiServicesRoundTripper{
+		base:       http.DefaultTransport,
+		apiKey:     "real-azure-key",
+		headers:    map[string]string{"api-key": "spoofed-key", "Authorization": "Bearer spoofed-token"},
+		apiVersion: defaultAIServicesAPIVersion,
+	}
+	httpClient := &http.Client{Transport: transport}
+	model := &chatCompletionsModel{inner: openai.Chat("DeepSeek-V3.1", openai.WithHTTPClient(httpClient), openai.WithAPIKey("x"), openai.WithBaseURL(server.URL))}
+
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAPIKey != "real-azure-key" {
+		t.Errorf("api-key = %q, want %q (caller WithHeaders must not override Azure key)", gotAPIKey, "real-azure-key")
+	}
+	if gotAuth != "" {
+		t.Errorf("Authorization = %q, want empty (Azure api-key auth wins)", gotAuth)
 	}
 }
 
@@ -1196,8 +1410,8 @@ func TestAIServices_TokenSourceError(t *testing.T) {
 func TestForceChatCompletions_PreservesExistingOptions(t *testing.T) {
 	params := provider.GenerateParams{
 		ProviderOptions: map[string]any{
-			"user":       "test-user",
-			"customKey":  42,
+			"user":      "test-user",
+			"customKey": 42,
 		},
 	}
 	forceChatCompletions(&params)
@@ -1381,4 +1595,142 @@ func (t *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	newReq.URL = parsed
 	newReq.Host = parsed.Host
 	return http.DefaultTransport.RoundTrip(newReq)
+}
+
+// TestChat_UseMaxCompletionTokens verifies that WithUseMaxCompletionTokens
+// renames max_tokens to max_completion_tokens on the Chat Completions wire
+// (item #7) -- needed because Azure deployment names defeat the reasoning-model
+// heuristic.
+func TestChat_UseMaxCompletionTokens(t *testing.T) {
+	var capturedBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/openai/deployments/gpt-4o/chat/completions" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		raw, _ := io.ReadAll(r.Body)
+		capturedBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, okChatJSON)
+	}))
+	defer server.Close()
+
+	// gpt-4o reaches the azureRoundTripper Chat Completions path and is NOT a
+	// reasoning model, so without the option max_tokens stays -- a clean way to
+	// prove the option alone drives the rename (as it must for reasoning
+	// deployments whose names defeat the heuristic).
+	model := Chat("gpt-4o",
+		WithAPIKey("k"),
+		WithEndpoint(server.URL),
+		WithDeploymentBasedURLs(true), // forces Chat Completions path
+		WithUseMaxCompletionTokens(true),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		MaxOutputTokens: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal([]byte(capturedBody), &body); err != nil {
+		t.Fatalf("captured body not JSON: %v (%q)", err, capturedBody)
+	}
+	if _, ok := body["max_tokens"]; ok {
+		t.Error("max_tokens must be renamed to max_completion_tokens")
+	}
+	if body["max_completion_tokens"] != float64(100) {
+		t.Errorf("max_completion_tokens = %v, want 100", body["max_completion_tokens"])
+	}
+}
+
+// TestChat_WithoutUseMaxCompletionTokens verifies the default behaviour is
+// unchanged: max_tokens stays as-is when the option is not enabled.
+func TestChat_WithoutUseMaxCompletionTokens(t *testing.T) {
+	var capturedBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		capturedBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, okChatJSON)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o",
+		WithAPIKey("k"),
+		WithEndpoint(server.URL),
+		WithDeploymentBasedURLs(true),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		MaxOutputTokens: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal([]byte(capturedBody), &body); err != nil {
+		t.Fatalf("captured body not JSON: %v (%q)", err, capturedBody)
+	}
+	if _, ok := body["max_completion_tokens"]; ok {
+		t.Error("max_completion_tokens should not be set without the option")
+	}
+	if body["max_tokens"] != float64(100) {
+		t.Errorf("max_tokens = %v, want 100", body["max_tokens"])
+	}
+}
+
+// TestChat_UseMaxCompletionTokens_GoldenBody is a golden full-body REQUEST
+// contract test (item #7): with WithUseMaxCompletionTokens(true) the outgoing
+// Chat Completions body must carry max_completion_tokens (not max_tokens) and
+// otherwise match the expected schema exactly.
+func TestChat_UseMaxCompletionTokens_GoldenBody(t *testing.T) {
+	var capturedBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/openai/deployments/gpt-4o/chat/completions" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		raw, _ := io.ReadAll(r.Body)
+		capturedBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, okChatJSON)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o",
+		WithAPIKey("k"),
+		WithEndpoint(server.URL),
+		WithDeploymentBasedURLs(true),
+		WithUseMaxCompletionTokens(true),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		MaxOutputTokens: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(capturedBody), &got); err != nil {
+		t.Fatalf("captured body not JSON: %v (%q)", err, capturedBody)
+	}
+	want := map[string]any{
+		"model":                 "gpt-4o",
+		"stream":                false,
+		"messages":              []any{map[string]any{"role": "user", "content": "hi"}},
+		"max_completion_tokens": float64(100),
+	}
+	if !reflect.DeepEqual(got, want) {
+		gotJSON, _ := json.Marshal(got)
+		wantJSON, _ := json.Marshal(want)
+		t.Errorf("request body mismatch:\n got: %s\nwant: %s", gotJSON, wantJSON)
+	}
 }

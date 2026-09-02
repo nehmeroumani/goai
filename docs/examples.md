@@ -279,7 +279,7 @@ MCP (Model Context Protocol) client examples. Connect to MCP servers and use the
 
 MCP tools with GoAI LLM integration. Connects to an MCP server, converts its tools, and passes them to `GenerateText` for an agent loop.
 
-> **Note:** This example requires a local MCP test server implementation compatible with the commands used in `examples/mcp-tools/main.go`.
+> **Note:** This example prefers the local MCP test server when available and otherwise falls back to the public `@modelcontextprotocol/server-filesystem` server.
 
 - **Provider:** Google Gemini
 - **Features:** `mcp.NewStdioTransport`, `mcp.NewClient`, `mcp.ConvertTools`, `goai.WithTools`, `WithMaxSteps`

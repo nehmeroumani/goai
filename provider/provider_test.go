@@ -70,6 +70,19 @@ func (m *mockImageModel) DoGenerate(_ context.Context, _ provider.ImageParams) (
 	}, nil
 }
 
+// mockVideoModel implements provider.VideoModel for testing.
+type mockVideoModel struct {
+	id string
+}
+
+func (m *mockVideoModel) ModelID() string { return m.id }
+
+func (m *mockVideoModel) DoGenerate(_ context.Context, _ provider.VideoParams) (*provider.VideoResult, error) {
+	return &provider.VideoResult{
+		Videos: []provider.VideoData{{Data: []byte("fake-mp4"), MediaType: "video/mp4"}},
+	}, nil
+}
+
 func TestLanguageModelInterface(t *testing.T) {
 	var model provider.LanguageModel = &mockLanguageModel{
 		id: "gpt-4o",
@@ -177,6 +190,24 @@ func TestImageModelInterface(t *testing.T) {
 	}
 	if result.Images[0].MediaType != "image/png" {
 		t.Errorf("MediaType = %q, want %q", result.Images[0].MediaType, "image/png")
+	}
+}
+
+func TestVideoModelInterface(t *testing.T) {
+	var model provider.VideoModel = &mockVideoModel{id: "veo-3.1-generate-preview"}
+
+	if model.ModelID() != "veo-3.1-generate-preview" {
+		t.Errorf("ModelID() = %q", model.ModelID())
+	}
+
+	result, err := model.DoGenerate(t.Context(), provider.VideoParams{
+		Prompt: "a cat walking", N: 1, AspectRatio: "16:9",
+	})
+	if err != nil {
+		t.Fatalf("DoGenerate error: %v", err)
+	}
+	if len(result.Videos) != 1 || result.Videos[0].MediaType != "video/mp4" {
+		t.Fatalf("videos = %+v", result.Videos)
 	}
 }
 
@@ -644,7 +675,6 @@ func TestCachedTokenSource_InvalidateDuringFetch(t *testing.T) {
 		t.Errorf("Token = %q, want %q", fetchTok, "slow-token")
 	}
 }
-
 
 // TestToolResult_JSONMarshal_ErrorAsString verifies FIX 19: ToolResult.Error
 // (an interface) marshals as a string via err.Error() rather than the default

@@ -404,3 +404,62 @@ func TestChat_PromptCachingIgnored(t *testing.T) {
 	for range streamResult.Stream {
 	}
 }
+
+// Item 45: the default Together base URL must be the current
+// https://api.together.ai/v1 host, not the legacy api.together.xyz.
+func TestChat_DefaultBaseURLIsTogetherAI(t *testing.T) {
+	var gotURL string
+	tr := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		gotURL = req.URL.String()
+		return okResponse(), nil
+	})
+	t.Setenv("TOGETHER_AI_API_KEY", "k")
+	t.Setenv("TOGETHER_AI_BASE_URL", "") // ensure no env override
+	m := Chat("meta-llama/Llama-3.3-70B-Instruct-Turbo", WithHTTPClient(&http.Client{Transport: tr}))
+	_, err := m.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(gotURL, "https://api.together.ai/v1/") {
+		t.Errorf("URL = %q, want default https://api.together.ai/v1/", gotURL)
+	}
+}
+
+// Item 47: together opts into IncludeReasoningContent, so an assistant message
+// carrying a reasoning part must serialize reasoning_content on the outgoing
+// request body.
+func TestChat_RoundTripsReasoningContent(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("meta-llama/Llama-3.3-70B-Instruct-Turbo", WithAPIKey("k"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{
+			Role: provider.RoleAssistant,
+			Content: []provider.Part{
+				{Type: provider.PartReasoning, Text: "let me think"},
+				{Type: provider.PartText, Text: "answer"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, ok := gotBody["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("messages = %v", gotBody["messages"])
+	}
+	assistant := msgs[0].(map[string]any)
+	if assistant["reasoning_content"] != "let me think" {
+		t.Errorf("reasoning_content = %v, want 'let me think'", assistant["reasoning_content"])
+	}
+}

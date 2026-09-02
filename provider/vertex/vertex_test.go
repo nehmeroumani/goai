@@ -7,11 +7,32 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zendev-sh/goai/provider"
 )
+
+type requestTrackingTransport struct {
+	responseBody     io.ReadCloser
+	requestCollected chan struct{}
+}
+
+func (t *requestTrackingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	runtime.AddCleanup(req, func(collected chan struct{}) {
+		close(collected)
+	}, t.requestCollected)
+
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       t.responseBody,
+		Request:    req,
+	}, nil
+}
 
 func TestChat_Stream(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +71,62 @@ func TestChat_Stream(t *testing.T) {
 	}
 }
 
+func TestChat_Stream_DoesNotRetainRequestGraph(t *testing.T) {
+	reader, writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	requestCollected := make(chan struct{})
+	client := &http.Client{Transport: &requestTrackingTransport{
+		responseBody:     reader,
+		requestCollected: requestCollected,
+	}}
+	model := Chat("gemini-2.5-pro",
+		WithTokenSource(provider.StaticToken("test-token")),
+		WithBaseURL("http://vertex.test"),
+		WithHTTPClient(client))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	result, err := model.DoStream(ctx, provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The pipe keeps the stream active. The request and its serialized body
+	// should nevertheless be unreachable once DoStream returns.
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		runtime.GC()
+		select {
+		case <-requestCollected:
+			cancel()
+			for {
+				select {
+				case _, ok := <-result.Stream:
+					if !ok {
+						return
+					}
+				case <-timer.C:
+					t.Fatal("stream did not close after context cancellation")
+				}
+			}
+		case <-timer.C:
+			t.Fatal("active stream retained its response/request graph")
+		case <-ticker.C:
+		}
+	}
+}
+
 func TestChat_Generate(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -69,6 +146,119 @@ func TestChat_Generate(t *testing.T) {
 	if result.Text != "Hello world" {
 		t.Errorf("Text = %q", result.Text)
 	}
+}
+
+func TestChat_NativeGeminiVertex(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer oauth-token" {
+			t.Errorf("Authorization = %q, want Bearer oauth-token", got)
+		}
+		if got := r.Header.Get("X-Custom"); got != "value" {
+			t.Errorf("X-Custom = %q, want value", got)
+		}
+		if !strings.HasSuffix(r.URL.Path, "/gemini-2.5-pro:generateContent") {
+			t.Errorf("path = %q, want native generateContent endpoint", r.URL.Path)
+		}
+		_, _ = fmt.Fprint(w, `{"candidates":[{"content":{"parts":[{"text":"native"}]},"finishReason":"STOP"}]}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-pro",
+		WithNativeGemini(),
+		WithProject("my-proj"),
+		WithLocation("global"),
+		WithTokenSource(provider.StaticToken("oauth-token")),
+		WithNativeChatBaseURL(server.URL+"/models"),
+		WithHeaders(map[string]string{"X-Custom": "value"}),
+		WithHTTPClient(server.Client()))
+
+	result, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "native" {
+		t.Errorf("Text = %q, want native", result.Text)
+	}
+	if _, ok := model.(provider.FileUploadCapableModel); ok {
+		t.Fatalf("native Vertex model type %T must not implement FileUploadCapableModel", model)
+	}
+}
+
+func TestChat_NativeGeminiRejectsAPIKey(t *testing.T) {
+	model := Chat("gemini-2.5-flash",
+		WithNativeGemini(),
+		WithAPIKey("api-key"))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "OAuth token source") {
+		t.Fatalf("DoGenerate() error = %v, want OAuth token source error", err)
+	}
+}
+
+func TestChat_NativeGeminiRejectsCompatBaseURL(t *testing.T) {
+	model := Chat("gemini-2.5-pro",
+		WithNativeGemini(),
+		WithTokenSource(provider.StaticToken("oauth-token")),
+		WithBaseURL("https://compat.example.test"))
+	if got := model.ModelID(); got != "gemini-2.5-pro" {
+		t.Errorf("ModelID() = %q, want gemini-2.5-pro", got)
+	}
+	params := provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+	}
+	want := "use WithNativeChatBaseURL"
+	if _, err := model.DoGenerate(t.Context(), params); err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("DoGenerate() error = %v, want %q", err, want)
+	}
+	if _, err := model.DoStream(t.Context(), params); err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("DoStream() error = %v, want %q", err, want)
+	}
+}
+
+func TestChat_NativeChatBaseURLRequiresNativeTransport(t *testing.T) {
+	model := Chat("gemini-2.5-pro",
+		WithTokenSource(provider.StaticToken("oauth-token")),
+		WithNativeChatBaseURL("https://vertex.example.test/models"))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires WithNativeGemini") {
+		t.Fatalf("DoGenerate() error = %v, want native transport error", err)
+	}
+}
+
+func TestChatOnlyOptionsRejectedByOtherConstructors(t *testing.T) {
+	want := "only supported by Chat"
+	token := WithTokenSource(provider.StaticToken("oauth-token"))
+
+	t.Run("image", func(t *testing.T) {
+		model := Image("imagen-4.0-generate-001", token, WithNativeChatBaseURL("https://vertex.example.test/models"))
+		_, err := model.DoGenerate(t.Context(), provider.ImageParams{Prompt: "draw", N: 1})
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("DoGenerate() error = %v, want %q", err, want)
+		}
+	})
+
+	t.Run("embedding", func(t *testing.T) {
+		model := Embedding("text-embedding-004", token, WithNativeGemini())
+		_, err := model.DoEmbed(t.Context(), []string{"hello"}, provider.EmbedParams{})
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("DoEmbed() error = %v, want %q", err, want)
+		}
+	})
+
+	t.Run("anthropic", func(t *testing.T) {
+		model := AnthropicChat("claude-sonnet-4", token, WithNativeChatBaseURL("https://vertex.example.test/models"))
+		_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+			Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		})
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("DoGenerate() error = %v, want %q", err, want)
+		}
+	})
 }
 
 func TestNoProject(t *testing.T) {
@@ -291,6 +481,35 @@ func (tr *urlCapturingTransport) RoundTrip(req *http.Request) (*http.Response, e
 		Body:       io.NopCloser(strings.NewReader(`{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)),
 		Header:     make(http.Header),
 	}, nil
+}
+
+func TestAuthHeaderWinsOverWithHeaders(t *testing.T) {
+	// A caller-supplied WithHeaders header named like the auth header must
+	// NOT override the real credential on the chat doHTTP path.
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-pro",
+		WithTokenSource(provider.StaticToken("real-token")),
+		WithBaseURL(server.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer spoofed-token"}),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer real-token" {
+		t.Errorf("Authorization = %q, want %q (credential must win over WithHeaders)", gotAuth, "Bearer real-token")
+	}
 }
 
 func TestRequestHeaders(t *testing.T) {
@@ -538,7 +757,7 @@ func TestAutoTokenSource_HasProjectUsesADC(t *testing.T) {
 	}
 }
 
-func TestStripGeminiProviderOptions_RemovesThinkingConfig(t *testing.T) {
+func TestStripGeminiProviderOptions_MapsThinkingConfigToReasoningEffort(t *testing.T) {
 	params := &provider.GenerateParams{
 		ProviderOptions: map[string]any{
 			"thinkingConfig": map[string]any{"thinkingBudget": 1024},
@@ -549,14 +768,149 @@ func TestStripGeminiProviderOptions_RemovesThinkingConfig(t *testing.T) {
 	if _, ok := params.ProviderOptions["thinkingConfig"]; ok {
 		t.Error("expected thinkingConfig to be removed")
 	}
+	// Budget 1024 (< 8192) maps to medium.
+	if got := params.ProviderOptions["reasoning_effort"]; got != "medium" {
+		t.Errorf("reasoning_effort = %v, want medium", got)
+	}
 	if _, ok := params.ProviderOptions["otherOption"]; !ok {
 		t.Error("expected otherOption to be kept")
+	}
+}
+
+func TestStripGeminiProviderOptions_ThinkingBudgetBuckets(t *testing.T) {
+	cases := []struct {
+		name   string
+		tc     any
+		want   string
+		hasEff bool
+	}{
+		{"zero budget -> low", map[string]any{"thinkingBudget": 0}, "low", true},
+		{"small budget -> low", map[string]any{"thinkingBudget": 64}, "low", true},
+		{"medium budget -> medium", map[string]any{"thinkingBudget": 4096}, "medium", true},
+		{"default budget -> high", map[string]any{"thinkingBudget": 8192}, "high", true},
+		{"large budget -> high", map[string]any{"thinkingBudget": 98304}, "high", true},
+		{"no budget key -> default medium", map[string]any{}, "medium", true},
+		{"float budget", map[string]any{"thinkingBudget": float64(4096)}, "medium", true},
+		{"json.Number budget", map[string]any{"thinkingBudget": json.Number("4096")}, "medium", true},
+		{"json.Number invalid -> default", map[string]any{"thinkingBudget": json.Number("abc")}, "medium", true},
+		{"string budget -> default", map[string]any{"thinkingBudget": "abc"}, "medium", true},
+		{"bool true -> default medium", true, "medium", true},
+		{"bool false -> disabled", false, "", false},
+		{"unrecognized -> disabled", "nonsense", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			params := &provider.GenerateParams{
+				ProviderOptions: map[string]any{"thinkingConfig": tc.tc},
+			}
+			stripGeminiProviderOptions(params)
+			got, ok := params.ProviderOptions["reasoning_effort"]
+			if ok != tc.hasEff {
+				t.Fatalf("reasoning_effort present = %v, want %v", ok, tc.hasEff)
+			}
+			if tc.hasEff && got != tc.want {
+				t.Errorf("reasoning_effort = %v, want %v", got, tc.want)
+			}
+			if _, stillThere := params.ProviderOptions["thinkingConfig"]; stillThere {
+				t.Error("thinkingConfig should always be removed")
+			}
+		})
 	}
 }
 
 func TestStripGeminiProviderOptions_NilOptions(t *testing.T) {
 	params := &provider.GenerateParams{}
 	stripGeminiProviderOptions(params) // should not panic
+}
+
+// TestChat_ThinkingConfigMapsToReasoningEffortOnWire is a golden full-body
+// REQUEST contract test (item #29): a caller passing Gemini-native
+// thinkingConfig in ProviderOptions must see it stripped from the outgoing
+// OpenAI-compat body and translated to the reasoning_effort knob, so the
+// OpenAI-compatible Vertex endpoint receives a schema it understands.
+func TestChat_ThinkingConfigMapsToReasoningEffortOnWire(t *testing.T) {
+	var capturedBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		capturedBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-pro", WithTokenSource(provider.StaticToken("tok")), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		ProviderOptions: map[string]any{
+			"thinkingConfig": map[string]any{"thinkingBudget": 4096},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(capturedBody), &got); err != nil {
+		t.Fatalf("captured body not JSON: %v (%q)", err, capturedBody)
+	}
+	// thinkingConfig must be gone, reasoning_effort present (4096 < 8192 → medium).
+	if _, ok := got["thinkingConfig"]; ok {
+		t.Error("thinkingConfig must not be sent to the OpenAI-compat endpoint")
+	}
+	if got["reasoning_effort"] != "medium" {
+		t.Errorf("reasoning_effort = %v, want medium", got["reasoning_effort"])
+	}
+	// Golden full-body assertion: only the OpenAI-compat keys, nothing leaked.
+	want := map[string]any{
+		"model":            "google/gemini-2.5-pro",
+		"stream":           false,
+		"messages":         []any{map[string]any{"role": "user", "content": "hi"}},
+		"reasoning_effort": "medium",
+	}
+	if !reflect.DeepEqual(got, want) {
+		gotJSON, _ := json.Marshal(got)
+		wantJSON, _ := json.Marshal(want)
+		t.Errorf("request body mismatch:\n got: %s\nwant: %s", gotJSON, wantJSON)
+	}
+}
+
+// TestChat_ThinkingConfigDisabledOmitsReasoningEffort verifies that a
+// thinkingConfig:false (disabled) does not emit reasoning_effort at all.
+func TestChat_ThinkingConfigDisabledOmitsReasoningEffort(t *testing.T) {
+	var capturedBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		capturedBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gemini-2.5-pro", WithTokenSource(provider.StaticToken("tok")), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		ProviderOptions: map[string]any{
+			"thinkingConfig": false,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(capturedBody), &got); err != nil {
+		t.Fatalf("captured body not JSON: %v (%q)", err, capturedBody)
+	}
+	if _, ok := got["reasoning_effort"]; ok {
+		t.Error("reasoning_effort must not be emitted when thinking is disabled")
+	}
+	if _, ok := got["thinkingConfig"]; ok {
+		t.Error("thinkingConfig must be stripped")
+	}
 }
 
 func TestSanitizeToolSchemas_CleansTool(t *testing.T) {

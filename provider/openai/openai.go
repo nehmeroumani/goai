@@ -14,10 +14,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
-	"sync"
+	"time"
 
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/internal/httpc"
@@ -27,8 +26,9 @@ import (
 
 // Compile-time interface compliance checks.
 var (
-	_ provider.LanguageModel = (*chatModel)(nil)
-	_ provider.CapableModel  = (*chatModel)(nil)
+	_ provider.LanguageModel          = (*chatModel)(nil)
+	_ provider.CapableModel           = (*chatModel)(nil)
+	_ provider.FileUploadCapableModel = (*chatModel)(nil)
 )
 
 const defaultBaseURL = "https://api.openai.com/v1"
@@ -37,10 +37,14 @@ const defaultBaseURL = "https://api.openai.com/v1"
 type Option func(*options)
 
 type options struct {
-	tokenSource provider.TokenSource
-	baseURL     string
-	headers     map[string]string
-	httpClient  *http.Client
+	tokenSource                provider.TokenSource
+	baseURL                    string
+	headers                    map[string]string
+	httpClient                 *http.Client
+	responsesStreamIdleTimeout time.Duration
+	responsesStreamAllowDone   bool
+	outputFormat               string
+	useMaxCompletionTokens     *bool
 }
 
 // WithAPIKey sets a static API key for authentication.
@@ -82,9 +86,24 @@ func WithHTTPClient(c *http.Client) Option {
 	}
 }
 
+// WithUseMaxCompletionTokens forces Chat Completions requests to send
+// max_completion_tokens instead of max_tokens. Reasoning models (gpt-5,
+// o-series, codex) reject max_tokens outright and require
+// max_completion_tokens. The OpenAI layer normally infers this from the model
+// id, but callers whose wire id is not the model id (e.g. Azure deployments)
+// must opt in explicitly. Nil keeps the model-id heuristic.
+func WithUseMaxCompletionTokens(use bool) Option {
+	return func(o *options) {
+		o.useMaxCompletionTokens = &use
+	}
+}
+
 // Chat creates an OpenAI language model for the given model ID.
 func Chat(modelID string, opts ...Option) provider.LanguageModel {
-	o := options{baseURL: defaultBaseURL}
+	o := options{
+		baseURL:                    defaultBaseURL,
+		responsesStreamIdleTimeout: DefaultResponsesStreamIdleTimeout,
+	}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -120,6 +139,7 @@ func (m *chatModel) Capabilities() provider.ModelCapabilities {
 		Reasoning:   openaicompat.IsReasoningModel(m.id),
 		ToolCall:    true,
 		Attachment:  true,
+		FileUpload:  true,
 		InputModalities: provider.ModalitySet{
 			Text:  true,
 			Image: true,
@@ -127,6 +147,10 @@ func (m *chatModel) Capabilities() provider.ModelCapabilities {
 		},
 		OutputModalities: provider.ModalitySet{Text: true},
 	}
+}
+
+func (m *chatModel) FileUploader() provider.FileUploader {
+	return &fileUploader{opts: m.opts}
 }
 
 func (m *chatModel) DoGenerate(ctx context.Context, params provider.GenerateParams) (*provider.GenerateResult, error) {
@@ -153,7 +177,8 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 
 func (m *chatModel) doStreamChatCompletions(ctx context.Context, params provider.GenerateParams) (*provider.StreamResult, error) {
 	body := openaicompat.BuildRequest(params, m.id, true, openaicompat.RequestConfig{
-		IncludeStreamOptions: true,
+		IncludeStreamOptions:   true,
+		UseMaxCompletionTokens: m.opts.useMaxCompletionTokens,
 	})
 
 	resp, err := m.doHTTP(ctx, m.opts.baseURL+"/chat/completions", body)
@@ -165,7 +190,9 @@ func (m *chatModel) doStreamChatCompletions(ctx context.Context, params provider
 }
 
 func (m *chatModel) doGenerateChatCompletions(ctx context.Context, params provider.GenerateParams) (*provider.GenerateResult, error) {
-	body := openaicompat.BuildRequest(params, m.id, false, openaicompat.RequestConfig{})
+	body := openaicompat.BuildRequest(params, m.id, false, openaicompat.RequestConfig{
+		UseMaxCompletionTokens: m.opts.useMaxCompletionTokens,
+	})
 
 	resp, err := m.doHTTP(ctx, m.opts.baseURL+"/chat/completions", body)
 	if err != nil {
@@ -173,7 +200,7 @@ func (m *chatModel) doGenerateChatCompletions(ctx context.Context, params provid
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := openaicompat.ReadResponseBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -184,31 +211,25 @@ func (m *chatModel) doGenerateChatCompletions(ctx context.Context, params provid
 // --- Responses API ---
 
 func (m *chatModel) doStreamResponses(ctx context.Context, params provider.GenerateParams) (*provider.StreamResult, error) {
+	if m.opts.responsesStreamIdleTimeout < 0 {
+		return nil, fmt.Errorf("openai: Responses stream idle timeout must be non-negative: %s", m.opts.responsesStreamIdleTimeout)
+	}
+
 	body := buildResponsesRequest(params, m.id, true)
 
 	resp, err := m.doHTTP(ctx, m.opts.baseURL+"/responses", body)
 	if err != nil {
 		return nil, err
 	}
+	// Keep resp.Request and its serialized request body out of the stream closure.
+	responseBody := resp.Body
 
 	out := make(chan provider.StreamChunk, 64)
 	go func() {
-		var closeOnce sync.Once
-		closeBody := func() { closeOnce.Do(func() { _ = resp.Body.Close() }) }
-		// Close body on context cancellation to unblock scanner.Scan().
-		// Without this, the goroutine leaks if the server stalls mid-stream.
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			select {
-			case <-ctx.Done():
-				closeBody()
-			case <-done:
-			}
-		}()
-		// Wrap body so streamResponses' defer close calls closeBody, not raw Close,
-		// preventing double-close when context cancellation races with normal completion.
-		streamResponses(ctx, onceCloser{resp.Body, closeBody}, out)
+		streamResponsesWithConfig(ctx, responseBody, out, responsesStreamConfig{
+			idleTimeout: m.opts.responsesStreamIdleTimeout,
+			allowDone:   m.opts.responsesStreamAllowDone,
+		})
 	}()
 
 	return &provider.StreamResult{Stream: out}, nil
@@ -223,25 +244,12 @@ func (m *chatModel) doGenerateResponses(ctx context.Context, params provider.Gen
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := openaicompat.ReadResponseBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
 
 	return parseResponsesResult(respBody)
-}
-
-// onceCloser wraps an io.ReadCloser so that Close is idempotent via a provided
-// close function. Used to prevent double-close when context cancellation races
-// with the normal end-of-stream close inside streamResponses.
-type onceCloser struct {
-	io.Reader
-	closeFn func()
-}
-
-func (o onceCloser) Close() error {
-	o.closeFn()
-	return nil
 }
 
 // --- HTTP helpers ---
@@ -284,4 +292,3 @@ func (m *chatModel) shouldUseResponsesAPI(params provider.GenerateParams) bool {
 	// Default: all models use Responses API (matches Vercel).
 	return true
 }
-

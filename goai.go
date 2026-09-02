@@ -12,6 +12,7 @@
 //   - [Embed]: single text embedding
 //   - [EmbedMany]: batch text embeddings with auto-chunking
 //   - [GenerateImage]: image generation from text prompts
+//   - [GenerateVideo]: video generation from text and media prompts
 //
 // # Providers
 //

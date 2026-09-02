@@ -5,7 +5,7 @@ description: "Access 60+ models from 15 vendors on AWS Bedrock with GoAI. Pure G
 
 # Bedrock
 
-[AWS Bedrock](https://aws.amazon.com/bedrock/) provider for GoAI - multi-model access via the native Converse API with SigV4 signing. No AWS SDK dependency.
+[AWS Bedrock](https://aws.amazon.com/bedrock/) provider for GoAI - multi-model access via Converse plus native Anthropic Messages over InvokeModel, with SigV4 signing. No AWS SDK dependency.
 
 ## Setup
 
@@ -108,6 +108,8 @@ func main() {
     fmt.Println(result.Text)
 }
 ```
+
+For Anthropic server-tool round trips and native Messages behavior, use `bedrock.AnthropicChat(...)` with the same credentials and options. It routes through `InvokeModel`/`InvokeModelWithResponseStream` instead of Converse.
 
 ### Streaming
 
@@ -239,7 +241,8 @@ Embeddings use the InvokeModel API (not Converse) and share the same credentials
   2. `us.` prefix also fails - retries with the bare model ID from `us-east-1`
   3. `maxTokens` exceeds model limit - retries without maxTokens
   4. Tool calling not supported in streaming mode - retries without tools
-- **Anthropic tools on Bedrock**: Bedrock's Converse API converts Anthropic server-side tools (web_search, web_fetch, code_execution) into standard function-call tools. The model generates tool_call requests, but these are NOT executed server-side. Provide Execute handlers to run them. Computer, bash, and text editor tools behave the same on both APIs - they always require client-side execution.
+- **Anthropic tools on Bedrock**: `bedrock.Chat` uses Converse and converts Anthropic server tools into client-executed function calls. `bedrock.AnthropicChat` uses the native Messages protocol through InvokeModel and supports server-tool round trips. Computer, bash, and text editor tools always require client-side execution.
 - **Prompt caching**: When enabled, a `cachePoint` block is appended to the system prompt.
 - **Document handling**: PDF and other file attachments are sent as Bedrock document blocks. Filenames are sanitized to match AWS requirements (alphanumeric, hyphens, parentheses, brackets only; max 200 chars).
 - **Thinking + maxTokens**: When thinking is enabled for Anthropic models, the provider automatically adds `budgetTokens` to `maxTokens` (Bedrock requires `maxTokens >= budget_tokens`) and removes `temperature`, `topP`, and `topK` from the inference config.
+- **Guardrails & prompt variables**: `guardrailConfig` and `promptVariables` are forwarded as top-level Converse request fields via `goai.WithProviderOptions` (e.g. `map[string]any{"guardrailConfig": {...}, "promptVariables": {...}}`).

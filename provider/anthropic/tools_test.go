@@ -140,6 +140,33 @@ func TestTools_WebSearch20260209(t *testing.T) {
 	}
 }
 
+func TestTools_WebSearch20260318(t *testing.T) {
+	tool := Tools.WebSearch_20260318(WithResponseInclusion("low"))
+	if tool.ProviderDefinedType != "web_search_20260318" {
+		t.Errorf("ProviderDefinedType = %q, want web_search_20260318", tool.ProviderDefinedType)
+	}
+	if tool.ProviderDefinedOptions["response_inclusion"] != "low" {
+		t.Errorf("response_inclusion = %v, want low", tool.ProviderDefinedOptions["response_inclusion"])
+	}
+}
+
+func TestTools_WebSearch20260318_NoResponseInclusion(t *testing.T) {
+	tool := Tools.WebSearch_20260318()
+	if _, ok := tool.ProviderDefinedOptions["response_inclusion"]; ok {
+		t.Error("response_inclusion should be absent when not set")
+	}
+}
+
+func TestTools_CodeExecution20250522(t *testing.T) {
+	tool := Tools.CodeExecution_20250522()
+	if tool.Name != "code_execution" {
+		t.Errorf("Name = %q, want code_execution", tool.Name)
+	}
+	if tool.ProviderDefinedType != "code_execution_20250522" {
+		t.Errorf("ProviderDefinedType = %q, want code_execution_20250522", tool.ProviderDefinedType)
+	}
+}
+
 func TestTools_WebSearchWithUserLocation(t *testing.T) {
 	tool := Tools.WebSearch(WithWebSearchUserLocation(WebSearchLocation{
 		Type:     "approximate",
@@ -206,6 +233,26 @@ func TestTools_CodeExecution20250825(t *testing.T) {
 	}
 }
 
+func TestTools_ToolSearchToolRegex(t *testing.T) {
+	tool := Tools.ToolSearchToolRegex()
+	if tool.Name != "tool_search_tool_regex" {
+		t.Errorf("Name = %q, want tool_search_tool_regex", tool.Name)
+	}
+	if tool.ProviderDefinedType != "tool_search_tool_regex_20251119" {
+		t.Errorf("ProviderDefinedType = %q, want tool_search_tool_regex_20251119", tool.ProviderDefinedType)
+	}
+}
+
+func TestTools_ToolSearchToolBM25(t *testing.T) {
+	tool := Tools.ToolSearchToolBM25()
+	if tool.Name != "tool_search_tool_bm25" {
+		t.Errorf("Name = %q, want tool_search_tool_bm25", tool.Name)
+	}
+	if tool.ProviderDefinedType != "tool_search_tool_bm25_20251119" {
+		t.Errorf("ProviderDefinedType = %q, want tool_search_tool_bm25_20251119", tool.ProviderDefinedType)
+	}
+}
+
 func TestBetaForTool(t *testing.T) {
 	tests := []struct {
 		toolType string
@@ -222,8 +269,12 @@ func TestBetaForTool(t *testing.T) {
 		{"text_editor_20250728", ""},
 		{"code_execution_20250825", "code-execution-2025-08-25"},
 		{"code_execution_20260120", ""},
+		{"code_execution_20250522", ""},
 		{"web_search_20260209", "code-execution-web-tools-2026-02-09"},
 		{"web_fetch_20260209", "code-execution-web-tools-2026-02-09"},
+		{"web_search_20260318", "code-execution-web-tools-2026-03-18"},
+		{"tool_search_tool_regex_20251119", ""}, // GA, no beta header
+		{"tool_search_tool_bm25_20251119", ""},  // GA, no beta header
 		{"unknown_tool", ""},
 		{"", ""},
 	}
@@ -265,8 +316,8 @@ func TestCollectToolBetas_Mixed(t *testing.T) {
 
 func TestCollectToolBetas_CodeExecution(t *testing.T) {
 	tools := []provider.ToolDefinition{
-		Tools.CodeExecution(),           // 20260120 → no beta
-		Tools.CodeExecution_20250825(),  // 20250825 → beta
+		Tools.CodeExecution(),          // 20260120 → no beta
+		Tools.CodeExecution_20250825(), // 20250825 → beta
 	}
 
 	betas := collectToolBetas(tools)
@@ -346,6 +397,38 @@ func TestConvertToolToAPI_Regular(t *testing.T) {
 	}
 	if api["input_schema"] == nil {
 		t.Error("regular tool should have input_schema")
+	}
+}
+
+func TestConvertToolToAPI_DeferLoading(t *testing.T) {
+	tool := provider.ToolDefinition{
+		Name:         "get_weather",
+		Description:  "Get the weather",
+		InputSchema:  json.RawMessage(`{"type":"object"}`),
+		DeferLoading: true,
+	}
+
+	api := convertToolToAPI(tool)
+
+	if api["defer_loading"] != true {
+		t.Errorf("defer_loading = %v, want true", api["defer_loading"])
+	}
+	if api["name"] != "get_weather" {
+		t.Errorf("name = %v, want get_weather", api["name"])
+	}
+}
+
+func TestConvertToolToAPI_NoDeferLoadingByDefault(t *testing.T) {
+	tool := provider.ToolDefinition{
+		Name:        "get_weather",
+		Description: "Get the weather",
+	}
+
+	api := convertToolToAPI(tool)
+
+	// Backward-compatible: absent unless explicitly deferred.
+	if _, ok := api["defer_loading"]; ok {
+		t.Error("defer_loading should be absent when DeferLoading is false")
 	}
 }
 

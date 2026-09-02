@@ -11,6 +11,22 @@ Import: `github.com/zendev-sh/goai`
 
 ---
 
+## PanicError
+
+Indicates that a user callback or `StopWhen` predicate panicked during execution.
+
+```go
+type PanicError struct {
+    Phase string
+    Value any
+    Stack []byte
+}
+```
+
+Use `errors.As` to inspect the phase. `Value` and `Stack` may contain sensitive data and are intentionally omitted from `Error()` output.
+
+---
+
 ## APIError
 
 Represents a non-overflow API error from the provider.

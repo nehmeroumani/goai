@@ -93,7 +93,7 @@ Go is stable. This benchmark is **not suitable for comparison** due to
 ## How to reproduce
 
 ```bash
-cd goai/bench
+cd bench
 make bench-all    # runs both Go + TS benchmarks and generates single-run report
 make bench-3x     # 3 independent runs, averaged into RESULTS.md
 make bench-go     # Go only

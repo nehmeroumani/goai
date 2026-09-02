@@ -1,11 +1,11 @@
 ---
 title: Core Functions
-description: "API reference for GoAI's core functions including GenerateText, StreamText, GenerateObject, StreamObject, Embed, EmbedMany, and GenerateImage."
+description: "API reference for GoAI's core functions including GenerateText, StreamText, GenerateObject, StreamObject, Embed, EmbedMany, GenerateImage, and GenerateVideo."
 ---
 
 # Core Functions
 
-This page documents every public function in the `goai` package.
+This page documents GoAI's core generation, embedding, image, video, message-builder, and schema functions. See [Options](options.md) and [Types](types.md) for the rest of the public API.
 
 Import path: `github.com/zendev-sh/goai`
 
@@ -13,7 +13,7 @@ Import path: `github.com/zendev-sh/goai`
 
 ## GenerateText
 
-Performs a non-streaming text generation. When tools with `Execute` functions are provided and `MaxSteps > 1`, it automatically runs a tool loop: generate, execute tools, re-generate.
+Performs a non-streaming text generation. With executable tools, the default single step executes requested tools and returns; `MaxSteps > 1` enables follow-up model calls after tool execution.
 
 ```go
 func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Option) (*TextResult, error)
@@ -123,7 +123,7 @@ if err := stream.Err(); err != nil {
 
 #### TextStream.Stream
 
-Returns a channel that emits raw `provider.StreamChunk` values from the provider.
+Returns a channel that emits `provider.StreamChunk` values from the provider plus GoAI-generated `ChunkStepFinish` and final `ChunkFinish` events in multi-step streams.
 
 ```go
 func (ts *TextStream) Stream() <-chan provider.StreamChunk
@@ -171,7 +171,7 @@ func GenerateObject[T any](ctx context.Context, model provider.LanguageModel, op
 
 **Parameters:** Same as `GenerateText`, plus structured output options (`WithExplicitSchema`, `WithSchemaName`).
 
-**Returns:** `*ObjectResult[T]` containing the parsed object, usage, and metadata. Returns an error on API failure, JSON parse failure, or if `MaxSteps` is exhausted before a stop step occurs.
+**Returns:** `*ObjectResult[T]` containing the parsed object, usage, and metadata. Returns an error on API failure, JSON parse failure, or if every allowed step continues through executable tool calls until `MaxSteps` is exhausted.
 
 **Behavior:**
 
@@ -179,7 +179,7 @@ func GenerateObject[T any](ctx context.Context, model provider.LanguageModel, op
 2. Sets `ResponseFormat` on the provider request to enable native JSON mode.
 3. Parses the model's JSON response into the target type `T`.
 
-When tools with `Execute` functions are provided and `MaxSteps > 1`, `GenerateObject` runs a tool loop identical to `GenerateText`. `ResponseFormat` is set on every step, and the model decides when to call tools vs produce the final JSON output. Structured output is parsed from the step that returns `finishReason` `"stop"`.
+When tools with `Execute` functions are provided and `MaxSteps > 1`, `GenerateObject` runs a tool loop like `GenerateText`. `ResponseFormat` is set on every step, and the model decides when to call tools versus produce the final JSON output. Structured output is parsed from the first response that is not an executable-tool continuation; it does not require `finishReason` `"stop"`.
 
 **Example:**
 
@@ -378,6 +378,34 @@ fmt.Printf("Generated %d image(s)\n", len(result.Images))
 
 ---
 
+## GenerateVideo
+
+Generates videos from text and media prompts. Long-running provider operations are polled until completion.
+
+```go
+func GenerateVideo(ctx context.Context, model provider.VideoModel, opts ...VideoOption) (*VideoResult, error)
+```
+
+**Parameters:**
+
+| Name    | Type                  | Description                                                        |
+| ------- | --------------------- | ------------------------------------------------------------------ |
+| `ctx`   | `context.Context`     | Request context.                                                   |
+| `model` | `provider.VideoModel` | The video model to use.                                            |
+| `opts`  | `...VideoOption`      | Video prompt, media, output settings, retry, timeout, and polling. |
+
+**Returns:** `*VideoResult` with `Video` for the first result and `Videos` for all generated videos.
+
+```go
+result, err := goai.GenerateVideo(ctx, google.Video("veo-3.1-generate-preview"),
+    goai.WithVideoPrompt("A cinematic ocean scene"),
+    goai.WithVideoAspectRatio("16:9"),
+    goai.WithVideoDuration(8*time.Second),
+)
+```
+
+---
+
 ## Message Builders
 
 Convenience functions for constructing `provider.Message` values.
@@ -433,7 +461,7 @@ result, err := goai.GenerateText(ctx, model,
 
 ## SchemaFrom
 
-Generates a JSON Schema from a Go type using reflection. The schema is compatible with OpenAI strict mode: all properties are required, pointer types become nullable, and `additionalProperties` is set to `false` on all objects.
+Generates a JSON Schema from a Go type using reflection. Struct properties are required, pointer fields become nullable, and struct schemas set `additionalProperties` to `false`; string-keyed maps use their element schema as `additionalProperties`.
 
 ```go
 func SchemaFrom[T any]() json.RawMessage
@@ -448,7 +476,7 @@ func SchemaFrom[T any]() json.RawMessage
 | `jsonschema:"description=..."` | `jsonschema:"description=City name"`   | Adds a description to the property.   |
 | `jsonschema:"enum=a\|b\|c"`    | `jsonschema:"enum=easy\|medium\|hard"` | Restricts values to an enum.          |
 
-**Supported types:** string, bool, int (all sizes), uint (all sizes), float32/64, slices, maps with string keys, structs, `time.Time` (string with `date-time` format), `json.RawMessage` (any type), and recursive types. Embedded structs are flattened. Pointer types produce nullable schemas (`type: ["<base>", "null"]`).
+**Supported types:** string, bool, int (all sizes), uint (all sizes), float32/64, slices, maps with string keys, structs, `time.Time` (string with `date-time` format), `json.RawMessage` (any type), and recursive types. Embedded structs are flattened. Pointer fields produce nullable schemas (`type: ["<base>", "null"]`); pointer layers on the top-level `T` are unwrapped.
 
 > **Limitation:** mutually recursive named slice types (for example `type A []B; type B []A`) are not supported and can overflow the stack. Use struct wrappers instead.
 

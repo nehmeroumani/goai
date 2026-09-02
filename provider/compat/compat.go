@@ -20,11 +20,23 @@ import (
 type Option func(*options)
 
 type options struct {
-	providerID  string
-	tokenSource provider.TokenSource
-	baseURL     string
-	headers     map[string]string
-	httpClient  *http.Client
+	providerID             string
+	tokenSource            provider.TokenSource
+	baseURL                string
+	headers                map[string]string
+	httpClient             *http.Client
+	useMaxCompletionTokens *bool
+}
+
+// WithMaxCompletionTokens forces the max_tokens / max_completion_tokens choice
+// instead of deriving it from the model id. Use it when the id does not
+// identify the model: on Azure OpenAI the wire id is the deployment name the
+// user picked, so a GPT-5 deployment called "prod" would be sent max_tokens
+// and rejected with "Unsupported parameter: 'max_tokens'".
+func WithMaxCompletionTokens(use bool) Option {
+	return func(o *options) {
+		o.useMaxCompletionTokens = &use
+	}
 }
 
 // WithProviderID overrides the provider name used in error messages.
@@ -72,17 +84,20 @@ func resolveOptions(opts []Option) options {
 func Chat(modelID string, opts ...Option) provider.LanguageModel {
 	o := resolveOptions(opts)
 	return openaicompat.NewChatModel(openaicompat.ChatModelConfig{
-		ProviderID:           o.providerID,
-		ModelID:              modelID,
-		BaseURL:              o.baseURL,
-		BaseURLRequired:      true,
-		TokenSource:          o.tokenSource,
-		TokenRequired:        false,
-		Headers:              o.headers,
-		HTTPClient:           o.httpClient,
-		Capabilities:         chatCaps,
-		IncludeStreamOptions: true,
-		WarnPromptCaching:    true,
+		ProviderID:        o.providerID,
+		ModelID:           modelID,
+		BaseURL:           o.baseURL,
+		BaseURLRequired:   true,
+		TokenSource:       o.tokenSource,
+		TokenRequired:     false,
+		Headers:           o.headers,
+		HTTPClient:        o.httpClient,
+		Capabilities:      chatCaps,
+		WarnPromptCaching: true,
+		RequestConfig: openaicompat.RequestConfig{
+			IncludeStreamOptions:   true,
+			UseMaxCompletionTokens: o.useMaxCompletionTokens,
+		},
 	})
 }
 

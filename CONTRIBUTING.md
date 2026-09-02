@@ -23,7 +23,7 @@ go test ./...
 goai/
 ├── *.go                    # Core SDK (GenerateText, StreamText, etc.)
 ├── provider/
-│   ├── provider.go         # LanguageModel, EmbeddingModel, ImageModel interfaces
+│   ├── provider.go         # LanguageModel, EmbeddingModel, ImageModel, VideoModel interfaces
 │   ├── types.go            # Shared types (Message, Part, Usage, etc.)
 │   ├── token.go            # TokenSource, CachedTokenSource
 │   ├── openai/             # OpenAI provider
@@ -88,8 +88,8 @@ For non-OpenAI-compatible providers (like Anthropic, Google, Cohere), implement 
 - [ ] Base URL/endpoint option (`WithBaseURL(url)` or provider-specific equivalent like `WithEndpoint(url)`)
 - [ ] `WithHeaders(h)` option
 - [ ] Streaming support (`DoStream`)
-- [ ] Error handling (`ParseHTTPError`)
-- [ ] Per-request headers (`_headers` extraction in `doHTTP`)
+- [ ] Error handling (`goai.ParseHTTPErrorWithHeaders`)
+- [ ] Per-request headers (use the shared `internal/httpc` helpers)
 - [ ] `var _ provider.LanguageModel = (*chatModel)(nil)` compile-time check
 - [ ] Tests with mock HTTP server (90% coverage target)
 

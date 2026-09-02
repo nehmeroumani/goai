@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -435,6 +436,90 @@ func TestDoGenerate_ReadError(t *testing.T) {
 	if !strings.Contains(err.Error(), "reading response") {
 		t.Errorf("unexpected error: %s", err)
 	}
+}
+
+// TestChat_ResponseBodyOverCap verifies the success-path bounded read in
+// DoGenerate: a response body larger than maxConverseResponseBytes is rejected
+// instead of being read fully into memory.
+func TestChat_ResponseBodyOverCap(t *testing.T) {
+	transport := &fixedBodyTransport{body: io.NopCloser(io.LimitReader(zeroReader{}, int64(maxConverseResponseBytes+2)))}
+	model := Chat("m",
+		WithAccessKey("AK"),
+		WithSecretKey("SK"),
+		WithBaseURL("http://fake"),
+		WithHTTPClient(&http.Client{Transport: transport}),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for oversized response body")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want an 'exceeds' over-cap error", err)
+	}
+}
+
+// TestChat_ErrorBodyBounded verifies the error-path bounded read in doHTTP: an
+// error response body larger than maxConverseErrorBytes is truncated, so the
+// tail marker never reaches the extracted error message.
+func TestChat_ErrorBodyBounded(t *testing.T) {
+	const tailMarker = "TAIL-MARKER-SHOULD-NOT-APPEAR"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.Copy(w, io.MultiReader(
+			strings.NewReader(`{"message":"`),
+			io.LimitReader(zeroReader{}, int64(maxConverseErrorBytes+len(tailMarker))),
+			strings.NewReader(tailMarker),
+		))
+	}))
+	defer server.Close()
+
+	model := Chat("m",
+		WithAccessKey("AK"),
+		WithSecretKey("SK"),
+		WithBaseURL(server.URL),
+	)
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *goai.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *goai.APIError", err)
+	}
+	if strings.Contains(apiErr.Message, tailMarker) {
+		t.Errorf("error message contains tail marker; error body was not bounded: %q", apiErr.Message)
+	}
+}
+
+// zeroReader yields an endless stream of bytes without allocating.
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
+}
+
+// fixedBodyTransport returns a canned 200 response with the given body.
+type fixedBodyTransport struct {
+	body io.ReadCloser
+}
+
+func (t *fixedBodyTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       t.body,
+		Header:     make(http.Header),
+	}, nil
 }
 
 func TestDoGenerate_ParseError(t *testing.T) {
@@ -2250,9 +2335,164 @@ func TestBuildConverseRequest_TopK(t *testing.T) {
 		},
 		ProviderOptions: map[string]any{"topK": 40},
 	}, "m")
-	ic := body["inferenceConfig"].(map[string]any)
-	if ic["topK"] != 40 {
-		t.Errorf("topK = %v", ic["topK"])
+	// topK is model-specific and must NOT be placed under inferenceConfig
+	// (which only accepts maxTokens/stopSequences/temperature/topP).
+	if ic, ok := body["inferenceConfig"].(map[string]any); ok {
+		if _, has := ic["topK"]; has {
+			t.Errorf("topK should not be in inferenceConfig: %v", ic)
+		}
+	}
+
+	// applyBedrockOptions moves topK into additionalModelRequestFields.
+	m := &chatModel{id: "m", originalID: "m", opts: options{}}
+	req := map[string]any{}
+	m.applyBedrockOptions(req, nil, map[string]any{"topK": 40})
+	additional, ok := req["additionalModelRequestFields"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing additionalModelRequestFields: %v", req)
+	}
+	if additional["topK"] != 40 {
+		t.Errorf("topK = %v, want 40 in additionalModelRequestFields", additional["topK"])
+	}
+}
+
+func TestBuildConverseRequest_GuardrailConfigAndPromptVariables(t *testing.T) {
+	body := buildConverseRequest(provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		ProviderOptions: map[string]any{
+			"guardrailConfig": map[string]any{
+				"guardrailIdentifier": "my-guardrail",
+				"guardrailVersion":    "1",
+			},
+			"promptVariables": map[string]any{"topic": "go"},
+		},
+	}, "m")
+
+	gc, ok := body["guardrailConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing guardrailConfig: %v", body)
+	}
+	if gc["guardrailIdentifier"] != "my-guardrail" || gc["guardrailVersion"] != "1" {
+		t.Errorf("guardrailConfig = %v", gc)
+	}
+
+	pv, ok := body["promptVariables"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing promptVariables: %v", body)
+	}
+	if pv["topic"] != "go" {
+		t.Errorf("promptVariables = %v", pv)
+	}
+
+	// Neither belongs under inferenceConfig.
+	if ic, ok := body["inferenceConfig"].(map[string]any); ok {
+		if _, has := ic["guardrailConfig"]; has {
+			t.Errorf("guardrailConfig should not be in inferenceConfig: %v", ic)
+		}
+		if _, has := ic["promptVariables"]; has {
+			t.Errorf("promptVariables should not be in inferenceConfig: %v", ic)
+		}
+	}
+}
+
+// TestConverseRequest_Golden_TopK is a golden full-body assertion for #20:
+// topK is a model-specific Converse field and must be emitted under
+// additionalModelRequestFields (never under inferenceConfig, which only
+// accepts maxTokens/stopSequences/temperature/topP). It exercises the real
+// DoGenerate HTTP round-trip and compares the entire outgoing body.
+func TestConverseRequest_Golden_TopK(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &captured); err != nil {
+			t.Fatalf("invalid request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, converseResponse("ok", "end_turn", 1, 1))
+	}))
+	defer server.Close()
+
+	model := Chat("meta.llama-3-70b",
+		WithAccessKey("AK"), WithSecretKey("SK"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		ProviderOptions: map[string]any{"topK": 40},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]any{
+		"messages": []any{
+			map[string]any{
+				"role":    "user",
+				"content": []any{map[string]any{"text": "hi"}},
+			},
+		},
+		"additionalModelRequestFields": map[string]any{"topK": float64(40)},
+	}
+	if !reflect.DeepEqual(captured, want) {
+		gotJSON, _ := json.MarshalIndent(captured, "", "  ")
+		wantJSON, _ := json.MarshalIndent(want, "", "  ")
+		t.Fatalf("request body mismatch\n got: %s\nwant: %s", gotJSON, wantJSON)
+	}
+}
+
+// TestConverseRequest_Golden_GuardrailAndPromptVariables is a golden full-body
+// assertion for #21: guardrailConfig and promptVariables are top-level Converse
+// request fields and must be emitted as such (never under inferenceConfig).
+// Exercises the real DoGenerate HTTP round-trip against the full outgoing body.
+func TestConverseRequest_Golden_GuardrailAndPromptVariables(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &captured); err != nil {
+			t.Fatalf("invalid request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, converseResponse("ok", "end_turn", 1, 1))
+	}))
+	defer server.Close()
+
+	model := Chat("meta.llama-3-70b",
+		WithAccessKey("AK"), WithSecretKey("SK"), WithBaseURL(server.URL))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		ProviderOptions: map[string]any{
+			"guardrailConfig": map[string]any{
+				"guardrailIdentifier": "my-guardrail",
+				"guardrailVersion":    "1",
+			},
+			"promptVariables": map[string]any{"topic": "go"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]any{
+		"messages": []any{
+			map[string]any{
+				"role":    "user",
+				"content": []any{map[string]any{"text": "hi"}},
+			},
+		},
+		"guardrailConfig": map[string]any{
+			"guardrailIdentifier": "my-guardrail",
+			"guardrailVersion":    "1",
+		},
+		"promptVariables": map[string]any{"topic": "go"},
+	}
+	if !reflect.DeepEqual(captured, want) {
+		gotJSON, _ := json.MarshalIndent(captured, "", "  ")
+		wantJSON, _ := json.MarshalIndent(want, "", "  ")
+		t.Fatalf("request body mismatch\n got: %s\nwant: %s", gotJSON, wantJSON)
 	}
 }
 

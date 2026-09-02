@@ -5,7 +5,7 @@ description: "Intercept and control GoAI's tool loop with lifecycle hooks. Permi
 
 # Lifecycle Hooks
 
-GoAI provides nine lifecycle hooks that let you observe, intercept, and control the generation process without modifying core SDK code.
+GoAI provides ten lifecycle hooks that let you observe, intercept, and control the generation process without modifying core SDK code.
 
 ## Hook Categories
 
@@ -13,7 +13,7 @@ Hooks fall into two categories:
 
 | Category | Hooks | Callbacks | Purpose |
 |----------|-------|-----------|---------|
-| **Observability** | `OnRequest`, `OnResponse`, `OnToolCallStart`, `OnToolCall`, `OnStepFinish`, `OnFinish` | Multiple (append) | Logging, metrics, tracing |
+| **Observability** | `OnRequest`, `OnResponse`, `OnToolCallStart`, `OnToolCall`, `OnStepFinish`, `OnFinish`, `OnPanic` | Multiple (append) | Logging, metrics, tracing, panic reporting |
 | **Interceptor** | `OnBeforeToolExecute`, `OnAfterToolExecute`, `OnBeforeStep` | Single (replace) | Permission, transformation, control flow |
 
 Observability hooks are fire-and-forget: they receive data but cannot change behavior. Interceptor hooks return values that control execution.
@@ -186,25 +186,13 @@ goai.WithOnFinish(func(info goai.FinishInfo) {
 }),
 ```
 
-Fires once after all generation steps complete. This is the only hook that receives `StepsExhausted`, making it the authoritative signal for "max steps exhaustion" detection.
+Fires once after generation terminates. This is the only hook that receives `StepsExhausted` and `StoppedBy`, making it the authoritative signal for max-step exhaustion and other termination causes.
 
 ## Panic Recovery
 
-Hook panics are recovered in most paths. "Propagates" = crashes the caller. "Recovered" = caught, logged to stderr, execution continues.
+Fatal lifecycle-hook panics are wrapped as `*PanicError`: synchronous APIs return the error, while streaming APIs expose it through `stream.Err()`. Processing stops and later callbacks on that path do not run. Tool-path hooks remain resilient: `OnBeforeToolExecute` skips the tool on panic, `OnAfterToolExecute` preserves the original result, and tool observability panics are reported through `OnPanic`.
 
-| Hook | GenerateText | StreamText (step 1)* | StreamText (step 2+) | GenerateObject |
-|------|-------------|---------------------|---------------------|----------------|
-| OnRequest | Propagates | Propagates | Recovered | Propagates |
-| OnResponse | Recovered | Propagates (error) | Recovered | Recovered |
-| OnToolCallStart | Recovered | Recovered | Recovered | Recovered |
-| OnToolCall | Recovered | Recovered | Recovered | Recovered |
-| OnStepFinish | Recovered | Recovered | Recovered | Recovered |
-| OnBeforeToolExecute | Recovered (skips tool) | Recovered (skips tool) | Recovered (skips tool) | Recovered (skips tool) |
-| OnAfterToolExecute | Recovered (preserves result) | Recovered (preserves result) | Recovered (preserves result) | Recovered (preserves result) |
-| OnBeforeStep | Recovered (proceeds) | N/A | Recovered (proceeds) | Recovered (proceeds) |
-| OnFinish | Recovered | Recovered | Recovered | Recovered |
-
-*\* StreamText step 1 runs synchronously in the caller's goroutine (before the background goroutine starts). Step 2+ runs in a background goroutine where all panics are recovered. StreamObject OnRequest propagates like GenerateObject. StreamObject OnResponse is recovered on both success and error paths.*
+`OnPanic` supports multiple callbacks in registration order. Panics inside an `OnPanic` callback are recovered and discarded.
 
 ## Complete Example
 

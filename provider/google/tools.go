@@ -26,10 +26,25 @@ var Tools = struct {
 	// use the output to formulate its response.
 	// Requires Gemini 2.0+.
 	CodeExecution func() provider.ToolDefinition
+
+	// ComputerUse enables Gemini's computer use tool: the model sees screenshots
+	// and emits UI actions (click, type, scroll, …) that the client executes,
+	// returning a fresh screenshot. Client-executed: each action arrives as a
+	// regular functionCall and its result goes back as a functionResponse.
+	// The Gemini 3.x family has it built-in (just add the tool); 2.5 needs the
+	// dedicated gemini-2.5-computer-use-preview model.
+	ComputerUse func(opts ...ComputerUseOption) provider.ToolDefinition
+
+	// FileSearch enables file-based grounding (Vertex AI Search / uploaded
+	// corpus retrieval). The model grounds its answers on the configured
+	// retrieval source instead of live web search.
+	FileSearch func(opts ...FileSearchOption) provider.ToolDefinition
 }{
 	GoogleSearch:  googleSearchTool,
 	URLContext:    urlContextTool,
 	CodeExecution: codeExecutionTool,
+	ComputerUse:   computerUseTool,
+	FileSearch:    fileSearchTool,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +133,106 @@ func codeExecutionTool() provider.ToolDefinition {
 	return provider.ToolDefinition{
 		Name:                "code_execution",
 		ProviderDefinedType: "google.code_execution",
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ComputerUse
+// ---------------------------------------------------------------------------
+
+// ComputerUseOption configures the computer use tool.
+type ComputerUseOption func(*computerUseConfig)
+
+type computerUseConfig struct {
+	// Environment is the target surface enum the model controls (e.g. the
+	// browser or the full desktop). Passed through verbatim to the wire; the
+	// caller owns the exact enum string the API expects.
+	Environment string
+	// ExcludedPredefinedFunctions lists built-in action names to disable, so the
+	// model never emits them (e.g. omit navigation in a kiosk).
+	ExcludedPredefinedFunctions []string
+}
+
+// WithEnvironment sets the computer use environment (the surface the model
+// controls). The value is the API enum string and is sent unchanged.
+func WithEnvironment(env string) ComputerUseOption {
+	return func(c *computerUseConfig) { c.Environment = env }
+}
+
+// WithExcludedFunctions disables specific predefined actions for this session.
+func WithExcludedFunctions(fns ...string) ComputerUseOption {
+	return func(c *computerUseConfig) { c.ExcludedPredefinedFunctions = fns }
+}
+
+func computerUseTool(opts ...ComputerUseOption) provider.ToolDefinition {
+	cfg := &computerUseConfig{}
+	for _, o := range opts {
+		o(cfg)
+	}
+
+	providerOpts := map[string]any{}
+	if cfg.Environment != "" {
+		providerOpts["environment"] = cfg.Environment
+	}
+	if len(cfg.ExcludedPredefinedFunctions) > 0 {
+		providerOpts["excludedPredefinedFunctions"] = cfg.ExcludedPredefinedFunctions
+	}
+
+	// googleProviderTool camelCases "google.computer_use" -> "computerUse" and
+	// nests providerOpts under it: {"computerUse": {"environment": "..."}}.
+	return provider.ToolDefinition{
+		Name:                   "computer_use",
+		ProviderDefinedType:    "google.computer_use",
+		ProviderDefinedOptions: providerOpts,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FileSearch
+// ---------------------------------------------------------------------------
+
+// FileSearchOption configures the file-search grounding tool.
+type FileSearchOption func(*fileSearchConfig)
+
+type fileSearchConfig struct {
+	// DynamicThreshold controls when the model decides to ground on the
+	// configured retrieval source (0.0–1.0). Lower thresholds trigger
+	// retrieval more eagerly.
+	DynamicThreshold float64
+	// Corpus is the Vertex AI Search / corpus identifier to ground on.
+	Corpus string
+}
+
+// WithDynamicThreshold sets the dynamic retrieval threshold (0.0–1.0).
+func WithDynamicThreshold(t float64) FileSearchOption {
+	return func(c *fileSearchConfig) { c.DynamicThreshold = t }
+}
+
+// WithCorpus sets the retrieval corpus identifier to ground on.
+func WithCorpus(id string) FileSearchOption {
+	return func(c *fileSearchConfig) { c.Corpus = id }
+}
+
+func fileSearchTool(opts ...FileSearchOption) provider.ToolDefinition {
+	cfg := &fileSearchConfig{}
+	for _, o := range opts {
+		o(cfg)
+	}
+
+	providerOpts := map[string]any{}
+	if cfg.DynamicThreshold > 0 {
+		providerOpts["dynamicRetrievalConfig"] = map[string]any{
+			"dynamicThreshold": cfg.DynamicThreshold,
+		}
+	}
+	if cfg.Corpus != "" {
+		providerOpts["corpus"] = cfg.Corpus
+	}
+
+	return provider.ToolDefinition{
+		Name:                   "file_search",
+		ProviderDefinedType:    "google.file_search",
+		ProviderDefinedOptions: providerOpts,
 	}
 }
 

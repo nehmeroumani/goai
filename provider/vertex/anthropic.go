@@ -27,6 +27,9 @@ import (
 //	result, err := goai.GenerateText(ctx, model, goai.WithPrompt("Hello"))
 func AnthropicChat(modelID string, opts ...Option) provider.LanguageModel {
 	o := resolveOpts(opts)
+	if err := validateNonChatOptions(o, "AnthropicChat"); err != nil {
+		return &invalidChatModel{id: modelID, err: err}
+	}
 
 	baseURL := anthropicBaseURL(o)
 	ts := resolveAnthropicTokenSource(o)

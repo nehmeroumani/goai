@@ -28,7 +28,7 @@ import (
 
 ## Core API
 
-### 7 Top-Level Functions
+### 8 Top-Level Functions
 
 | Function                                      | Purpose                         | Returns                     |
 | --------------------------------------------- | ------------------------------- | --------------------------- |
@@ -39,10 +39,11 @@ import (
 | `goai.Embed(ctx, model, text, opts...)`       | Single text embedding           | `(*EmbedResult, error)`     |
 | `goai.EmbedMany(ctx, model, texts, opts...)`  | Batch embeddings (auto-chunked) | `(*EmbedManyResult, error)` |
 | `goai.GenerateImage(ctx, model, imgOpts...)`  | Image generation                | `(*ImageResult, error)`     |
+| `goai.GenerateVideo(ctx, model, vidOpts...)`  | Video generation                | `(*VideoResult, error)`     |
 
 ### Model Constructors
 
-Each provider has `Chat()`, and optionally `Embedding()` and `Image()`:
+Each provider has `Chat()`, and optionally `Embedding()`, `Image()`, and `Video()`:
 
 ```go
 // Language models
@@ -64,6 +65,9 @@ ollama.Embedding("nomic-embed-text")
 // Image models
 openai.Image("gpt-image-1")
 google.Image("imagen-4.0-generate-001")
+
+// Video models
+google.Video("veo-3.1-generate-preview")
 ```
 
 ### Auth - Auto-Resolved from Environment
@@ -93,11 +97,11 @@ model := openai.Chat("gpt-4o", openai.WithAPIKey("sk-..."))
 Most providers support these options (Bedrock uses AWS credential options; Ollama requires no auth):
 
 ```go
-provider.WithAPIKey(key)         // static API key
-provider.WithTokenSource(ts)     // dynamic auth (OAuth, service accounts)
-provider.WithBaseURL(url)        // override endpoint (Azure uses WithEndpoint)
-provider.WithHeaders(h)          // custom HTTP headers
-provider.WithHTTPClient(c)       // custom HTTP transport
+openai.WithAPIKey(key)            // static API key
+openai.WithTokenSource(ts)        // dynamic auth (OAuth, service accounts)
+openai.WithBaseURL(url)           // override endpoint (Azure uses WithEndpoint)
+openai.WithHeaders(h)             // custom HTTP headers
+openai.WithHTTPClient(c)          // custom HTTP transport
 ```
 
 ---
@@ -270,7 +274,20 @@ result, err := goai.GenerateImage(ctx, openai.Image("gpt-image-1"),
 
 **Note**: `GenerateImage` uses `ImageOption` (not `Option`): `WithImagePrompt`, `WithImageCount`, `WithImageSize`, `WithAspectRatio`, `WithImageMaxRetries`, `WithImageTimeout`, `WithImageProviderOptions`.
 
-### 9. Provider-Defined Tools (Server-Side)
+### 9. Video Generation
+
+```go
+result, err := goai.GenerateVideo(ctx, google.Video("veo-3.1-generate-preview"),
+    goai.WithVideoPrompt("A gopher writing Go code"),
+    goai.WithVideoAspectRatio("16:9"),
+    goai.WithVideoDuration(8*time.Second),
+)
+// result.Video.Data = raw bytes, result.Video.MediaType = "video/mp4"
+```
+
+Video generation handles asynchronous operation polling and authenticated downloads. Use `WithVideoImage` for image-to-video and `WithVideoPollTimeout` to bound long-running operations.
+
+### 10. Provider-Defined Tools (Server-Side)
 
 Built-in tools executed by the provider, not your code:
 
@@ -305,12 +322,12 @@ func providerTool(td provider.ToolDefinition) goai.Tool {
 Available provider tools:
 
 - **OpenAI**: `WebSearch()`, `CodeInterpreter()`, `ImageGeneration()`, `FileSearch(opts...)`
-- **Anthropic**: `WebSearch()`, `WebFetch()`, `Computer(opts)`, `Bash()`, `TextEditor()`, `CodeExecution()` (+ versioned variants)
-- **Google**: `GoogleSearch()`, `URLContext()`, `CodeExecution()`
+- **Anthropic**: `WebSearch()`, `WebFetch()`, `Computer(opts)`, `Bash()`, `TextEditor()`, `CodeExecution()`, `ToolSearchToolRegex()`, `ToolSearchToolBM25()` (+ versioned variants)
+- **Google**: `GoogleSearch()`, `URLContext()`, `CodeExecution()`, `ComputerUse(opts...)`
 - **xAI**: `WebSearch()`, `XSearch()`
 - **Groq**: `BrowserSearch()`
 
-### 10. Observability Hooks
+### 11. Observability Hooks
 
 ```go
 result, err := goai.GenerateText(ctx, model,
@@ -356,6 +373,7 @@ goai.WithSeed(s int)                               // deterministic generation
 goai.WithStopSequences(seqs ...string)             // stop sequences
 
 goai.WithMaxRetries(n int)                         // retry count (default: 2)
+goai.WithRetryObserver(fn RetryObserver)           // observe retry attempts
 goai.WithTimeout(d time.Duration)                  // request timeout
 goai.WithHeaders(h map[string]string)              // additional HTTP headers
 goai.WithProviderOptions(opts map[string]any)      // provider-specific params
@@ -365,6 +383,11 @@ goai.WithOnResponse(fn func(ResponseInfo))         // after each API call
 goai.WithOnStepFinish(fn func(StepResult))         // after each step
 goai.WithOnToolCallStart(fn func(ToolCallStartInfo)) // before each tool execution
 goai.WithOnToolCall(fn func(ToolCallInfo))         // after each tool execution
+goai.WithOnFinish(fn func(FinishInfo))             // after generation terminates
+goai.WithOnPanic(fn func(PanicInfo))               // observe recovered callback panics
+goai.WithOnBeforeStep(fn func(BeforeStepInfo) BeforeStepResult)
+goai.WithOnBeforeToolExecute(fn func(BeforeToolExecuteInfo) BeforeToolExecuteResult)
+goai.WithOnAfterToolExecute(fn func(AfterToolExecuteInfo) AfterToolExecuteResult)
 
 goai.WithExplicitSchema(schema json.RawMessage)    // override auto-generated schema
 goai.WithSchemaName(name string)                   // schema name (default: "response")
@@ -385,6 +408,27 @@ goai.WithImageTimeout(d time.Duration)            // overall timeout
 goai.WithImageProviderOptions(opts map[string]any) // provider-specific params
 ```
 
+### Video Options (type `goai.VideoOption`)
+
+```go
+goai.WithVideoPrompt(prompt string)
+goai.WithVideoImage(image provider.MediaData)
+goai.WithVideoCount(n int)
+goai.WithVideoAspectRatio(ratio string)
+goai.WithVideoResolution(resolution string)
+goai.WithVideoDuration(d time.Duration)
+goai.WithVideoFPS(fps int)
+goai.WithVideoSeed(seed int64)
+goai.WithVideoFrameImages(frames ...provider.VideoFrame)
+goai.WithVideoInputReferences(refs ...provider.MediaData)
+goai.WithVideoAudio(enabled bool)
+goai.WithVideoProviderOptions(opts map[string]any)
+goai.WithVideoMaxRetries(n int)
+goai.WithVideoTimeout(d time.Duration)
+goai.WithVideoPollInterval(d time.Duration)
+goai.WithVideoPollTimeout(d time.Duration)
+```
+
 ---
 
 ## Result Types
@@ -394,6 +438,7 @@ goai.WithImageProviderOptions(opts map[string]any) // provider-specific params
 ```go
 type TextResult struct {
     Text             string                         // accumulated generated text
+    Reasoning        string                         // accumulated reasoning text
     ToolCalls        []provider.ToolCall            // tool calls from final step
     Steps            []StepResult                   // per-step results
     TotalUsage       provider.Usage                 // aggregated token usage
@@ -401,6 +446,8 @@ type TextResult struct {
     Response         provider.ResponseMetadata      // provider metadata (ID, Model)
     ProviderMetadata map[string]map[string]any      // provider-specific response data
     Sources          []provider.Source              // citations/references
+    StepsExhausted   bool                           // whether MaxSteps was exhausted
+    ResponseMessages []provider.Message             // messages for the next turn
 }
 ```
 
@@ -413,6 +460,7 @@ type ObjectResult[T any] struct {
     FinishReason     provider.FinishReason
     Response         provider.ResponseMetadata
     ProviderMetadata map[string]map[string]any      // provider-specific response data
+    ResponseMessages []provider.Message             // messages for the next turn
     Steps            []StepResult                   // results from each generation step (multi-step tool loops)
 }
 ```
@@ -421,13 +469,17 @@ type ObjectResult[T any] struct {
 
 ```go
 type EmbedResult struct {
-    Embedding []float64
-    Usage     provider.Usage
+    Embedding        []float64
+    Usage            provider.Usage
+    ProviderMetadata map[string]map[string]any
+    Response         provider.ResponseMetadata
 }
 
 type EmbedManyResult struct {
-    Embeddings [][]float64
-    Usage      provider.Usage
+    Embeddings       [][]float64
+    Usage            provider.Usage
+    ProviderMetadata map[string]map[string]any
+    Response         provider.ResponseMetadata
 }
 ```
 
@@ -435,7 +487,21 @@ type EmbedManyResult struct {
 
 ```go
 type ImageResult struct {
-    Images []provider.ImageData  // .Data = []byte, .MediaType = "image/png"
+    Images           []provider.ImageData
+    ProviderMetadata map[string]map[string]any
+    Usage            provider.Usage
+    Response         provider.ResponseMetadata
+}
+```
+
+### VideoResult
+
+```go
+type VideoResult struct {
+    Video            provider.VideoData
+    Videos           []provider.VideoData
+    ProviderMetadata map[string]map[string]any
+    Response         provider.ResponseMetadata
 }
 ```
 
@@ -513,8 +579,8 @@ model := openai.Chat("gpt-4o", openai.WithTokenSource(ts))
 | Provider      | Import               | Chat | Embed | Image | Provider Tools |
 | ------------- | -------------------- | ---- | ----- | ----- | -------------- |
 | OpenAI        | `provider/openai`    | Yes  | Yes   | Yes   | 4              |
-| Anthropic     | `provider/anthropic` | Yes  | -     | -     | 10             |
-| Google Gemini | `provider/google`    | Yes  | Yes   | Yes   | 3              |
+| Anthropic     | `provider/anthropic` | Yes  | -     | -     | 12             |
+| Google Gemini | `provider/google`    | Yes  | Yes   | Yes   | 4              |
 | AWS Bedrock   | `provider/bedrock`   | Yes  | Yes   | -     | -              |
 | Azure OpenAI  | `provider/azure`     | Yes  | -     | Yes   | -              |
 | Vertex AI     | `provider/vertex`    | Yes  | Yes   | Yes   | -              |
@@ -537,7 +603,7 @@ Fireworks, Together, DeepInfra, OpenRouter, Perplexity, Cerebras
 
 | Provider | Import            | Chat | Embed | Default URL          |
 | -------- | ----------------- | ---- | ----- | -------------------- |
-| Ollama   | `provider/ollama` | Yes  | Yes   | `localhost:11434/v1` |
+| Ollama   | `provider/ollama` | Yes  | Yes   | `http://localhost:11434` |
 | vLLM     | `provider/vllm`   | Yes  | Yes   | `localhost:8000/v1`  |
 | RunPod   | `provider/runpod` | Yes  | -     | `RUNPOD_ENDPOINT_ID` |
 | Custom   | `provider/compat` | Yes  | Yes   | user-defined         |
@@ -554,7 +620,7 @@ Fireworks, Together, DeepInfra, OpenRouter, Perplexity, Cerebras
 
 4. **Don't type-assert errors** - always use `errors.As(err, &target)`, never `err.(*goai.APIError)`.
 
-5. **Don't mix `Option` and `ImageOption`** - `GenerateImage` uses `ImageOption`, all other functions use `Option`.
+5. **Don't mix option families** - text/object/embed functions use `Option`, `GenerateImage` uses `ImageOption`, and `GenerateVideo` uses `VideoOption`.
 
 6. **Don't forget error handling on streaming** - always check the error from `StreamText`/`StreamObject` before consuming the stream.
 

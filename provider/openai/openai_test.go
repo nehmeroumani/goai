@@ -21,7 +21,14 @@ import (
 type errorReader struct{}
 
 func (e *errorReader) Read(_ []byte) (int, error) { return 0, fmt.Errorf("read error") }
-func (e *errorReader) Close() error                { return nil }
+func (e *errorReader) Close() error               { return nil }
+
+// failTokenSource is a provider.TokenSource that always returns an error.
+type failTokenSource struct{}
+
+func (f failTokenSource) Token(_ context.Context) (string, error) {
+	return "", fmt.Errorf("token error")
+}
 
 // chatCompletionsOpts forces the Chat Completions API path (not Responses API).
 var chatCompletionsOpts = map[string]any{"useResponsesAPI": false}
@@ -84,6 +91,51 @@ func TestChat_ChatCompletions_Stream(t *testing.T) {
 	}
 	if chunks[1].Text != " world" {
 		t.Errorf("chunks[1].Text = %q, want %q", chunks[1].Text, " world")
+	}
+}
+
+func TestReasoningInputItem_RequiresItemID(t *testing.T) {
+	part := openAIReasoningPart("", "think", "opaque-state")
+	if item, ok := reasoningInputItem(part); ok || item != nil {
+		t.Fatalf("reasoningInputItem() = %#v, %v; want nil, false without item ID", item, ok)
+	}
+}
+
+func TestConvertToResponsesInput_ReasoningTextToolCallOrder(t *testing.T) {
+	input := convertToResponsesInput([]provider.Message{
+		{Role: provider.RoleAssistant, Content: []provider.Part{
+			openAIReasoningPart("rs-1", "think", "opaque-state"),
+			{Type: provider.PartText, Text: "I'll inspect."},
+			{Type: provider.PartToolCall, ToolCallID: "call-1", ToolName: "read", ToolInput: json.RawMessage(`{"path":"a.go"}`)},
+		}},
+		{Role: provider.RoleTool, Content: []provider.Part{{Type: provider.PartToolResult, ToolCallID: "call-1", ToolOutput: "contents"}}},
+	})
+
+	wantTypes := []string{"reasoning", "message", "function_call", "function_call_output"}
+	if len(input) != len(wantTypes) {
+		t.Fatalf("input = %#v, want %d items", input, len(wantTypes))
+	}
+	for i, want := range wantTypes {
+		if got := input[i]["type"]; got != want {
+			t.Fatalf("input[%d].type = %v, want %q; input=%#v", i, got, want, input)
+		}
+	}
+}
+
+func TestConvertToResponsesInput_EmptyAndUnreplayableReasoning(t *testing.T) {
+	input := convertToResponsesInput([]provider.Message{{
+		Role: provider.RoleAssistant,
+		Content: []provider.Part{
+			{Type: provider.PartText},
+			{Type: provider.PartReasoning, Text: "semantic fallback"},
+		},
+	}})
+	if len(input) != 1 || input[0]["type"] != "message" {
+		t.Fatalf("input = %#v, want one fallback message", input)
+	}
+	content := input[0]["content"].([]map[string]any)
+	if content[0]["text"] != "semantic fallback" {
+		t.Fatalf("content = %#v, want semantic fallback", content)
 	}
 }
 
@@ -667,8 +719,8 @@ func TestIsReasoningModel(t *testing.T) {
 		{"gpt-5.2", true},
 		{"codex-mini-latest", true},
 		{"codex-mini", true},
-		{"O3", true},        // case insensitive
-		{"GPT-5.1", true},   // case insensitive
+		{"O3", true},      // case insensitive
+		{"GPT-5.1", true}, // case insensitive
 	}
 	for _, tt := range tests {
 		t.Run(tt.model, func(t *testing.T) {
@@ -721,6 +773,9 @@ func TestChat_Capabilities(t *testing.T) {
 	if caps.Reasoning {
 		t.Error("gpt-4o should not be reasoning")
 	}
+	if !caps.FileUpload {
+		t.Error("gpt-4o should support file upload")
+	}
 
 	// Reasoning model
 	model = Chat("o3", WithAPIKey("key"))
@@ -730,6 +785,9 @@ func TestChat_Capabilities(t *testing.T) {
 	}
 	if !caps.Reasoning {
 		t.Error("o3 should be reasoning")
+	}
+	if !caps.FileUpload {
+		t.Error("o3 should support file upload")
 	}
 }
 
@@ -850,6 +908,70 @@ func TestChat_ChatCompletions_RequestBody(t *testing.T) {
 	tools, ok := capturedBody["tools"].([]any)
 	if !ok || len(tools) != 1 {
 		t.Errorf("tools = %v", capturedBody["tools"])
+	}
+}
+
+func TestChat_WithUseMaxCompletionTokens_Generate(t *testing.T) {
+	var capturedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	// gpt-4o is not a reasoning model, so without the option it would use
+	// max_tokens. The option alone must drive the rename to max_completion_tokens.
+	model := Chat("gpt-4o", WithAPIKey("key"), WithBaseURL(server.URL), WithUseMaxCompletionTokens(true))
+	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		MaxOutputTokens: 100,
+		ProviderOptions: chatCompletionsOpts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := capturedBody["max_tokens"]; ok {
+		t.Error("max_tokens must be renamed to max_completion_tokens")
+	}
+	if capturedBody["max_completion_tokens"] != float64(100) {
+		t.Errorf("max_completion_tokens = %v, want 100", capturedBody["max_completion_tokens"])
+	}
+}
+
+func TestChat_WithUseMaxCompletionTokens_Stream(t *testing.T) {
+	var capturedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &capturedBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("key"), WithBaseURL(server.URL), WithUseMaxCompletionTokens(true))
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		MaxOutputTokens: 50,
+		ProviderOptions: chatCompletionsOpts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range result.Stream {
+	}
+	if _, ok := capturedBody["max_tokens"]; ok {
+		t.Error("max_tokens must be renamed to max_completion_tokens")
+	}
+	if capturedBody["max_completion_tokens"] != float64(50) {
+		t.Errorf("max_completion_tokens = %v, want 50", capturedBody["max_completion_tokens"])
 	}
 }
 
@@ -1090,7 +1212,7 @@ func TestChat_Responses_ProviderOptions(t *testing.T) {
 			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
 		},
 		ProviderOptions: map[string]any{
-			"serviceTier":     "default",
+			"serviceTier":      "default",
 			"reasoning_effort": "medium",
 		},
 	})
@@ -1128,7 +1250,7 @@ func TestChat_Responses_ProviderOptions_All(t *testing.T) {
 			"parallelToolCalls": true,
 			"truncation":        "auto",
 			"include":           []string{"reasoning.encrypted_content"},
-			"reasoning_summary":  "auto",
+			"reasoning_summary": "auto",
 		},
 	})
 
@@ -1213,6 +1335,421 @@ func TestConvertToResponsesInput_FileAttachment(t *testing.T) {
 	}
 	if content[1]["filename"] != "doc.pdf" {
 		t.Errorf("content[1].filename = %v, want doc.pdf", content[1]["filename"])
+	}
+}
+
+func TestConvertToResponsesInput_FileRemoteRef(t *testing.T) {
+	msgs := []provider.Message{
+		{Role: provider.RoleUser, Content: []provider.Part{
+			{Type: provider.PartText, Text: "read this PDF"},
+			{Type: provider.PartFile, RemoteRef: &provider.RemoteFileRef{ID: "file-abc123"}, MediaType: "application/pdf", Filename: "doc.pdf"},
+		}},
+	}
+
+	result := convertToResponsesInput(msgs)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(result))
+	}
+
+	content, ok := result[0]["content"].([]map[string]any)
+	if !ok || len(content) != 2 {
+		t.Fatalf("content = %v", result[0]["content"])
+	}
+	if content[1]["type"] != "input_file" {
+		t.Errorf("content[1].type = %v, want input_file", content[1]["type"])
+	}
+	if content[1]["file_id"] != "file-abc123" {
+		t.Errorf("content[1].file_id = %v, want file-abc123", content[1]["file_id"])
+	}
+	if content[1]["filename"] != "doc.pdf" {
+		t.Errorf("content[1].filename = %v, want doc.pdf", content[1]["filename"])
+	}
+	if _, hasFileData := content[1]["file_data"]; hasFileData {
+		t.Error("should not have file_data when RemoteRef is set")
+	}
+}
+
+func TestChat_FileUploader(t *testing.T) {
+	model := Chat("gpt-4o", WithAPIKey("test-key"))
+	uploader, ok := model.(provider.FileUploadCapableModel)
+	if !ok {
+		t.Fatal("chatModel should implement FileUploadCapableModel")
+	}
+	if uploader.FileUploader() == nil {
+		t.Error("FileUploader() should return non-nil")
+	}
+}
+
+func TestFileUploader_UploadFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/files" {
+			t.Errorf("path = %q, want /files", r.URL.Path)
+		}
+		if r.Method != "POST" {
+			t.Errorf("method = %q, want POST", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-key" {
+			t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		ct := r.Header.Get("Content-Type")
+		if !strings.Contains(ct, "multipart/form-data") {
+			t.Errorf("Content-Type = %q, want multipart/form-data", ct)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"file-xyz789","bytes":123,"created_at":1234567890,"filename":"test.pdf","purpose":"assistants"}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	ref, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:    strings.NewReader("fake-pdf-content"),
+		Filename:  "test.pdf",
+		MediaType: "application/pdf",
+		Purpose:   "assistants",
+	})
+	if err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+	if ref.ID != "file-xyz789" {
+		t.Errorf("ref.ID = %q, want file-xyz789", ref.ID)
+	}
+	if ref.Filename != "test.pdf" {
+		t.Errorf("ref.Filename = %q", ref.Filename)
+	}
+	if ref.MediaType != "application/pdf" {
+		t.Errorf("ref.MediaType = %q", ref.MediaType)
+	}
+	if ref.Provider != "openai" {
+		t.Errorf("ref.Provider = %q", ref.Provider)
+	}
+	if len(ref.Data) == 0 {
+		t.Error("ref.Data should contain file bytes")
+	}
+}
+
+func TestFileUploader_UploadFile_HTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"error":{"message":"bad request"}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	_, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:    strings.NewReader("data"),
+		Filename:  "test.pdf",
+		MediaType: "application/pdf",
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestFileUploader_DeleteFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/files/file-to-delete" {
+			t.Errorf("path = %q, want /files/file-to-delete", r.URL.Path)
+		}
+		if r.Method != "DELETE" {
+			t.Errorf("method = %q, want DELETE", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-key" {
+			t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"file-to-delete","object":"file","deleted":true}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "file-to-delete"})
+	if err != nil {
+		t.Fatalf("DeleteFile error: %v", err)
+	}
+}
+
+func TestFileUploader_DeleteFile_HTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = fmt.Fprint(w, `{"error":{"message":"file not found"}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "nonexistent"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestFileUploader_DeleteFile_RejectsTraversal(t *testing.T) {
+	model := Chat("gpt-4o", WithAPIKey("test-key"))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	// A server-controlled ID must not be able to climb out of the /files/
+	// prefix via path traversal, including percent-encoded variants.
+	for _, id := range []string{
+		"../../etc/passwd", "../other-file", "a/b", `a\b`, "..",
+		// percent-encoded traversal bypasses
+		"..%2f", "..%2F", "..%5c", "..%5C",
+		"%2e%2e%2f", "%2E%2E%2F", "%2e%2e", "%2e%2e%5c",
+		"..%2fetc%2fpasswd", "%2fetc%2fpasswd", "file%2f..%2f..",
+	} {
+		err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: id})
+		if err == nil {
+			t.Errorf("DeleteFile(%q): expected traversal rejection, got nil", id)
+		}
+		if !strings.Contains(err.Error(), "unsafe ID") {
+			t.Errorf("DeleteFile(%q): error = %q, want 'unsafe ID'", id, err)
+		}
+	}
+}
+
+func TestFileUploader_UploadFile_EmptyMediaType(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"file-mediatype","bytes":3,"created_at":1234567890,"filename":"test.bin","purpose":"assistants"}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	ref, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:   strings.NewReader("abc"),
+		Filename: "test.bin",
+	})
+	if err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+	if ref.ID != "file-mediatype" {
+		t.Errorf("ref.ID = %q", ref.ID)
+	}
+	if ref.MediaType == "" {
+		t.Error("MediaType should be detected from content")
+	}
+}
+
+func TestFileUploader_UploadFile_InvalidJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `not-json`)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	_, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:    strings.NewReader("data"),
+		Filename:  "test.txt",
+		MediaType: "text/plain",
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid JSON response")
+	}
+}
+
+func TestFileUploader_DeleteFile_InvalidJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, `not-json`)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "file-xyz"})
+	if err != nil {
+		t.Fatalf("DeleteFile should not error on invalid JSON response body: %v", err)
+	}
+}
+
+func TestFileUploader_UploadFile_ReadError(t *testing.T) {
+	model := Chat("gpt-4o", WithAPIKey("test-key"))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	_, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:    &errorReader{},
+		Filename:  "test.txt",
+		MediaType: "text/plain",
+	})
+	if err == nil {
+		t.Fatal("expected error for failing reader")
+	}
+}
+
+func TestFileUploader_UploadFile_TokenError(t *testing.T) {
+	model := Chat("gpt-4o", WithTokenSource(failTokenSource{}))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	_, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:    strings.NewReader("data"),
+		Filename:  "test.txt",
+		MediaType: "text/plain",
+	})
+	if err == nil {
+		t.Fatal("expected error for token failure")
+	}
+}
+
+func TestFileUploader_UploadFile_Headers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Custom") != "value" {
+			t.Errorf("X-Custom = %q", r.Header.Get("X-Custom"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"file-headers","bytes":3,"created_at":1234567890,"filename":"test.txt","purpose":"assistants"}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL), WithHeaders(map[string]string{"X-Custom": "value"}))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	ref, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:    strings.NewReader("abc"),
+		Filename:  "test.txt",
+		MediaType: "text/plain",
+	})
+	if err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+	if ref.ID != "file-headers" {
+		t.Errorf("ref.ID = %q", ref.ID)
+	}
+}
+
+// A caller-supplied header named "Authorization" must NOT override the real
+// credential on the upload path: auth is applied last, so it wins.
+func TestFileUploader_UploadFile_AuthHeaderCannotBeOverridden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Errorf("Authorization = %q, want %q (caller header must not win)", got, "Bearer test-key")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"file-auth","bytes":3,"created_at":1234567890,"filename":"test.txt","purpose":"assistants"}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer attacker"}))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	_, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:    strings.NewReader("abc"),
+		Filename:  "test.txt",
+		MediaType: "text/plain",
+	})
+	if err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+}
+
+func TestFileUploader_UploadFile_HTTPClientError(t *testing.T) {
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL("http://127.0.0.1:1"))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	_, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:    strings.NewReader("data"),
+		Filename:  "test.txt",
+		MediaType: "text/plain",
+	})
+	if err == nil {
+		t.Fatal("expected error for connection refused")
+	}
+}
+
+func TestFileUploader_DeleteFile_TokenError(t *testing.T) {
+	model := Chat("gpt-4o", WithTokenSource(failTokenSource{}))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "file-xyz"})
+	if err == nil {
+		t.Fatal("expected error for token failure")
+	}
+}
+
+// A caller-supplied header named "Authorization" must NOT override the real
+// credential on the delete path: auth is applied last, so it wins.
+func TestFileUploader_DeleteFile_AuthHeaderCannotBeOverridden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Errorf("Authorization = %q, want %q (caller header must not win)", got, "Bearer test-key")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL),
+		WithHeaders(map[string]string{"Authorization": "Bearer attacker"}))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	if err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "file-to-delete"}); err != nil {
+		t.Fatalf("DeleteFile error: %v", err)
+	}
+}
+
+func TestFileUploader_DeleteFile_HTTPClientError(t *testing.T) {
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL("http://127.0.0.1:1"))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "file-xyz"})
+	if err == nil {
+		t.Fatal("expected error for connection refused")
+	}
+}
+
+func TestFileUploader_DeleteFile_Headers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Custom") != "value" {
+			t.Errorf("X-Custom = %q", r.Header.Get("X-Custom"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"file-to-delete","object":"file","deleted":true}`)
+	}))
+	defer server.Close()
+
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL(server.URL), WithHeaders(map[string]string{"X-Custom": "value"}))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "file-to-delete"})
+	if err != nil {
+		t.Fatalf("DeleteFile error: %v", err)
+	}
+}
+
+func TestFileUploader_UploadFile_InvalidURL(t *testing.T) {
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL("://"))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	_, err := uploader.UploadFile(t.Context(), provider.FileUpload{
+		Reader:    strings.NewReader("data"),
+		Filename:  "test.txt",
+		MediaType: "text/plain",
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid URL")
+	}
+}
+
+func TestFileUploader_DeleteFile_InvalidURL(t *testing.T) {
+	model := Chat("gpt-4o", WithAPIKey("test-key"), WithBaseURL("://"))
+	uploader := model.(provider.FileUploadCapableModel).FileUploader()
+
+	err := uploader.DeleteFile(t.Context(), provider.RemoteFileRef{ID: "file-xyz"})
+	if err == nil {
+		t.Fatal("expected error for invalid URL")
 	}
 }
 
@@ -1802,7 +2339,7 @@ func TestParseResponsesResult_ReasoningSummary(t *testing.T) {
 		"status": "completed",
 		"output": [
 			{"type": "reasoning", "summary": [
-				{"type": "summary_text", "text": "Step one. "},
+				{"type": "summary_text", "text": "Step one."},
 				{"type": "summary_text", "text": "Step two."}
 			]},
 			{"type": "message", "content": [{"type": "output_text", "text": "answer"}]}
@@ -1817,8 +2354,214 @@ func TestParseResponsesResult_ReasoningSummary(t *testing.T) {
 	if result.Text != "answer" {
 		t.Errorf("Text = %q, want %q", result.Text, "answer")
 	}
-	if result.Reasoning != "Step one. Step two." {
-		t.Errorf("Reasoning = %q, want %q", result.Reasoning, "Step one. Step two.")
+	// Each summary is a separate entry, so the parser supplies the boundary
+	// instead of relying on the text to carry its own trailing whitespace.
+	if result.Reasoning != "Step one.\n\nStep two." {
+		t.Errorf("Reasoning = %q, want %q", result.Reasoning, "Step one.\n\nStep two.")
+	}
+}
+
+func TestParseResponsesResult_ReasoningEncryptedContent(t *testing.T) {
+	body := `{
+		"id": "resp-1",
+		"model": "o3",
+		"status": "completed",
+		"output": [{"type": "reasoning", "id": "rs-1", "encrypted_content": "opaque-state", "summary": [{"type": "summary_text", "text": "think"}]}]
+	}`
+
+	result, err := parseResponsesResult([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ReasoningParts) != 1 {
+		t.Fatalf("ReasoningParts = %d, want 1", len(result.ReasoningParts))
+	}
+	openAI, ok := result.ReasoningParts[0].ProviderOptions["openai"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing openai reasoning metadata: %#v", result.ReasoningParts[0].ProviderOptions)
+	}
+	if openAI["itemId"] != "rs-1" || openAI["encryptedContent"] != "opaque-state" {
+		t.Errorf("reasoning metadata = %#v", openAI)
+	}
+}
+
+func TestParseResponsesResult_ReasoningEmptySummaryPreservesReplayState(t *testing.T) {
+	body := `{
+		"id": "resp-1",
+		"model": "o3",
+		"status": "completed",
+		"output": [{"type": "reasoning", "id": "rs-1", "encrypted_content": "opaque-state", "summary": []}]
+	}`
+
+	result, err := parseResponsesResult([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ReasoningParts) != 1 || result.ReasoningParts[0].Text != "" {
+		t.Fatalf("ReasoningParts = %#v", result.ReasoningParts)
+	}
+	input, ok := reasoningInputItem(result.ReasoningParts[0])
+	if !ok {
+		t.Fatal("encrypted reasoning state was not replayable")
+	}
+	summary, ok := input["summary"].([]map[string]any)
+	if !ok || len(summary) != 0 {
+		t.Fatalf("summary = %#v, want empty array", input["summary"])
+	}
+}
+
+func TestConvertToResponsesInput_ReasoningEncryptedContent(t *testing.T) {
+	input := convertToResponsesInput([]provider.Message{{
+		Role:    provider.RoleAssistant,
+		Content: []provider.Part{openAIReasoningPart("rs-1", "think", "opaque-state")},
+	}})
+	if len(input) != 1 {
+		t.Fatalf("input length = %d, want 1", len(input))
+	}
+	if input[0]["type"] != "reasoning" || input[0]["id"] != "rs-1" || input[0]["encrypted_content"] != "opaque-state" {
+		t.Errorf("reasoning input = %#v", input[0])
+	}
+	if got := input[0]["summary"].([]map[string]any)[0]["text"]; got != "think" {
+		t.Errorf("summary text = %v, want think", got)
+	}
+}
+
+func TestConvertToResponsesInput_ReasoningEncryptedContentWithEmptySummary(t *testing.T) {
+	input := convertToResponsesInput([]provider.Message{{
+		Role:    provider.RoleAssistant,
+		Content: []provider.Part{openAIReasoningPart("rs-1", "", "opaque-state")},
+	}})
+	if len(input) != 1 {
+		t.Fatalf("input length = %d, want 1", len(input))
+	}
+	if summary, ok := input[0]["summary"].([]map[string]any); !ok || len(summary) != 0 {
+		t.Fatalf("summary = %#v, want empty array", input[0]["summary"])
+	}
+}
+
+func TestReasoningInputItem_RequiresOpenAIState(t *testing.T) {
+	for name, part := range map[string]provider.Part{
+		"missing provider metadata": {Type: provider.PartReasoning, Text: "think"},
+		"empty openai metadata":     {Type: provider.PartReasoning, ProviderOptions: map[string]any{"openai": map[string]any{}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if item, ok := reasoningInputItem(part); ok || item != nil {
+				t.Fatalf("reasoningInputItem() = %#v, %v; want nil, false", item, ok)
+			}
+		})
+	}
+}
+
+func TestBuildResponsesRequest_AutoContinuationInput(t *testing.T) {
+	body := buildResponsesRequest(provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "original"}}},
+			{Role: provider.RoleAssistant, Content: []provider.Part{{Type: provider.PartToolCall, ToolCallID: "call-1", ToolName: "lookup", ToolInput: json.RawMessage(`{}`)}}},
+			{Role: provider.RoleTool, Content: []provider.Part{{Type: provider.PartToolResult, ToolCallID: "call-1", ToolOutput: "result"}}},
+		},
+		ProviderOptions: map[string]any{
+			"previousResponseId":         "resp-1",
+			"goaiAutoPreviousResponseID": true,
+		},
+	}, "o3", false)
+	input := body["input"].([]map[string]any)
+	if len(input) != 1 || input[0]["type"] != "function_call_output" || input[0]["call_id"] != "call-1" {
+		t.Fatalf("auto continuation input = %#v", input)
+	}
+}
+
+func TestResponsesToolContinuation_HTTPRoundTrip(t *testing.T) {
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var request map[string]any
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		requests = append(requests, request)
+		w.Header().Set("Content-Type", "application/json")
+		if len(requests) == 1 {
+			_, _ = fmt.Fprint(w, `{"id":"resp-1","model":"o3","status":"completed","output":[{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}"}]}`)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"id":"resp-2","model":"o3","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}`)
+	}))
+	defer server.Close()
+
+	model := Chat("o3", WithAPIKey("key"), WithBaseURL(server.URL))
+	first, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "lookup"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleAssistant, Content: append(first.ReasoningParts, provider.Part{Type: provider.PartToolCall, ToolCallID: "call-1", ToolName: "lookup", ToolInput: json.RawMessage(`{}`)})},
+			{Role: provider.RoleTool, Content: []provider.Part{{Type: provider.PartToolResult, ToolCallID: "call-1", ToolOutput: "result"}}},
+		},
+		ProviderOptions: map[string]any{
+			"previousResponseId":         first.Response.ID,
+			"goaiAutoPreviousResponseID": true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(requests))
+	}
+	if requests[1]["previous_response_id"] != "resp-1" {
+		t.Errorf("previous_response_id = %v", requests[1]["previous_response_id"])
+	}
+	input := requests[1]["input"].([]any)
+	if len(input) != 1 || input[0].(map[string]any)["type"] != "function_call_output" {
+		t.Errorf("continuation input = %#v", input)
+	}
+}
+
+func TestStreamResponses_ReasoningEncryptedContent(t *testing.T) {
+	sse := "event: response.output_item.added\n" +
+		`data: {"output_index":0,"item":{"type":"reasoning","id":"rs-1"}}` + "\n\n" +
+		"event: response.reasoning_summary_text.delta\n" +
+		`data: {"item_id":"rs-1","summary_index":0,"delta":"think"}` + "\n\n" +
+		"event: response.output_item.done\n" +
+		`data: {"output_index":0,"item":{"type":"reasoning","id":"rs-1","encrypted_content":"opaque-state"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"response":{"id":"resp-1","model":"o3"}}` + "\n\n"
+	out := make(chan provider.StreamChunk, 8)
+	streamResponses(t.Context(), io.NopCloser(strings.NewReader(sse)), out)
+
+	var chunks []provider.StreamChunk
+	for chunk := range out {
+		chunks = append(chunks, chunk)
+	}
+	var encrypted, gotFinish bool
+	for _, chunk := range chunks {
+		if chunk.Type == provider.ChunkError {
+			t.Fatalf("unexpected stream error: %v", chunk.Error)
+		}
+		gotFinish = gotFinish || chunk.Type == provider.ChunkFinish
+		if openAI, ok := chunk.Metadata["openai"].(map[string]any); ok && openAI["encryptedContent"] == "opaque-state" {
+			encrypted = true
+		}
+	}
+	if !encrypted {
+		t.Fatal("stream did not preserve encrypted reasoning content")
+	}
+	if !gotFinish {
+		t.Fatal("usage-less terminal event did not finish the stream")
+	}
+}
+
+func TestActiveReasoningForEvent_PrefersCanonicalItemID(t *testing.T) {
+	active := map[int]*responsesReasoning{
+		0: {canonicalID: "rs-0"},
+		1: {canonicalID: "rs-1"},
+	}
+	index, reasoning := activeReasoningForEvent(active, 1, "rs-0")
+	if index != 0 || reasoning.canonicalID != "rs-0" {
+		t.Fatalf("selected reasoning = %d, %#v; want item 0", index, reasoning)
 	}
 }
 
@@ -1928,14 +2671,48 @@ func TestStreamResponses_ContentFilterIncomplete(t *testing.T) {
 	}
 }
 
-func TestStreamResponses_DONE(t *testing.T) {
+func TestStreamResponses_DONERejectedByDefault(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer server.Close()
 
-	model := Chat("o3", WithAPIKey("key"), WithBaseURL(server.URL))
+	model := Chat("gpt-5", WithAPIKey("key"), WithBaseURL(server.URL))
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var gotError error
+	for chunk := range result.Stream {
+		if chunk.Type == provider.ChunkError {
+			gotError = chunk.Error
+		}
+	}
+	var protocolErr *StreamProtocolError
+	if !errors.As(gotError, &protocolErr) {
+		t.Fatalf("error = %T %v, want strict Responses protocol error", gotError, gotError)
+	}
+}
+
+func TestStreamResponses_DONECompatibility(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	model := Chat(
+		"gpt-5",
+		WithAPIKey("key"),
+		WithBaseURL(server.URL),
+		WithResponsesStreamDoneCompatibility(true),
+	)
 	result, err := model.DoStream(t.Context(), provider.GenerateParams{
 		Messages: []provider.Message{
 			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
@@ -1947,12 +2724,87 @@ func TestStreamResponses_DONE(t *testing.T) {
 
 	var gotFinish bool
 	for chunk := range result.Stream {
-		if chunk.Type == provider.ChunkFinish {
-			gotFinish = true
-		}
+		gotFinish = gotFinish || chunk.Type == provider.ChunkFinish
 	}
 	if !gotFinish {
-		t.Error("expected finish chunk from [DONE]")
+		t.Fatal("compatibility option did not accept [DONE]")
+	}
+}
+
+func TestStreamResponses_PrematureEOF(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		wantReasoning bool
+	}{
+		{
+			name:  "before output",
+			input: "event: response.created\ndata: {\"response\":{\"id\":\"resp_1\"}}\n\n",
+		},
+		{
+			name:          "after reasoning delta",
+			input:         "event: response.reasoning_summary_text.delta\ndata: {\"item_id\":\"rs_1\",\"summary_index\":0,\"delta\":\"thinking\"}\n\n",
+			wantReasoning: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := make(chan provider.StreamChunk, 4)
+			streamResponses(t.Context(), io.NopCloser(strings.NewReader(tt.input)), out)
+
+			var gotReasoning, gotError bool
+			for chunk := range out {
+				gotReasoning = gotReasoning || chunk.Type == provider.ChunkReasoning
+				gotError = gotError || chunk.Type == provider.ChunkError
+			}
+			if gotReasoning != tt.wantReasoning {
+				t.Fatalf("reasoning chunk = %v, want %v", gotReasoning, tt.wantReasoning)
+			}
+			if !gotError {
+				t.Fatal("expected premature EOF to emit a stream error")
+			}
+		})
+	}
+}
+
+func TestStreamResponses_MalformedTerminal(t *testing.T) {
+	terminalEvents := []string{
+		"response.completed",
+		"response.incomplete",
+		"response.failed",
+		"error",
+	}
+
+	for _, eventType := range terminalEvents {
+		for _, payload := range []struct {
+			name string
+			data string
+		}{
+			{name: "invalid JSON", data: "{not-json}"},
+			{name: "invalid shape", data: `{"response":"invalid","error":"invalid"}`},
+			{name: "missing required fields", data: `{}`},
+		} {
+			t.Run(eventType+"/"+payload.name, func(t *testing.T) {
+				input := fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, payload.data)
+				out := make(chan provider.StreamChunk, 4)
+				streamResponses(t.Context(), io.NopCloser(strings.NewReader(input)), out)
+
+				var gotError error
+				for chunk := range out {
+					if chunk.Type == provider.ChunkError {
+						gotError = chunk.Error
+					}
+				}
+				if gotError == nil {
+					t.Fatal("expected malformed terminal event to emit a stream error")
+				}
+				var protocolErr *StreamProtocolError
+				if !errors.As(gotError, &protocolErr) || protocolErr.EventType != eventType {
+					t.Fatalf("error = %T %#v, want protocol error for %q", gotError, gotError, eventType)
+				}
+			})
+		}
 	}
 }
 
@@ -1999,14 +2851,18 @@ func TestStreamResponses_ScannerError(t *testing.T) {
 	out := make(chan provider.StreamChunk, 64)
 	go streamResponses(t.Context(), &errorReader{}, out)
 
-	var gotError bool
+	var gotError error
 	for chunk := range out {
 		if chunk.Type == provider.ChunkError {
-			gotError = true
+			gotError = chunk.Error
 		}
 	}
-	if !gotError {
+	if gotError == nil {
 		t.Error("expected error chunk from scanner error")
+	}
+	var protocolErr *StreamProtocolError
+	if !errors.As(gotError, &protocolErr) || protocolErr.Reason != "stream read failed" || errors.Unwrap(protocolErr) == nil {
+		t.Fatalf("error = %T %#v, want wrapped stream protocol error", gotError, gotError)
 	}
 }
 
@@ -3320,9 +4176,10 @@ func TestBF13_ErrorTypes(t *testing.T) {
 // --- 100% coverage gap tests ---
 
 func TestDetectMediaType_GifAndJpg(t *testing.T) {
-	// Covers image.go:147-148 (gif case) and jpg alias.
-	if got := detectMediaType("gif", ""); got != "image/gif" {
-		t.Errorf("detectMediaType(gif) = %q, want image/gif", got)
+	// gif is not in the official output_format enum (png|jpeg|webp); it must
+	// fall back to png. jpg is an alias for jpeg.
+	if got := detectMediaType("gif", ""); got != "image/png" {
+		t.Errorf("detectMediaType(gif) = %q, want image/png", got)
 	}
 	if got := detectMediaType("jpg", ""); got != "image/jpeg" {
 		t.Errorf("detectMediaType(jpg) = %q, want image/jpeg", got)
@@ -4074,3 +4931,236 @@ func TestConvertToResponsesInput_ServerToolItem(t *testing.T) {
 	}
 }
 
+func TestStreamResponses_ToolCallEmittedOnceAfterTrailingDelta(t *testing.T) {
+	// A delta arriving after the arguments already parse must not become a
+	// second call: the buffer is resolved on function_call_arguments.done.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.output_item.added\n")
+		_, _ = fmt.Fprint(w, `data: {"output_index":0,"item":{"type":"function_call","call_id":"tc1","name":"read"}}`+"\n\n")
+		_, _ = fmt.Fprint(w, "event: response.function_call_arguments.delta\n")
+		_, _ = fmt.Fprint(w, `data: {"output_index":0,"delta":"{\"path\":\"a.go\"}"}`+"\n\n")
+		_, _ = fmt.Fprint(w, "event: response.function_call_arguments.delta\n")
+		_, _ = fmt.Fprint(w, `data: {"output_index":0,"delta":"\n"}`+"\n\n")
+		_, _ = fmt.Fprint(w, "event: response.function_call_arguments.done\n")
+		_, _ = fmt.Fprint(w, `data: {"output_index":0}`+"\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\n")
+		_, _ = fmt.Fprint(w, `data: {"response":{"usage":{"input_tokens":1,"output_tokens":1}}}`+"\n\n")
+	}))
+	defer server.Close()
+
+	model := Chat("o3", WithAPIKey("key"), WithBaseURL(server.URL))
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []provider.StreamChunk
+	for chunk := range result.Stream {
+		if chunk.Type == provider.ChunkToolCall {
+			calls = append(calls, chunk)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("emitted %d tool calls, want 1", len(calls))
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(calls[0].ToolInput), &args); err != nil {
+		t.Fatalf("ToolInput = %q, does not parse: %v", calls[0].ToolInput, err)
+	}
+	if args["path"] != "a.go" {
+		t.Errorf("args = %v, want path a.go", args)
+	}
+	if calls[0].ToolCallID != "tc1" || calls[0].ToolName != "read" {
+		t.Errorf("call = %q/%q, want tc1/read", calls[0].ToolCallID, calls[0].ToolName)
+	}
+}
+
+// The flush in output_item.done is the one TrySend path that cannot be reached
+// with an already-cancelled context: the events leading up to it send first and
+// bail out earlier. Cancel once the arguments are buffered instead.
+func TestStreamResponses_ContextCancel_OutputItemDoneFlush(t *testing.T) {
+	line := func(event, data string) string {
+		return "event: " + event + "\ndata: " + data + "\n\n"
+	}
+	input := line("response.output_item.added",
+		`{"output_index":0,"item":{"type":"function_call","id":"fc1","call_id":"c1","name":"fn"}}`) +
+		line("response.function_call_arguments.delta", `{"output_index":0,"delta":"{\"a\":1}"}`) +
+		// No arguments.done: the item is closed directly, so the flush runs.
+		line("response.output_item.done", `{"output_index":0,"item":{"type":"function_call"}}`)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	out := make(chan provider.StreamChunk) // unbuffered: the flush blocks on send
+	done := make(chan struct{})
+	go func() {
+		streamResponses(ctx, io.NopCloser(strings.NewReader(input)), out)
+		close(done)
+	}()
+
+	for chunk := range out {
+		if chunk.Type == provider.ChunkToolCallDelta {
+			break // stop consuming: the flush is now the pending send
+		}
+	}
+	cancel()
+
+	<-done
+	for range out { //nolint:revive // drain whatever was buffered
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning summary boundaries
+// ---------------------------------------------------------------------------
+
+// collectReasoning streams an SSE body and returns the reasoning text as a
+// consumer that concatenates deltas would see it, plus the reasoningId metadata
+// of every chunk.
+func collectReasoning(t *testing.T, sse string) (string, []string) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, sse)
+	}))
+	defer server.Close()
+
+	model := Chat("o3", WithAPIKey("key"), WithBaseURL(server.URL))
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var text string
+	var ids []string
+	for chunk := range result.Stream {
+		if chunk.Type != provider.ChunkReasoning {
+			continue
+		}
+		text += chunk.Text
+		if id, ok := chunk.Metadata["reasoningId"].(string); ok {
+			ids = append(ids, id)
+		}
+	}
+	return text, ids
+}
+
+func sseLine(event, data string) string {
+	return "event: " + event + "\ndata: " + data + "\n\n"
+}
+
+func reasoningItem(outputIndex int, id string) string {
+	return sseLine("response.output_item.added",
+		fmt.Sprintf(`{"output_index":%d,"item":{"type":"reasoning","id":%q}}`, outputIndex, id))
+}
+
+func summaryDelta(itemID string, summaryIndex int, delta string) string {
+	return sseLine("response.reasoning_summary_text.delta",
+		fmt.Sprintf(`{"item_id":%q,"summary_index":%d,"delta":%q}`, itemID, summaryIndex, delta))
+}
+
+func TestStreamResponses_ReasoningSummaryBoundaries(t *testing.T) {
+	t.Run("distinct summaries keep their boundary", func(t *testing.T) {
+		got, _ := collectReasoning(t, reasoningItem(0, "rs_1")+
+			summaryDelta("rs_1", 0, "**Planning multi-step code review**")+
+			summaryDelta("rs_1", 1, "**Verifying read-only diff retrieval**"))
+
+		want := "**Planning multi-step code review**\n\n**Verifying read-only diff retrieval**"
+		if got != want {
+			t.Errorf("reasoning = %q, want %q", got, want)
+		}
+		if strings.Contains(got, "****") {
+			t.Error("the summaries were merged into a single bold span")
+		}
+	})
+
+	// The common case by far: one summary arrives as many deltas. Separating
+	// those would shred every reasoning block.
+	t.Run("deltas within one summary are concatenated bare", func(t *testing.T) {
+		got, _ := collectReasoning(t, reasoningItem(0, "rs_1")+
+			summaryDelta("rs_1", 0, "**Plan")+
+			summaryDelta("rs_1", 0, "ning**")+
+			summaryDelta("rs_1", 0, " the ")+
+			summaryDelta("rs_1", 0, "review"))
+
+		if want := "**Planning** the review"; got != want {
+			t.Errorf("reasoning = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a single summary gets no separator", func(t *testing.T) {
+		got, _ := collectReasoning(t, reasoningItem(0, "rs_1")+
+			summaryDelta("rs_1", 0, "**Only one**"))
+
+		if want := "**Only one**"; got != want {
+			t.Errorf("reasoning = %q, want %q", got, want)
+		}
+	})
+
+	// Each reasoning item tracks its own index, so a new item starts clean
+	// rather than inheriting the previous item's last summary.
+	t.Run("a second reasoning item starts without a separator", func(t *testing.T) {
+		got, _ := collectReasoning(t, reasoningItem(0, "rs_1")+
+			summaryDelta("rs_1", 0, "first")+
+			sseLine("response.output_item.done", `{"output_index":0,"item":{"type":"reasoning"}}`)+
+			reasoningItem(1, "rs_2")+
+			summaryDelta("rs_2", 0, "second"))
+
+		if want := "firstsecond"; got != want {
+			t.Errorf("reasoning = %q, want %q", got, want)
+		}
+	})
+
+	// A stream whose first summary is not index 0 must not open with a separator.
+	t.Run("a non-zero first index gets no leading separator", func(t *testing.T) {
+		got, _ := collectReasoning(t, reasoningItem(0, "rs_1")+
+			summaryDelta("rs_1", 3, "**Late start**"))
+
+		if want := "**Late start**"; got != want {
+			t.Errorf("reasoning = %q, want %q", got, want)
+		}
+	})
+
+	// Without the item event there is nothing to track: behave as before rather
+	// than guessing a boundary.
+	t.Run("summaries without a reasoning item are untouched", func(t *testing.T) {
+		got, _ := collectReasoning(t,
+			summaryDelta("rs_x", 0, "a")+summaryDelta("rs_x", 1, "b"))
+
+		if want := "ab"; got != want {
+			t.Errorf("reasoning = %q, want %q", got, want)
+		}
+	})
+
+	// The separator is a presentation concern: the index still travels in the
+	// metadata for consumers that split on it.
+	t.Run("reasoningId still carries the summary index", func(t *testing.T) {
+		_, ids := collectReasoning(t, reasoningItem(0, "rs_1")+
+			summaryDelta("rs_1", 0, "a")+
+			summaryDelta("rs_1", 1, "b"))
+
+		if len(ids) != 2 || ids[0] != "rs_1:0" || ids[1] != "rs_1:1" {
+			t.Errorf("reasoningIds = %v, want [rs_1:0 rs_1:1]", ids)
+		}
+	})
+}
+
+func TestParseResponsesResult_SingleSummaryHasNoSeparator(t *testing.T) {
+	body := `{
+		"id": "resp-1", "model": "o3", "status": "completed",
+		"output": [
+			{"type": "reasoning", "summary": [{"type": "summary_text", "text": "Only one."}]},
+			{"type": "message", "content": [{"type": "output_text", "text": "answer"}]}
+		],
+		"usage": {"input_tokens": 1, "output_tokens": 1}
+	}`
+	result, err := parseResponsesResult([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Reasoning != "Only one." {
+		t.Errorf("Reasoning = %q, want %q", result.Reasoning, "Only one.")
+	}
+}

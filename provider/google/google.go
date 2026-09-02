@@ -11,6 +11,7 @@ package google
 import (
 	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,38 +19,78 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
-	"sync"
 
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/internal/gemini"
+	"github.com/zendev-sh/goai/internal/geminichat"
 	"github.com/zendev-sh/goai/internal/httpc"
 	"github.com/zendev-sh/goai/internal/sse"
 	"github.com/zendev-sh/goai/provider"
 )
 
+// Bounds for reading untrusted HTTP response bodies. Success responses are
+// capped at 64 MiB; error bodies (used only to surface an error message) are
+// capped at 1 MiB to prevent a malicious server from exhausting memory.
+const (
+	maxGoogleSuccessBodyBytes int64 = 64 << 20
+	maxGoogleErrorBodyBytes   int64 = 1 << 20
+)
+
+// readSuccessBody reads a success response body, bounding it to
+// maxGoogleSuccessBodyBytes and returning a clear error if the cap is exceeded.
+func readSuccessBody(reader io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, maxGoogleSuccessBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxGoogleSuccessBodyBytes {
+		return nil, fmt.Errorf("response body exceeds %d byte limit", maxGoogleSuccessBodyBytes)
+	}
+	return data, nil
+}
+
 // Compile-time interface compliance checks.
 var (
-	_ provider.LanguageModel = (*chatModel)(nil)
-	_ provider.CapableModel  = (*chatModel)(nil)
+	_ provider.LanguageModel          = (*chatModel)(nil)
+	_ provider.CapableModel           = (*chatModel)(nil)
+	_ provider.FileUploadCapableModel = (*chatModel)(nil)
+	_ provider.LanguageModel          = (*vertexChatModel)(nil)
+	_ provider.CapableModel           = (*vertexChatModel)(nil)
 )
 
 const defaultBaseURL = "https://generativelanguage.googleapis.com"
+
+func init() {
+	geminichat.RegisterFactory(newVertexChat)
+}
 
 // Option configures the Google provider.
 type Option func(*options)
 
 type options struct {
 	tokenSource provider.TokenSource
+	usesAPIKey  bool
 	baseURL     string
 	headers     map[string]string
 	httpClient  *http.Client
+
+	// Vertex AI mode: when isVertex is set, requests route to the
+	// {location}-aiplatform.googleapis.com endpoints and authenticate with a
+	// Bearer OAuth token instead of the x-goog-api-key header. The native wire
+	// format (serialization, SSE, thinking, grounding) is identical.
+	isVertex      bool
+	project       string
+	location      string
+	vertexBaseURL string
 }
 
 // WithAPIKey sets a static API key for authentication.
 func WithAPIKey(key string) Option {
 	return func(o *options) {
 		o.tokenSource = provider.StaticToken(key)
+		o.usesAPIKey = true
 	}
 }
 
@@ -57,7 +98,39 @@ func WithAPIKey(key string) Option {
 func WithTokenSource(ts provider.TokenSource) Option {
 	return func(o *options) {
 		o.tokenSource = ts
+		o.usesAPIKey = false
 	}
+}
+
+func withVertex(project, location string) Option {
+	return func(o *options) {
+		o.isVertex = true
+		o.project = project
+		o.location = location
+	}
+}
+
+func withVertexBaseURL(url string) Option {
+	return func(o *options) {
+		o.vertexBaseURL = url
+	}
+}
+
+func newVertexChat(modelID string, cfg geminichat.Config) provider.LanguageModel {
+	model := &chatModel{
+		id: modelID,
+		opts: options{
+			tokenSource:   cfg.TokenSource,
+			baseURL:       defaultBaseURL,
+			headers:       cfg.Headers,
+			httpClient:    cfg.HTTPClient,
+			isVertex:      true,
+			project:       cfg.Project,
+			location:      cfg.Location,
+			vertexBaseURL: cfg.BaseURL,
+		},
+	}
+	return &vertexChatModel{model: model}
 }
 
 // WithBaseURL overrides the default Gemini API base URL.
@@ -90,21 +163,25 @@ func Chat(modelID string, opts ...Option) provider.LanguageModel {
 	// Resolve API key from env if not set.
 	// Support both GOOGLE_GENERATIVE_AI_API_KEY (Vercel AI SDK convention)
 	// and GEMINI_API_KEY (Google's own convention / models.dev).
-	if o.tokenSource == nil {
+	if !o.isVertex && o.tokenSource == nil {
 		if key := cmp.Or(os.Getenv("GOOGLE_GENERATIVE_AI_API_KEY"), os.Getenv("GEMINI_API_KEY")); key != "" {
 			o.tokenSource = provider.StaticToken(key)
 		}
 	}
 	// Resolve base URL from env if not overridden.
-	if o.baseURL == defaultBaseURL {
+	if !o.isVertex && o.baseURL == defaultBaseURL {
 		if base := os.Getenv("GOOGLE_GENERATIVE_AI_BASE_URL"); base != "" {
 			o.baseURL = base
 		}
 	}
-	return &chatModel{
+	model := &chatModel{
 		id:   modelID,
 		opts: o,
 	}
+	if o.isVertex {
+		return &vertexChatModel{model: model}
+	}
+	return model
 }
 
 type chatModel struct {
@@ -120,6 +197,7 @@ func (m *chatModel) Capabilities() provider.ModelCapabilities {
 		Reasoning:   modelSupportsThinking(m.id),
 		ToolCall:    true,
 		Attachment:  true,
+		FileUpload:  true,
 		InputModalities: provider.ModalitySet{
 			Text:  true,
 			Image: true,
@@ -127,6 +205,33 @@ func (m *chatModel) Capabilities() provider.ModelCapabilities {
 		},
 		OutputModalities: provider.ModalitySet{Text: true},
 	}
+}
+
+func (m *chatModel) FileUploader() provider.FileUploader {
+	return &fileUploader{opts: m.opts}
+}
+
+// vertexChatModel deliberately does not implement FileUploadCapableModel.
+// Vertex native Gemini endpoints do not support the Gemini Developer API's
+// Files API used by chatModel.FileUploader.
+type vertexChatModel struct {
+	model *chatModel
+}
+
+func (m *vertexChatModel) ModelID() string { return m.model.ModelID() }
+
+func (m *vertexChatModel) Capabilities() provider.ModelCapabilities {
+	caps := m.model.Capabilities()
+	caps.FileUpload = false
+	return caps
+}
+
+func (m *vertexChatModel) DoGenerate(ctx context.Context, params provider.GenerateParams) (*provider.GenerateResult, error) {
+	return m.model.DoGenerate(ctx, params)
+}
+
+func (m *vertexChatModel) DoStream(ctx context.Context, params provider.GenerateParams) (*provider.StreamResult, error) {
+	return m.model.DoStream(ctx, params)
 }
 
 func (m *chatModel) DoGenerate(ctx context.Context, params provider.GenerateParams) (*provider.GenerateResult, error) {
@@ -137,7 +242,10 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	if err != nil {
 		return nil, err
 	}
-	reqURL := fmt.Sprintf("%s/v1beta/models/%s:generateContent", m.opts.baseURL, url.PathEscape(m.id))
+	reqURL, err := m.endpointURL("generateContent", "")
+	if err != nil {
+		return nil, err
+	}
 
 	resp, err := m.doHTTP(ctx, reqURL, body, params.Headers)
 	if err != nil {
@@ -145,7 +253,7 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readSuccessBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -161,33 +269,21 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 	if err != nil {
 		return nil, err
 	}
-	reqURL := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", m.opts.baseURL, url.PathEscape(m.id))
+	reqURL, err := m.endpointURL("streamGenerateContent", "?alt=sse")
+	if err != nil {
+		return nil, err
+	}
 
 	resp, err := m.doHTTP(ctx, reqURL, body, params.Headers)
 	if err != nil {
 		return nil, err
 	}
+	// Keep resp.Request and its serialized request body out of the stream closure.
+	responseBody := resp.Body
 
-	out := make(chan provider.StreamChunk, 64)
-	go func() {
-		var closeOnce sync.Once
-		closeBody := func() { closeOnce.Do(func() { _ = resp.Body.Close() }) }
-		defer closeBody()
-		// Close body on context cancellation to unblock scanner.Scan().
-		// Without this, the goroutine leaks if the server stalls mid-stream.
-		done := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				closeBody()
-			case <-done:
-			}
-		}()
-		defer close(done)
-		parseSSE(ctx, resp.Body, out)
-	}()
-
-	return &provider.StreamResult{Stream: out}, nil
+	return provider.RunStream(ctx, responseBody, func(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk) {
+		parseSSE(ctx, body, out)
+	}), nil
 }
 
 // --- Request building ---
@@ -202,7 +298,6 @@ type geminiRequestBody struct {
 	SafetySettings    any `json:"safetySettings,omitempty"`
 	GenerationConfig  any `json:"generationConfig,omitempty"`
 	CachedContent     any `json:"cachedContent,omitempty"`
-	Labels            any `json:"labels,omitempty"`
 	Contents          any `json:"contents"`
 }
 
@@ -299,6 +394,16 @@ func (m *chatModel) buildRequest(params provider.GenerateParams) (geminiRequestB
 			toolConfig["retrievalConfig"] = rc
 		}
 	}
+	// Gemini 3.x supports this additional toolConfig field. Accept only the
+	// documented boolean from the Google namespace; SDK-derived fields above
+	// must not be overridden by raw provider options.
+	if gopts != nil {
+		if tc, ok := gopts["toolConfig"].(map[string]any); ok {
+			if include, ok := tc["includeServerSideToolInvocations"].(bool); ok {
+				toolConfig["includeServerSideToolInvocations"] = include
+			}
+		}
+	}
 
 	if len(toolConfig) > 0 {
 		body.ToolConfig = toolConfig
@@ -371,10 +476,20 @@ func (m *chatModel) buildRequest(params provider.GenerateParams) (geminiRequestB
 		}
 	}
 
-	// Image config from ProviderOptions.
+	// Image config from ProviderOptions. imageSize is not an official
+	// ImageConfig field -- it belongs at the top level of generationConfig,
+	// so it is hoisted out of imageConfig.
 	if gopts != nil {
 		if ic, ok := gopts["imageConfig"].(map[string]any); ok {
-			genConfig["imageConfig"] = ic
+			hoisted := make(map[string]any, len(ic))
+			for k, v := range ic {
+				if k == "imageSize" {
+					genConfig["imageSize"] = v
+					continue
+				}
+				hoisted[k] = v
+			}
+			genConfig["imageConfig"] = hoisted
 		}
 	}
 
@@ -402,13 +517,6 @@ func (m *chatModel) buildRequest(params provider.GenerateParams) (geminiRequestB
 		}
 	}
 
-	// Labels from ProviderOptions.
-	if gopts != nil {
-		if lb, ok := gopts["labels"].(map[string]any); ok {
-			body.Labels = lb
-		}
-	}
-
 	// Messages (last, changes per turn).
 	body.Contents = convertMessages(params.Messages)
 
@@ -419,6 +527,7 @@ func (m *chatModel) buildRequest(params provider.GenerateParams) (geminiRequestB
 
 func convertMessages(msgs []provider.Message) []map[string]any {
 	result := make([]map[string]any, 0, len(msgs))
+	lastWasTool := false
 
 	for _, msg := range msgs {
 		if msg.Role == provider.RoleSystem {
@@ -446,7 +555,27 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 				}
 				parts = append(parts, textPart)
 
-			case provider.PartImage, provider.PartFile:
+			case provider.PartImage:
+				if part.RemoteRef != nil {
+					// Remote reference to an uploaded file/image: emit fileData.
+					// Fall back to inlineData when the raw bytes are available.
+					if len(part.RemoteRef.Data) > 0 {
+						parts = append(parts, map[string]any{
+							"inlineData": map[string]any{
+								"mimeType": part.RemoteRef.MediaType,
+								"data":     base64.StdEncoding.EncodeToString(part.RemoteRef.Data),
+							},
+						})
+					} else {
+						parts = append(parts, map[string]any{
+							"fileData": map[string]any{
+								"fileUri":  part.RemoteRef.URI,
+								"mimeType": part.RemoteRef.MediaType,
+							},
+						})
+					}
+					break
+				}
 				mediaType, data, ok := httpc.ParseDataURL(part.URL)
 				if ok {
 					parts = append(parts, map[string]any{
@@ -455,6 +584,11 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 							"data":     data,
 						},
 					})
+				}
+
+			case provider.PartFile:
+				if p := filePartToContent(part); p != nil {
+					parts = append(parts, p)
 				}
 
 			case provider.PartReasoning:
@@ -477,11 +611,15 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 				if args == nil {
 					args = map[string]any{}
 				}
+				functionCall := map[string]any{
+					"name": part.ToolName,
+					"args": args,
+				}
+				if part.ToolCallID != "" {
+					functionCall["id"] = part.ToolCallID
+				}
 				fcPart := map[string]any{
-					"functionCall": map[string]any{
-						"name": part.ToolName,
-						"args": args,
-					},
+					"functionCall": functionCall,
 				}
 				if google, ok := part.ProviderOptions["google"].(map[string]any); ok {
 					if sig, ok := google["thoughtSignature"].(string); ok && sig != "" {
@@ -500,20 +638,31 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 				if _, ok := response.(map[string]any); !ok {
 					response = map[string]any{"result": response}
 				}
-				parts = append(parts, map[string]any{
-					"functionResponse": map[string]any{
-						"name":     part.ToolName,
-						"response": response,
-					},
-				})
+				functionResponse := map[string]any{
+					"name":     part.ToolName,
+					"response": response,
+				}
+				if part.ToolCallID != "" {
+					functionResponse["id"] = part.ToolCallID
+				}
+				parts = append(parts, map[string]any{"functionResponse": functionResponse})
 			}
 		}
 
 		if len(parts) > 0 {
-			result = append(result, map[string]any{
+			content := map[string]any{
 				"role":  role,
 				"parts": parts,
-			})
+			}
+			if msg.Role == provider.RoleTool && lastWasTool && len(result) > 0 {
+				existing, _ := result[len(result)-1]["parts"].([]map[string]any)
+				result[len(result)-1]["parts"] = append(existing, parts...)
+			} else {
+				result = append(result, content)
+			}
+			lastWasTool = msg.Role == provider.RoleTool
+		} else {
+			lastWasTool = false
 		}
 	}
 
@@ -544,15 +693,7 @@ type geminiResponse struct {
 	ModelVersion string `json:"modelVersion,omitempty"`
 	Candidates   []struct {
 		Content struct {
-			Parts []struct {
-				Text             string `json:"text,omitempty"`
-				Thought          bool   `json:"thought,omitempty"`
-				ThoughtSignature string `json:"thoughtSignature,omitempty"`
-				FunctionCall     *struct {
-					Name string          `json:"name"`
-					Args json.RawMessage `json:"args"`
-				} `json:"functionCall,omitempty"`
-			} `json:"parts"`
+			Parts []geminiPart `json:"parts"`
 		} `json:"content"`
 		FinishReason      string             `json:"finishReason,omitempty"`
 		GroundingMetadata *groundingMetadata `json:"groundingMetadata,omitempty"`
@@ -567,6 +708,59 @@ type geminiResponse struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
+}
+
+// geminiPart is a single content part in a Gemini candidate. Besides text,
+// thought and functionCall parts, Gemini can return richer part types
+// (inlineData, executableCode, codeExecutionResult, fileData, videoMetadata)
+// that must not be silently dropped.
+type geminiPart struct {
+	Text             string `json:"text,omitempty"`
+	Thought          bool   `json:"thought,omitempty"`
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
+	FunctionCall     *struct {
+		ID   string          `json:"id,omitempty"`
+		Name string          `json:"name"`
+		Args json.RawMessage `json:"args"`
+	} `json:"functionCall,omitempty"`
+	InlineData *struct {
+		MimeType string `json:"mimeType"`
+		Data     string `json:"data"`
+	} `json:"inlineData,omitempty"`
+	ExecutableCode *struct {
+		Code     string `json:"code"`
+		Language string `json:"language"`
+	} `json:"executableCode,omitempty"`
+	CodeExecutionResult *struct {
+		Output string `json:"output"`
+	} `json:"codeExecutionResult,omitempty"`
+	FileData *struct {
+		FileURI  string `json:"fileUri"`
+		MimeType string `json:"mimeType"`
+	} `json:"fileData,omitempty"`
+	VideoMetadata *struct {
+		VideoDuration string `json:"videoDuration"`
+	} `json:"videoMetadata,omitempty"`
+}
+
+// extraPart returns a structured map for the non-text, non-function parts
+// Gemini can emit (inlineData, executableCode, codeExecutionResult, fileData,
+// videoMetadata), or nil when the part is none of those. It lets callers
+// surface these parts instead of dropping them.
+func (p geminiPart) extraPart() map[string]any {
+	switch {
+	case p.InlineData != nil:
+		return map[string]any{"inlineData": p.InlineData}
+	case p.ExecutableCode != nil:
+		return map[string]any{"executableCode": p.ExecutableCode}
+	case p.CodeExecutionResult != nil:
+		return map[string]any{"codeExecutionResult": p.CodeExecutionResult}
+	case p.FileData != nil:
+		return map[string]any{"fileData": p.FileData}
+	case p.VideoMetadata != nil:
+		return map[string]any{"videoMetadata": p.VideoMetadata}
+	}
+	return nil
 }
 
 func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk) {
@@ -616,10 +810,10 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 				usage.InputTokens = 0
 			}
 			usage.ReasoningTokens = resp.UsageMetadata.ThoughtsTokenCount
-			usage.OutputTokens = resp.UsageMetadata.CandidatesTokenCount - resp.UsageMetadata.ThoughtsTokenCount
-			if usage.OutputTokens < 0 {
-				usage.OutputTokens = 0
-			}
+			// candidatesTokenCount is the visible output; thinking is reported
+			// separately in thoughtsTokenCount, so subtracting it zeroed the
+			// output whenever thoughts outgrew the answer.
+			usage.OutputTokens = resp.UsageMetadata.CandidatesTokenCount
 		}
 
 		if len(resp.Candidates) == 0 {
@@ -642,7 +836,10 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 			if part.FunctionCall != nil {
 				// Gemini sends complete function calls (not streaming).
 				argsStr := string(part.FunctionCall.Args)
-				callID := fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, callIndex)
+				callID := part.FunctionCall.ID
+				if callID == "" {
+					callID = fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, callIndex)
+				}
 				callIndex++
 
 				if !provider.TrySend(ctx, out, provider.StreamChunk{
@@ -668,6 +865,15 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 				}
 			} else if part.Text != "" {
 				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkText, Text: part.Text, Metadata: meta}) {
+					return
+				}
+			} else if extra := part.extraPart(); extra != nil {
+				// Surface non-text parts (inlineData, executableCode,
+				// codeExecutionResult, fileData, videoMetadata) instead of
+				// dropping them. They arrive as a text chunk carrying the
+				// structured part under metadata.google.part.
+				extraMeta := map[string]any{"google": map[string]any{"part": extra}}
+				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkText, Metadata: extraMeta}) {
 					return
 				}
 			}
@@ -799,10 +1005,7 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 			result.Usage.InputTokens = 0
 		}
 		result.Usage.ReasoningTokens = resp.UsageMetadata.ThoughtsTokenCount
-		result.Usage.OutputTokens = resp.UsageMetadata.CandidatesTokenCount - resp.UsageMetadata.ThoughtsTokenCount
-		if result.Usage.OutputTokens < 0 {
-			result.Usage.OutputTokens = 0
-		}
+		result.Usage.OutputTokens = resp.UsageMetadata.CandidatesTokenCount
 		result.Usage.TotalTokens = result.Usage.InputTokens + result.Usage.OutputTokens + result.Usage.ReasoningTokens
 	}
 
@@ -818,10 +1021,14 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 	var textParts []string
 	var reasoningParts []string
 	var providerMeta map[string]any
+	var extraParts []map[string]any
 	var callIndex int
 	for _, part := range candidate.Content.Parts {
 		if part.FunctionCall != nil {
-			callID := fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, callIndex)
+			callID := part.FunctionCall.ID
+			if callID == "" {
+				callID = fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, callIndex)
+			}
 			callIndex++
 			tc := provider.ToolCall{
 				ID:    callID,
@@ -840,6 +1047,11 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 			reasoningParts = append(reasoningParts, part.Text)
 		} else if !part.Thought && part.Text != "" {
 			textParts = append(textParts, part.Text)
+		} else if extra := part.extraPart(); extra != nil {
+			// Preserve non-text parts (inlineData, executableCode,
+			// codeExecutionResult, fileData, videoMetadata) rather than
+			// dropping them. They surface under metadata.google.parts.
+			extraParts = append(extraParts, extra)
 		}
 		// Preserve thoughtSignature for multi-turn reasoning.
 		if part.ThoughtSignature != "" {
@@ -858,6 +1070,19 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 		result.ProviderMetadata = map[string]map[string]any{
 			"google": providerMeta,
 		}
+	}
+	// Attach non-text parts (inlineData, executableCode, codeExecutionResult,
+	// fileData, videoMetadata) so they are not dropped from the result.
+	if len(extraParts) > 0 {
+		if result.ProviderMetadata == nil {
+			result.ProviderMetadata = map[string]map[string]any{}
+		}
+		gm := result.ProviderMetadata["google"]
+		if gm == nil {
+			gm = map[string]any{}
+			result.ProviderMetadata["google"] = gm
+		}
+		gm["parts"] = extraParts
 	}
 
 	// Extract grounding sources from groundingMetadata.
@@ -881,13 +1106,20 @@ func (m *chatModel) doHTTP(ctx context.Context, url string, body any, perRequest
 	jsonBody := httpc.MustMarshalJSON(body)
 	req := httpc.MustNewRequest(ctx, "POST", url, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", token)
 
+	// Apply caller-supplied headers first, then set the credential LAST so a
+	// caller's header named like the auth header cannot override the real
+	// credential (auth wins).
 	for k, v := range m.opts.headers {
 		req.Header.Set(k, v)
 	}
 	for k, v := range perRequestHeaders {
 		req.Header.Set(k, v)
+	}
+	if m.opts.isVertex {
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		req.Header.Set("x-goog-api-key", token)
 	}
 
 	resp, err := m.httpClient().Do(req)
@@ -896,7 +1128,7 @@ func (m *chatModel) doHTTP(ctx context.Context, url string, body any, perRequest
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxGoogleErrorBodyBytes))
 		_ = resp.Body.Close()
 		return nil, goai.ParseHTTPErrorWithHeaders("google", resp.StatusCode, respBody, resp.Header)
 	}
@@ -911,11 +1143,55 @@ func (m *chatModel) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
+// endpointURL builds the request URL for an action (generateContent /
+// streamGenerateContent). In Vertex mode it targets the aiplatform publisher
+// endpoint; otherwise the generativelanguage base URL.
+func (m *chatModel) endpointURL(action, query string) (string, error) {
+	if !m.opts.isVertex {
+		return fmt.Sprintf("%s/v1beta/models/%s:%s%s", m.opts.baseURL, url.PathEscape(m.id), action, query), nil
+	}
+	if !validGCPIdentifier(m.opts.project) {
+		return "", fmt.Errorf("google: invalid vertex project %q", m.opts.project)
+	}
+	if !validGCPIdentifier(m.opts.location) {
+		return "", fmt.Errorf("google: invalid vertex location %q", m.opts.location)
+	}
+	if base := strings.TrimRight(m.opts.vertexBaseURL, "/"); base != "" {
+		return fmt.Sprintf("%s/%s:%s%s", base, url.PathEscape(m.id), action, query), nil
+	}
+	// The "global" region has no location prefix on the hostname.
+	host := m.opts.location + "-aiplatform.googleapis.com"
+	if m.opts.location == "global" {
+		host = "aiplatform.googleapis.com"
+	}
+	return fmt.Sprintf("https://%s/v1beta1/projects/%s/locations/%s/publishers/google/models/%s:%s%s",
+		host, m.opts.project, m.opts.location, url.PathEscape(m.id), action, query), nil
+}
+
+// validGCPIdentifier guards project/location before hostname interpolation
+// (anti-SSRF). Allows standard projects (my-project-123), domain-scoped
+// (example.com:proj) and regions (us-east5); blocks /, \, @, .., whitespace.
+var validGCPIdentifierRE = regexp.MustCompile(`^[a-z0-9][a-z0-9.:_-]{0,127}$`)
+
+func validGCPIdentifier(s string) bool {
+	return validGCPIdentifierRE.MatchString(s) && !strings.Contains(s, "..")
+}
+
 func (m *chatModel) resolveToken(ctx context.Context) (string, error) {
+	if m.opts.isVertex && m.opts.usesAPIKey {
+		return "", errors.New("google: WithVertex requires an OAuth token source; API keys are not supported")
+	}
 	if m.opts.tokenSource == nil {
 		return "", errors.New("goai: no API key or token source configured")
 	}
 	return m.opts.tokenSource.Token(ctx)
+}
+
+func validateNonChatOptions(o options) error {
+	if o.isVertex {
+		return errors.New("google: WithVertex is only supported by Chat; use provider/vertex for other model types")
+	}
+	return nil
 }
 
 // --- Schema sanitization ---

@@ -1,6 +1,7 @@
 // Package vertex provides a Google Cloud Vertex AI language model implementation for GoAI.
 //
-// Uses the OpenAI-compatible endpoint provided by Vertex AI.
+// Chat uses Vertex AI's OpenAI-compatible endpoint by default. Use
+// WithNativeGemini to select the native generateContent transport.
 //
 // Usage:
 //
@@ -14,6 +15,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -23,14 +25,38 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/internal/gemini"
+	"github.com/zendev-sh/goai/internal/geminichat"
 	"github.com/zendev-sh/goai/internal/httpc"
 	"github.com/zendev-sh/goai/internal/openaicompat"
 	"github.com/zendev-sh/goai/internal/sse"
 	"github.com/zendev-sh/goai/provider"
+	_ "github.com/zendev-sh/goai/provider/google"
 )
+
+// Bounds for reading untrusted HTTP response bodies. Success responses are
+// capped at 64 MiB; error bodies (used only to surface an error message) are
+// capped at 1 MiB to prevent a malicious server from exhausting memory.
+const (
+	maxVertexSuccessBodyBytes int64 = 64 << 20
+	maxVertexErrorBodyBytes   int64 = 1 << 20
+)
+
+// readSuccessBody reads a success response body, bounding it to
+// maxVertexSuccessBodyBytes and returning a clear error if the cap is exceeded.
+func readSuccessBody(reader io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, maxVertexSuccessBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxVertexSuccessBodyBytes {
+		return nil, fmt.Errorf("response body exceeds %d byte limit", maxVertexSuccessBodyBytes)
+	}
+	return data, nil
+}
 
 // Compile-time interface compliance checks.
 var (
@@ -42,12 +68,14 @@ var (
 type Option func(*options)
 
 type options struct {
-	tokenSource provider.TokenSource
-	project     string
-	location    string
-	baseURL     string
-	headers     map[string]string
-	httpClient  *http.Client
+	tokenSource       provider.TokenSource
+	project           string
+	location          string
+	baseURL           string
+	nativeChatBaseURL string
+	headers           map[string]string
+	httpClient        *http.Client
+	nativeGemini      bool
 }
 
 // WithAPIKey sets a static API key for authentication.
@@ -80,10 +108,19 @@ func WithLocation(location string) Option {
 	}
 }
 
-// WithBaseURL overrides the default Vertex AI endpoint.
+// WithBaseURL overrides the endpoint used by the selected model constructor.
+// Native Gemini Chat uses WithNativeChatBaseURL instead.
 func WithBaseURL(url string) Option {
 	return func(o *options) {
 		o.baseURL = url
+	}
+}
+
+// WithNativeChatBaseURL overrides the native Vertex models collection URL. The
+// model ID and generateContent action are appended to this URL.
+func WithNativeChatBaseURL(url string) Option {
+	return func(o *options) {
+		o.nativeChatBaseURL = url
 	}
 }
 
@@ -98,6 +135,14 @@ func WithHeaders(h map[string]string) Option {
 func WithHTTPClient(c *http.Client) Option {
 	return func(o *options) {
 		o.httpClient = c
+	}
+}
+
+// WithNativeGemini uses Vertex AI's native Gemini generateContent transport
+// instead of the OpenAI-compatible endpoint. The default remains unchanged.
+func WithNativeGemini() Option {
+	return func(o *options) {
+		o.nativeGemini = true
 	}
 }
 
@@ -117,8 +162,13 @@ func resolveOpts(opts []Option) options {
 	o.project = cmp.Or(o.project, os.Getenv("GOOGLE_VERTEX_PROJECT"), os.Getenv("GOOGLE_CLOUD_PROJECT"), os.Getenv("GCLOUD_PROJECT"))
 	// Resolve location: explicit > GOOGLE_VERTEX_LOCATION (Vercel) > GOOGLE_CLOUD_LOCATION > us-central1.
 	o.location = cmp.Or(o.location, os.Getenv("GOOGLE_VERTEX_LOCATION"), os.Getenv("GOOGLE_CLOUD_LOCATION"), "us-central1")
-	// Resolve base URL from env if not overridden.
-	o.baseURL = cmp.Or(o.baseURL, os.Getenv("GOOGLE_VERTEX_BASE_URL"))
+	// Keep endpoint overrides transport-specific so their URL contracts do not
+	// change when WithNativeGemini is enabled.
+	if o.nativeGemini {
+		o.nativeChatBaseURL = cmp.Or(o.nativeChatBaseURL, os.Getenv("GOOGLE_VERTEX_NATIVE_CHAT_BASE_URL"))
+	} else {
+		o.baseURL = cmp.Or(o.baseURL, os.Getenv("GOOGLE_VERTEX_BASE_URL"))
+	}
 	// Auto-resolve auth if no explicit token source and no custom baseURL.
 	// Custom baseURL (e.g. testing, proxy) may not need auth.
 	if o.tokenSource == nil && o.baseURL == "" {
@@ -238,7 +288,61 @@ func isNativeAPIKeyAuth(ts provider.TokenSource) bool {
 // Chat creates a Vertex AI language model for the given model ID.
 func Chat(modelID string, opts ...Option) provider.LanguageModel {
 	o := resolveOpts(opts)
+	if o.nativeGemini {
+		return nativeGeminiChat(modelID, o)
+	}
+	if o.nativeChatBaseURL != "" {
+		return &invalidChatModel{
+			id:  modelID,
+			err: errors.New("vertex: WithNativeChatBaseURL requires WithNativeGemini"),
+		}
+	}
 	return &chatModel{id: modelID, opts: o}
+}
+
+func nativeGeminiChat(modelID string, o options) provider.LanguageModel {
+	if _, ok := o.tokenSource.(*apiKeyTokenSource); ok {
+		return &invalidChatModel{
+			id:  modelID,
+			err: errors.New("vertex: WithNativeGemini requires an OAuth token source; API keys are not supported"),
+		}
+	}
+	if o.baseURL != "" {
+		return &invalidChatModel{
+			id:  modelID,
+			err: errors.New("vertex: WithBaseURL configures the OpenAI-compatible transport; use WithNativeChatBaseURL with WithNativeGemini"),
+		}
+	}
+	return geminichat.New(modelID, geminichat.Config{
+		Project:     o.project,
+		Location:    o.location,
+		BaseURL:     o.nativeChatBaseURL,
+		TokenSource: o.tokenSource,
+		Headers:     o.headers,
+		HTTPClient:  o.httpClient,
+	})
+}
+
+func validateNonChatOptions(o options, constructor string) error {
+	if o.nativeGemini || o.nativeChatBaseURL != "" {
+		return fmt.Errorf("vertex: WithNativeGemini and WithNativeChatBaseURL are only supported by Chat, not %s", constructor)
+	}
+	return nil
+}
+
+type invalidChatModel struct {
+	id  string
+	err error
+}
+
+func (m *invalidChatModel) ModelID() string { return m.id }
+
+func (m *invalidChatModel) DoGenerate(context.Context, provider.GenerateParams) (*provider.GenerateResult, error) {
+	return nil, m.err
+}
+
+func (m *invalidChatModel) DoStream(context.Context, provider.GenerateParams) (*provider.StreamResult, error) {
+	return nil, m.err
 }
 
 type chatModel struct {
@@ -283,7 +387,7 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readSuccessBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -305,16 +409,22 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 	if err != nil {
 		return nil, err
 	}
+	// Keep resp.Request and its serialized request body out of the stream closure.
+	responseBody := resp.Body
 
 	out := make(chan provider.StreamChunk, 64)
-	scanner := sse.NewScanner(resp.Body)
+	scanner := sse.NewScanner(responseBody)
 	go func() {
-		defer func() { _ = resp.Body.Close() }()
+		// Guard against closing the body twice: the cancellation goroutine and
+		// the stream defer both close it. sync.Once makes the second call a no-op.
+		var closeOnce sync.Once
+		closeBody := func() { closeOnce.Do(func() { _ = responseBody.Close() }) }
+		defer closeBody()
 		done := make(chan struct{})
 		go func() {
 			select {
 			case <-ctx.Done():
-				_ = resp.Body.Close()
+				closeBody()
 			case <-done:
 			}
 		}()
@@ -339,17 +449,19 @@ func (m *chatModel) doHTTP(ctx context.Context, body map[string]any) (*http.Resp
 	req := httpc.MustNewRequest(ctx, "POST", url, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
 
-	if m.opts.tokenSource != nil {
-		if err := setAuth(ctx, req, m.opts.tokenSource); err != nil {
-			return nil, err
-		}
-	}
-
 	for k, v := range m.opts.headers {
 		req.Header.Set(k, v)
 	}
 	for k, v := range reqHeaders {
 		req.Header.Set(k, v)
+	}
+
+	// Set the credential last so it wins over any caller-supplied header
+	// named like the auth header.
+	if m.opts.tokenSource != nil {
+		if err := setAuth(ctx, req, m.opts.tokenSource); err != nil {
+			return nil, err
+		}
 	}
 
 	resp, err := m.httpClient().Do(req)
@@ -358,7 +470,7 @@ func (m *chatModel) doHTTP(ctx context.Context, body map[string]any) (*http.Resp
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxVertexErrorBodyBytes))
 		_ = resp.Body.Close()
 		return nil, goai.ParseHTTPErrorWithHeaders("vertex", resp.StatusCode, respBody, resp.Header)
 	}
@@ -404,15 +516,79 @@ func (m *chatModel) httpClient() *http.Client {
 // not understood by the OpenAI-compatible endpoint. These options (thinkingConfig,
 // etc.) are set by consumers for the native Google API but would cause 400 errors
 // when passed through to the OpenAI-compat wire format.
+//
+// thinkingConfig is translated to the OpenAI-compat reasoning_effort knob
+// (item #29) instead of being dropped, preserving the caller's intent to enable
+// reasoning at a given intensity.
 func stripGeminiProviderOptions(params *provider.GenerateParams) {
 	if params.ProviderOptions == nil {
 		return
 	}
 	// Copy to avoid mutating the caller's map.
 	params.ProviderOptions = maps.Clone(params.ProviderOptions)
-	// thinkingConfig is a Gemini-native concept -- the OpenAI-compat endpoint
-	// uses reasoning_effort instead (if supported).
-	delete(params.ProviderOptions, "thinkingConfig")
+	if tc, ok := params.ProviderOptions["thinkingConfig"]; ok {
+		delete(params.ProviderOptions, "thinkingConfig")
+		if budget, enabled, isDefault := thinkingBudget(tc); enabled {
+			if isDefault {
+				// Enabled with the model's default budget -- a meaningful
+				// reasoning level, not minimal.
+				params.ProviderOptions["reasoning_effort"] = "medium"
+			} else {
+				params.ProviderOptions["reasoning_effort"] = effortForBudget(budget)
+			}
+		}
+	}
+}
+
+// thinkingBudget extracts the numeric thinking budget from a Gemini
+// thinkingConfig value. enabled is false when thinking is explicitly disabled
+// (thinkingConfig: false) or the value is not a usable budget, in which case no
+// reasoning_effort is emitted. isDefault is true when thinking is enabled
+// without an explicit budget (thinkingConfig: true, or a map with no
+// thinkingBudget key).
+func thinkingBudget(tc any) (budget int, enabled, isDefault bool) {
+	switch v := tc.(type) {
+	case bool:
+		// true → enable with the model default budget; false → disabled.
+		return 0, v, true
+	case map[string]any:
+		b, ok := v["thinkingBudget"]
+		if !ok {
+			// Enabled with the model default budget.
+			return 0, true, true
+		}
+		switch n := b.(type) {
+		case float64:
+			return int(n), true, false
+		case int:
+			return n, true, false
+		case json.Number:
+			i, err := n.Int64()
+			if err != nil {
+				return 0, true, true
+			}
+			return int(i), true, false
+		}
+		return 0, true, true
+	default:
+		return 0, false, false
+	}
+}
+
+// effortForBudget maps a Gemini thinking budget (a token budget, typically in
+// the hundreds-to-thousands range) onto the closest OpenAI reasoning_effort
+// level. Tiny budgets (a few hundred tokens) mean minimal reasoning → "low";
+// Gemini 2.5 models default to an 8192-token budget, so budgets at or above
+// that are treated as "high".
+func effortForBudget(budget int) string {
+	switch {
+	case budget < 1024:
+		return "low"
+	case budget < 8192:
+		return "medium"
+	default:
+		return "high"
+	}
 }
 
 // jsonMarshalFunc is swappable for testing error paths.

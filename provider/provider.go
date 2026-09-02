@@ -54,3 +54,12 @@ type ImageModel interface {
 	// DoGenerate generates images from the given parameters.
 	DoGenerate(ctx context.Context, params ImageParams) (*ImageResult, error)
 }
+
+// VideoModel generates videos from text and media prompts.
+type VideoModel interface {
+	// ModelID returns the provider-specific model identifier.
+	ModelID() string
+
+	// DoGenerate generates videos from the given parameters.
+	DoGenerate(ctx context.Context, params VideoParams) (*VideoResult, error)
+}

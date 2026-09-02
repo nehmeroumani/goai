@@ -76,8 +76,7 @@ fmt.Printf("Tokens: %d\n", result.TotalUsage.TotalTokens)
 
 ## Goroutine Lifetime and Leaks
 
-Both `TextStream` and `ObjectStream[T]` start a background goroutine when created.
-This goroutine runs until the stream is fully consumed or the context is cancelled.
+`TextStream` and `ObjectStream[T]` initialize without starting a consumer. The background consumer starts lazily on the first call to `Stream()`, `TextStream()`, `PartialObjectStream()`, or `Result()`, and runs until the stream is fully consumed or the context is cancelled.
 
 **Always do one of the following:**
 
@@ -252,3 +251,6 @@ Both `StreamText` (via `Result()`) and `GenerateText` return a `*TextResult`:
 | `Response`         | `provider.ResponseMetadata` | Provider metadata (response ID, actual model) |
 | `ProviderMetadata` | `map[string]map[string]any` | Provider-specific response data               |
 | `Sources`          | `[]provider.Source`         | Citations/references from the response        |
+| `Reasoning`        | `string`                    | Accumulated reasoning text                    |
+| `StepsExhausted`   | `bool`                      | Whether the tool loop exhausted `MaxSteps`    |
+| `ResponseMessages` | `[]provider.Message`        | Messages to append for the next turn          |

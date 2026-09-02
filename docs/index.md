@@ -7,15 +7,15 @@ description: "Open-source Go SDK for AI applications. One unified API for OpenAI
 
 <div class="vp-doc" style="max-width: 688px; margin: 0 auto; padding: 2rem 1.5rem;">
 
-## What's New
+## Selected Releases
 
-> **v0.7.2** — New provider: [NVIDIA NIM](/providers/nvidia) (OpenAI-compatible, chat + embeddings). E2E tested with `meta/llama-3.3-70b-instruct`. [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.9.0** — Provider-neutral file upload and remote file references. `FileUploader` interface + `RemoteFileRef` for OpenAI, Anthropic, and Google Gemini. Compat providers map file parts to native OpenAI shapes. [Changelog →](https://github.com/zendev-sh/goai/releases)
 >
-> **v0.7.0** — New providers: [Cloudflare Workers AI](/providers/cloudflare) and [FPT Smart Cloud](/providers/fptcloud) (both OpenAI-compatible, chat + embeddings). [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.8.5** — New provider: [Requesty](/providers/requesty) (OpenAI-compatible LLM gateway). Anthropic native structured output, per-step `Reasoning`, Gemini schema sanitization. [Changelog →](https://github.com/zendev-sh/goai/releases)
 >
-> **v0.6.0** — OpenTelemetry tracing + metrics, context propagation via RequestInfo.Ctx, Langfuse data race fix. [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.8.0** — MCP OAuth 2.1 + PKCE, `NewTool[In]` typed constructor, lifecycle hook panics surfaced as `*PanicError`. [Changelog →](https://github.com/zendev-sh/goai/releases)
 >
-> **v0.5.8** — RunPod provider (serverless vLLM), Bedrock embeddings, and docs accuracy improvements. [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.7.0** — New providers: [Cloudflare Workers AI](/providers/cloudflare) and [FPT Smart Cloud](/providers/fptcloud). [Changelog →](https://github.com/zendev-sh/goai/releases)
 
 ## What is GoAI SDK?
 
@@ -32,16 +32,16 @@ Inspired by the [Vercel AI SDK](https://sdk.vercel.ai), GoAI is designed idiomat
 - **Embed / EmbedMany** — text embeddings with auto-chunking
 - **GenerateImage** — image generation (OpenAI, Google, Azure, Vertex AI)
 - **Tool Calling** — custom tools with auto tool loops (`MaxSteps`)
-- **20 Provider-Defined Tools** — web search, code execution, computer use, file search
+- **23 Provider-Defined Tools** — web search, code execution, computer use, file search
 - **[MCP Client](/concepts/mcp)** — connect to any MCP server (stdio, HTTP, SSE), auto-convert tools for GoAI
-- **Prompt Caching** — automatic cache control for Anthropic and OpenAI
+- **Prompt Caching** — automatic cache control for Anthropic, Bedrock, and MiniMax
 - **[Observability](/concepts/observability)** — built-in Langfuse and OpenTelemetry integrations for tracing generations, tools, and multi-step loops
 - **Multi-agent orchestration** - for declarative YAML workflows on top of GoAI, see [zenflow](https://zenflow.sh)
 
 ## Why GoAI?
 
 - **One API, 25+ providers** — switch providers by changing one line of code
-- **Minimal deps** — core requires only `golang.org/x/oauth2`; optional OTel integration in separate submodule
+- **Minimal deps** — core runtime requires only `golang.org/x/oauth2` (`go.uber.org/goleak` is test-only); optional OTel integration lives in a separate submodule
 - **Go-native design** — generics for type safety, channels for streaming, interfaces for extensibility
 - **24x faster cold start** than Vercel AI SDK (569μs vs 13.9ms)
 - **3.1x less memory** per request (220KB vs 676KB)
@@ -54,16 +54,20 @@ package main
 import (
     "context"
     "fmt"
+    "log"
 
     "github.com/zendev-sh/goai"
     "github.com/zendev-sh/goai/provider/openai"
 )
 
 func main() {
-    result, _ := goai.GenerateText(context.Background(),
+    result, err := goai.GenerateText(context.Background(),
         openai.Chat("gpt-4o"),
         goai.WithPrompt("Explain Go interfaces in one sentence."),
     )
+    if err != nil {
+        log.Fatal(err)
+    }
     fmt.Println(result.Text)
 }
 ```
@@ -96,7 +100,7 @@ result, _ := goai.GenerateText(ctx, model,
 
 ## Supported Providers
 
-OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI, Vertex AI, Cohere, Mistral, xAI (Grok), Groq, DeepSeek, Fireworks, Together AI, DeepInfra, OpenRouter, Perplexity, Cerebras, Cloudflare Workers AI, FPT Smart Cloud, NVIDIA NIM, Ollama, vLLM, RunPod, and any OpenAI-compatible endpoint.
+OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI, Vertex AI, Cohere, Mistral, xAI (Grok), Groq, DeepSeek, MiniMax, Fireworks, Together AI, DeepInfra, OpenRouter, Requesty, Perplexity, Cerebras, Cloudflare Workers AI, FPT Smart Cloud, NVIDIA NIM, Ollama, llama.cpp, vLLM, RunPod, and any OpenAI-compatible endpoint.
 
 [View all providers →](/providers/)
 

@@ -6,9 +6,22 @@ import (
 	"github.com/zendev-sh/goai/provider"
 )
 
-// ConvertMessages converts provider.Message slice to OpenAI wire format.
-// The system prompt is prepended as the first message if non-empty.
-func ConvertMessages(msgs []provider.Message, system string) []map[string]any {
+// MessagesConfig carries per-request serialization knobs for ConvertMessages.
+type MessagesConfig struct {
+	// IncludeReasoningContent controls serialization of the non-standard
+	// reasoning_content field on assistant messages.
+	IncludeReasoningContent bool
+
+	// FlatInputFile makes PDF parts serialize as the flat
+	// {"type":"input_file","file_data":...} shape (Requesty) instead of the
+	// nested {"type":"file","file":{...}} shape (item 59).
+	FlatInputFile bool
+}
+
+// ConvertMessagesWithConfig converts provider.Message slice to OpenAI wire
+// format using the supplied MessagesConfig.
+func ConvertMessagesWithConfig(msgs []provider.Message, system string, cfg MessagesConfig) []map[string]any {
+	includeReasoning := cfg.IncludeReasoningContent
 	result := make([]map[string]any, 0, len(msgs)+1)
 
 	if system != "" {
@@ -46,6 +59,7 @@ func ConvertMessages(msgs []provider.Message, system string) []map[string]any {
 		var textParts []string
 		var reasoningParts []string
 		var hasImage bool
+		var hasFile bool
 
 		for _, part := range msg.Content {
 			switch part.Type {
@@ -57,6 +71,8 @@ func ConvertMessages(msgs []provider.Message, system string) []map[string]any {
 				}
 			case provider.PartImage:
 				hasImage = true
+			case provider.PartFile:
+				hasFile = true
 			case provider.PartToolCall:
 				// Use raw ToolInput bytes directly -- they are already JSON.
 				args := string(part.ToolInput)
@@ -71,8 +87,8 @@ func ConvertMessages(msgs []provider.Message, system string) []map[string]any {
 			}
 		}
 
-		// If message has images, use content array format.
-		if hasImage && msg.Role == provider.RoleUser {
+		// If message has images or files, use content array format.
+		if (hasImage || hasFile) && msg.Role == provider.RoleUser {
 			var contentArr []map[string]any
 			for _, part := range msg.Content {
 				switch part.Type {
@@ -95,9 +111,18 @@ func ConvertMessages(msgs []provider.Message, system string) []map[string]any {
 						"type":      "image_url",
 						"image_url": imgURL,
 					})
+				case provider.PartFile:
+					if item, ok := filePartToContent(part, cfg.FlatInputFile); ok {
+						contentArr = append(contentArr, item)
+					}
 				}
 			}
-			m["content"] = contentArr
+			if len(contentArr) == 0 {
+				// Every part was dropped: keep the message valid.
+				m["content"] = ""
+			} else {
+				m["content"] = contentArr
+			}
 			result = append(result, m)
 			continue
 		}
@@ -105,7 +130,7 @@ func ConvertMessages(msgs []provider.Message, system string) []map[string]any {
 		if len(textParts) > 0 {
 			m["content"] = joinText(textParts)
 		}
-		if len(reasoningParts) > 0 {
+		if includeReasoning && len(reasoningParts) > 0 {
 			m["reasoning_content"] = joinText(reasoningParts)
 		}
 		if len(toolCalls) > 0 {
@@ -132,4 +157,92 @@ func partsToText(parts []provider.Part) string {
 
 func joinText(parts []string) string {
 	return strings.Join(parts, "\n")
+}
+
+// filePartToContent converts a PartFile to an OpenAI content item using the
+// chat completions shapes that OpenAI and compat gateways (OpenRouter et al.)
+// accept: PDFs become a "file" part (inline data URL, or the plain URL for
+// remote files) and audio becomes an "input_audio" part. Anything else has no
+// wire representation and is omitted (ok=false) — inlining raw base64 as text
+// only feeds the model garbage.
+func filePartToContent(part provider.Part, flatInputFile bool) (map[string]any, bool) {
+	mediaType := part.MediaType
+	fileData := "" // what goes in file.file_data: a data URL or a plain URL
+	payload := ""  // bare base64 for input_audio
+
+	switch {
+	case part.RemoteRef != nil && len(part.RemoteRef.Data) > 0:
+		if mediaType == "" {
+			mediaType = part.RemoteRef.MediaType
+		}
+		payload = string(part.RemoteRef.Data)
+		fileData = "data:" + mediaType + ";base64," + payload
+	case strings.HasPrefix(part.URL, "data:"):
+		rest := part.URL[5:]
+		if i := strings.Index(rest, ";base64,"); i >= 0 {
+			if mediaType == "" {
+				mediaType = rest[:i]
+			}
+			payload = rest[i+len(";base64,"):]
+		}
+		fileData = "data:" + mediaType + ";base64," + payload
+	case part.URL != "":
+		// Remote URL: usable for the "file" part (gateways fetch it), never
+		// for input_audio (audio must be base64 inline).
+		fileData = part.URL
+	}
+
+	if mediaType == "application/pdf" && fileData != "" {
+		filename := part.Filename
+		if filename == "" {
+			filename = "document.pdf"
+		}
+		if flatInputFile {
+			// Requesty uses the flat {"type":"input_file","file_data":...} shape
+			// instead of the nested {"type":"file","file":{...}} shape (item 59).
+			return map[string]any{
+				"type":      "input_file",
+				"file_data": fileData,
+			}, true
+		}
+		return map[string]any{
+			"type": "file",
+			"file": map[string]any{
+				"filename":  filename,
+				"file_data": fileData,
+			},
+		}, true
+	}
+	if format, ok := audioFormat(mediaType); ok && payload != "" {
+		return map[string]any{
+			"type": "input_audio",
+			"input_audio": map[string]any{
+				"data":   payload,
+				"format": format,
+			},
+		}, true
+	}
+	return nil, false
+}
+
+// audioFormat maps an audio media type to the input_audio format
+// identifier (wav, mp3, aiff, aac, ogg, flac, m4a).
+func audioFormat(mediaType string) (string, bool) {
+	switch mediaType {
+	case "audio/wav", "audio/wave", "audio/x-wav":
+		return "wav", true
+	case "audio/mp3", "audio/mpeg":
+		return "mp3", true
+	case "audio/aiff", "audio/x-aiff":
+		return "aiff", true
+	case "audio/aac":
+		return "aac", true
+	case "audio/ogg", "application/ogg":
+		return "ogg", true
+	case "audio/flac", "audio/x-flac":
+		return "flac", true
+	case "audio/mp4", "audio/x-m4a":
+		return "m4a", true
+	}
+	return "", false
 }
