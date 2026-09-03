@@ -718,11 +718,16 @@ func setPreviousResponseID(params *provider.GenerateParams, response provider.Re
 	if store, ok := params.ProviderOptions["store"].(bool); ok && !store {
 		return
 	}
-	if _, ok := params.ProviderOptions["previousResponseId"]; ok {
-		return
-	}
 	if _, ok := params.ProviderOptions["previous_response_id"]; ok {
 		return
+	}
+	// A caller-supplied id is left alone; the id goai set itself advances to
+	// the latest response, since the continuation input carries only the
+	// tool outputs that answer it.
+	if _, ok := params.ProviderOptions["previousResponseId"]; ok {
+		if auto, _ := params.ProviderOptions["goaiAutoPreviousResponseID"].(bool); !auto {
+			return
+		}
 	}
 	params.ProviderOptions["previousResponseId"] = response.ID
 	params.ProviderOptions["goaiAutoPreviousResponseID"] = true

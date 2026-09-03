@@ -135,6 +135,7 @@ func TestSetPreviousResponseID(t *testing.T) {
 		{name: "non responses id", id: "msg_123", want: nil},
 		{name: "store false", id: "resp_123", opts: map[string]any{"store": false}, want: nil},
 		{name: "explicit camel case", id: "resp_123", opts: map[string]any{"previousResponseId": "manual"}, want: "manual"},
+		{name: "goai-set id advances", id: "resp_123", opts: map[string]any{"previousResponseId": "resp_1", "goaiAutoPreviousResponseID": true}, want: "resp_123"},
 		{name: "explicit wire key", id: "resp_123", opts: map[string]any{"previous_response_id": "manual"}, want: nil},
 	}
 	for _, tt := range tests {
@@ -153,11 +154,11 @@ func TestSetPreviousResponseID(t *testing.T) {
 
 func TestGenerateText_ToolLoopPropagatesPreviousResponseID(t *testing.T) {
 	var calls int
-	var secondOptions map[string]any
+	var secondPrevious any
 	model := &mockModel{id: "responses", generateFn: func(_ context.Context, params provider.GenerateParams) (*provider.GenerateResult, error) {
 		calls++
 		if calls == 2 {
-			secondOptions = params.ProviderOptions
+			secondPrevious = params.ProviderOptions["previousResponseId"]
 			return &provider.GenerateResult{Text: "done", FinishReason: provider.FinishStop, Response: provider.ResponseMetadata{ID: "resp_456"}}, nil
 		}
 		return &provider.GenerateResult{
@@ -174,18 +175,18 @@ func TestGenerateText_ToolLoopPropagatesPreviousResponseID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if secondOptions["previousResponseId"] != "resp_123" {
-		t.Fatalf("second request options = %#v", secondOptions)
+	if secondPrevious != "resp_123" {
+		t.Fatalf("second request previousResponseId = %#v, want resp_123", secondPrevious)
 	}
 }
 
 func TestStreamText_ToolLoopPropagatesPreviousResponseID(t *testing.T) {
 	var calls int
-	var secondOptions map[string]any
+	var secondPrevious any
 	model := &mockModel{id: "responses", streamFn: func(_ context.Context, params provider.GenerateParams) (*provider.StreamResult, error) {
 		calls++
 		if calls == 2 {
-			secondOptions = params.ProviderOptions
+			secondPrevious = params.ProviderOptions["previousResponseId"]
 			return streamFromChunks(
 				provider.StreamChunk{Type: provider.ChunkText, Text: "done"},
 				provider.StreamChunk{Type: provider.ChunkFinish, FinishReason: provider.FinishStop, Response: provider.ResponseMetadata{ID: "resp_456"}},
@@ -209,8 +210,8 @@ func TestStreamText_ToolLoopPropagatesPreviousResponseID(t *testing.T) {
 	if err := stream.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if secondOptions["previousResponseId"] != "resp_123" {
-		t.Fatalf("second request options = %#v", secondOptions)
+	if secondPrevious != "resp_123" {
+		t.Fatalf("second request previousResponseId = %#v, want resp_123", secondPrevious)
 	}
 }
 
@@ -6638,5 +6639,86 @@ func TestStreamText_BareFinishChunkKeepsStepFinishReason(t *testing.T) {
 	}
 	if result.TotalUsage.OutputTokens != 100 {
 		t.Fatalf("OutputTokens = %d, want the finish chunk's 100", result.TotalUsage.OutputTokens)
+	}
+}
+
+// TestGenerateText_ToolLoopAdvancesPreviousResponseID pins that every
+// request after the first points at the response just before it: the
+// continuation input carries only that response's tool outputs, so a pointer
+// left on an earlier response would leave its later tool calls unanswered.
+func TestGenerateText_ToolLoopAdvancesPreviousResponseID(t *testing.T) {
+	var previous []string
+	model := &mockModel{id: "responses", generateFn: func(_ context.Context, params provider.GenerateParams) (*provider.GenerateResult, error) {
+		id, _ := params.ProviderOptions["previousResponseId"].(string)
+		previous = append(previous, id)
+		response := provider.ResponseMetadata{ID: fmt.Sprintf("resp_%d", len(previous))}
+		if len(previous) == 3 {
+			return &provider.GenerateResult{Text: "done", FinishReason: provider.FinishStop, Response: response}, nil
+		}
+		return &provider.GenerateResult{
+			ToolCalls:    []provider.ToolCall{{ID: fmt.Sprintf("call-%d", len(previous)), Name: "lookup", Input: json.RawMessage(`{}`)}},
+			FinishReason: provider.FinishToolCalls,
+			Response:     response,
+		}, nil
+	}}
+
+	_, err := GenerateText(t.Context(), model,
+		WithPrompt("lookup"), WithMaxSteps(3),
+		WithTools(Tool{Name: "lookup", Execute: func(context.Context, json.RawMessage) (string, error) { return "ok", nil }}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"", "resp_1", "resp_2"}
+	if len(previous) != len(want) {
+		t.Fatalf("requests = %d, want %d", len(previous), len(want))
+	}
+	for i, id := range want {
+		if previous[i] != id {
+			t.Fatalf("request %d previousResponseId = %q, want %q (all: %q)", i+1, previous[i], id, previous)
+		}
+	}
+}
+
+// TestStreamText_ToolLoopAdvancesPreviousResponseID is the streaming twin of
+// TestGenerateText_ToolLoopAdvancesPreviousResponseID.
+func TestStreamText_ToolLoopAdvancesPreviousResponseID(t *testing.T) {
+	var previous []string
+	model := &mockModel{id: "responses", streamFn: func(_ context.Context, params provider.GenerateParams) (*provider.StreamResult, error) {
+		id, _ := params.ProviderOptions["previousResponseId"].(string)
+		previous = append(previous, id)
+		response := provider.ResponseMetadata{ID: fmt.Sprintf("resp_%d", len(previous))}
+		if len(previous) == 3 {
+			return streamFromChunks(
+				provider.StreamChunk{Type: provider.ChunkText, Text: "done"},
+				provider.StreamChunk{Type: provider.ChunkFinish, FinishReason: provider.FinishStop, Response: response},
+			), nil
+		}
+		return streamFromChunks(
+			provider.StreamChunk{Type: provider.ChunkToolCall, ToolCallID: fmt.Sprintf("call-%d", len(previous)), ToolName: "lookup", ToolInput: `{}`},
+			provider.StreamChunk{Type: provider.ChunkFinish, FinishReason: provider.FinishToolCalls, Response: response},
+		), nil
+	}}
+
+	stream, err := StreamText(t.Context(), model,
+		WithPrompt("lookup"), WithMaxSteps(3),
+		WithTools(Tool{Name: "lookup", Execute: func(context.Context, json.RawMessage) (string, error) { return "ok", nil }}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream.Stream() {
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"", "resp_1", "resp_2"}
+	if len(previous) != len(want) {
+		t.Fatalf("requests = %d, want %d", len(previous), len(want))
+	}
+	for i, id := range want {
+		if previous[i] != id {
+			t.Fatalf("request %d previousResponseId = %q, want %q (all: %q)", i+1, previous[i], id, previous)
+		}
 	}
 }
