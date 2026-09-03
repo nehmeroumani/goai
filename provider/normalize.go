@@ -2,6 +2,22 @@ package provider
 
 import "slices"
 
+// NormalizeOption adjusts how NormalizeToolMessages shapes its output.
+type NormalizeOption func(*normalizeConfig)
+
+type normalizeConfig struct {
+	separateToolMessages bool
+}
+
+// WithSeparateToolMessages keeps tool messages as turns of their own instead
+// of folding them into adjacent user messages. Use it before providers with a
+// dedicated tool role (OpenAI-compatible, Cohere), where a tool message
+// followed by a user message is a valid sequence and merging the two would
+// leave user text inside a tool message.
+func WithSeparateToolMessages() NormalizeOption {
+	return func(c *normalizeConfig) { c.separateToolMessages = true }
+}
+
 // NormalizeToolMessages prepares messages for providers that require:
 // 1. Every assistant tool-call has a matching tool-result (orphan fix)
 // 2. Alternating user/assistant roles (merge consecutive same-role)
@@ -12,12 +28,17 @@ import "slices"
 // results inside a user turn (Anthropic, Bedrock) map the role at conversion
 // time. Providers with a dedicated tool role (OpenAI-compatible, Cohere) read
 // tool results only from tool messages, so this invariant is what keeps the
-// synthetic results visible to them.
+// synthetic results visible to them; pass WithSeparateToolMessages for those
+// providers so tool and user messages are not merged at all.
 //
 // Call this before provider-specific message conversion.
-func NormalizeToolMessages(msgs []Message) []Message {
+func NormalizeToolMessages(msgs []Message, opts ...NormalizeOption) []Message {
+	var cfg normalizeConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	msgs = ensureToolResultPairing(msgs)
-	msgs = mergeConsecutiveRoles(msgs)
+	msgs = mergeConsecutiveRoles(msgs, !cfg.separateToolMessages)
 	return msgs
 }
 
@@ -100,17 +121,19 @@ func cloneMessages(msgs []Message) []Message {
 	return out
 }
 
-// mergeConsecutiveRoles merges consecutive messages with the same role.
-// Tool-role messages are treated as user-role for merging purposes. A merged
-// message that carries tool-result parts keeps the tool role and places those
-// parts first (providers require tool-result immediately after tool-use).
-func mergeConsecutiveRoles(msgs []Message) []Message {
+// mergeConsecutiveRoles merges consecutive messages with the same role. When
+// foldToolIntoUser is set, tool-role messages count as user-role for that
+// comparison, and a merged message that carries tool-result parts keeps the
+// tool role and places those parts first (providers require tool-result
+// immediately after tool-use). Otherwise tool messages only merge with other
+// tool messages.
+func mergeConsecutiveRoles(msgs []Message, foldToolIntoUser bool) []Message {
 	if len(msgs) == 0 {
 		return msgs
 	}
 	var result []Message
 	for _, msg := range msgs {
-		if len(result) > 0 && mergeRole(result[len(result)-1].Role) == mergeRole(msg.Role) {
+		if len(result) > 0 && mergeRole(result[len(result)-1].Role, foldToolIntoUser) == mergeRole(msg.Role, foldToolIntoUser) {
 			last := &result[len(result)-1]
 			var toolResults, others []Part
 			for _, p := range slices.Concat(last.Content, msg.Content) {
@@ -131,10 +154,10 @@ func mergeConsecutiveRoles(msgs []Message) []Message {
 	return result
 }
 
-// mergeRole folds the tool role into user for the purpose of detecting
-// consecutive same-role messages.
-func mergeRole(role Role) Role {
-	if role == RoleTool {
+// mergeRole is the role used to detect consecutive same-role messages: the
+// tool role folds into user when foldToolIntoUser is set.
+func mergeRole(role Role, foldToolIntoUser bool) Role {
+	if foldToolIntoUser && role == RoleTool {
 		return RoleUser
 	}
 	return role

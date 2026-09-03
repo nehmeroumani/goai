@@ -93,6 +93,26 @@ func TestNormalizeToolMessages_OrphanBeforeUserTurnKeepsToolRole(t *testing.T) {
 	}
 }
 
+func TestNormalizeToolMessages_WithSeparateToolMessages(t *testing.T) {
+	// The injected tool message stays its own turn ahead of the user turn.
+	msgs := []Message{
+		{Role: RoleAssistant, Content: []Part{
+			{Type: PartToolCall, ToolCallID: "tc1", ToolName: "do_thing"},
+		}},
+		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "never mind"}}},
+	}
+	result := NormalizeToolMessages(msgs, WithSeparateToolMessages())
+	if len(result) != 3 {
+		t.Fatalf("len = %d, want 3 (assistant, tool, user)", len(result))
+	}
+	if result[1].Role != RoleTool || len(result[1].Content) != 1 || result[1].Content[0].ToolCallID != "tc1" {
+		t.Errorf("result[1] = %+v, want the synthetic tool message", result[1])
+	}
+	if result[2].Role != RoleUser || len(result[2].Content) != 1 || result[2].Content[0].Text != "never mind" {
+		t.Errorf("result[2] = %+v, want the untouched user message", result[2])
+	}
+}
+
 func TestNormalizeToolMessages_PartialMatch(t *testing.T) {
 	msgs := []Message{
 		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "multi"}}},
@@ -209,7 +229,7 @@ func TestMergeConsecutiveRoles_SameRole(t *testing.T) {
 		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "b"}}},
 		{Role: RoleAssistant, Content: []Part{{Type: PartText, Text: "c"}}},
 	}
-	result := mergeConsecutiveRoles(msgs)
+	result := mergeConsecutiveRoles(msgs, true)
 	if len(result) != 2 {
 		t.Fatalf("len = %d, want 2", len(result))
 	}
@@ -229,7 +249,7 @@ func TestMergeConsecutiveRoles_ToolAndUser(t *testing.T) {
 		}},
 		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "thanks"}}},
 	}
-	result := mergeConsecutiveRoles(msgs)
+	result := mergeConsecutiveRoles(msgs, true)
 	if len(result) != 1 {
 		t.Fatalf("len = %d, want 1 (merged)", len(result))
 	}
@@ -254,7 +274,7 @@ func TestMergeConsecutiveRoles_UserThenToolKeepsToolRole(t *testing.T) {
 			{Type: PartToolResult, ToolCallID: "tc1", ToolOutput: "result"},
 		}},
 	}
-	result := mergeConsecutiveRoles(msgs)
+	result := mergeConsecutiveRoles(msgs, true)
 	if len(result) != 1 {
 		t.Fatalf("len = %d, want 1 (merged)", len(result))
 	}
@@ -271,14 +291,39 @@ func TestMergeConsecutiveRoles_UserTextOnlyKeepsUserRole(t *testing.T) {
 		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "one"}}},
 		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "two"}}},
 	}
-	result := mergeConsecutiveRoles(msgs)
+	result := mergeConsecutiveRoles(msgs, true)
 	if len(result) != 1 || result[0].Role != RoleUser || len(result[0].Content) != 2 {
 		t.Fatalf("result = %+v, want one user message with two parts", result)
 	}
 }
 
+func TestMergeConsecutiveRoles_SeparateToolMessages(t *testing.T) {
+	// Without folding, a tool message and the user turn after it stay apart,
+	// while same-role neighbours (tool+tool, user+user) still merge.
+	msgs := []Message{
+		{Role: RoleTool, Content: []Part{
+			{Type: PartToolResult, ToolCallID: "tc1", ToolOutput: "r1"},
+		}},
+		{Role: RoleTool, Content: []Part{
+			{Type: PartToolResult, ToolCallID: "tc2", ToolOutput: "r2"},
+		}},
+		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "one"}}},
+		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "two"}}},
+	}
+	result := mergeConsecutiveRoles(msgs, false)
+	if len(result) != 2 {
+		t.Fatalf("len = %d, want 2 (tool, user)", len(result))
+	}
+	if result[0].Role != RoleTool || len(result[0].Content) != 2 {
+		t.Errorf("result[0] = %+v, want one tool message with two results", result[0])
+	}
+	if result[1].Role != RoleUser || len(result[1].Content) != 2 {
+		t.Errorf("result[1] = %+v, want one user message with two texts", result[1])
+	}
+}
+
 func TestMergeConsecutiveRoles_Empty(t *testing.T) {
-	result := mergeConsecutiveRoles(nil)
+	result := mergeConsecutiveRoles(nil, true)
 	if len(result) != 0 {
 		t.Fatalf("len = %d, want 0", len(result))
 	}
