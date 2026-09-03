@@ -2518,6 +2518,28 @@ func TestBuildResponsesRequest_AutoContinuationInput(t *testing.T) {
 	}
 }
 
+func TestBuildResponsesRequest_StoreOffDropsReasoningWithoutEncryptedContent(t *testing.T) {
+	messages := []provider.Message{{
+		Role: provider.RoleAssistant,
+		Content: []provider.Part{
+			openAIReasoningPart("rs-1", "", ""),
+			openAIReasoningPart("rs-2", "", "opaque-state"),
+			{Type: provider.PartText, Text: "done"},
+		},
+	}}
+
+	body := buildResponsesRequest(provider.GenerateParams{Messages: messages, ProviderOptions: map[string]any{"store": false}}, "o3", false)
+	input := body["input"].([]map[string]any)
+	if len(input) != 2 || input[0]["id"] != "rs-2" || input[1]["type"] != "message" {
+		t.Fatalf("store-off input = %#v, want the replayable reasoning item and the message", input)
+	}
+
+	body = buildResponsesRequest(provider.GenerateParams{Messages: messages, ProviderOptions: map[string]any{"store": true}}, "o3", false)
+	if input := body["input"].([]map[string]any); len(input) != 3 {
+		t.Fatalf("stored input = %#v, want every item", input)
+	}
+}
+
 func TestResponsesToolContinuation_HTTPRoundTrip(t *testing.T) {
 	var requests []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

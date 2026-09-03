@@ -44,10 +44,14 @@ func buildResponsesRequest(params provider.GenerateParams, modelID string, strea
 	}
 
 	// Messages → Responses API "input" format.
-	body["input"] = convertToResponsesInput(params.Messages)
+	input := convertToResponsesInput(params.Messages)
 	if auto, ok := params.ProviderOptions["goaiAutoPreviousResponseID"].(bool); ok && auto {
-		body["input"] = convertAutoContinuationInput(params.Messages)
+		input = convertAutoContinuationInput(params.Messages)
 	}
+	if store, ok := params.ProviderOptions["store"].(bool); ok && !store {
+		input = withoutUnreplayableReasoning(input)
+	}
+	body["input"] = input
 
 	if params.MaxOutputTokens > 0 {
 		body["max_output_tokens"] = params.MaxOutputTokens
@@ -457,6 +461,21 @@ func userContentItems(parts []provider.Part) []map[string]any {
 		}
 	}
 	return contentItems
+}
+
+// withoutUnreplayableReasoning drops reasoning items that carry no
+// encrypted_content. With store off the API cannot look a reasoning item up
+// by id, and one such item fails the whole request. The input slice is
+// freshly built by the converters above, so filtering in place is safe.
+func withoutUnreplayableReasoning(input []map[string]any) []map[string]any {
+	kept := input[:0]
+	for _, item := range input {
+		if item["type"] == "reasoning" && item["encrypted_content"] == nil {
+			continue
+		}
+		kept = append(kept, item)
+	}
+	return kept
 }
 
 func convertAutoContinuationInput(msgs []provider.Message) []map[string]any {
