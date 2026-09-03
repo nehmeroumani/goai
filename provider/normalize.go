@@ -6,6 +6,14 @@ import "slices"
 // 1. Every assistant tool-call has a matching tool-result (orphan fix)
 // 2. Alternating user/assistant roles (merge consecutive same-role)
 //
+// Tool-result parts only ever live on RoleTool messages in the output: a
+// synthetic result gets its own tool message, and a merge that absorbs a
+// tool result keeps the tool role. Providers whose wire format carries tool
+// results inside a user turn (Anthropic, Bedrock) map the role at conversion
+// time. Providers with a dedicated tool role (OpenAI-compatible, Cohere) read
+// tool results only from tool messages, so this invariant is what keeps the
+// synthetic results visible to them.
+//
 // Call this before provider-specific message conversion.
 func NormalizeToolMessages(msgs []Message) []Message {
 	msgs = ensureToolResultPairing(msgs)
@@ -15,7 +23,9 @@ func NormalizeToolMessages(msgs []Message) []Message {
 
 // ensureToolResultPairing ensures every assistant message with tool-call parts
 // has matching tool-result parts in following messages. Injects synthetic
-// "Tool execution aborted" results for orphaned tool-calls.
+// "Tool execution aborted" results for orphaned tool-calls, appended to the
+// tool message that directly follows the assistant turn, or placed on a new
+// tool message inserted right after it. Results never land on a user message.
 //
 // Server-executed tool calls (e.g. Anthropic web_search) are skipped: their
 // result is delivered inline on the same assistant turn via the part's
@@ -66,13 +76,10 @@ func ensureToolResultPairing(msgs []Message) []Message {
 		if len(orphans) == 0 {
 			continue
 		}
-		if i+1 < len(msgs) && (msgs[i+1].Role == RoleTool || msgs[i+1].Role == RoleUser) {
+		if i+1 < len(msgs) && msgs[i+1].Role == RoleTool {
 			msgs[i+1].Content = append(msgs[i+1].Content, orphans...)
 		} else {
-			toolMsg := Message{Role: RoleTool, Content: orphans}
-			msgs = append(msgs, Message{})
-			copy(msgs[i+2:], msgs[i+1:])
-			msgs[i+1] = toolMsg
+			msgs = slices.Insert(msgs, i+1, Message{Role: RoleTool, Content: orphans})
 		}
 	}
 	return msgs
@@ -94,46 +101,43 @@ func cloneMessages(msgs []Message) []Message {
 }
 
 // mergeConsecutiveRoles merges consecutive messages with the same role.
-// Tool-role messages are treated as user-role for merging purposes.
-// When merging, tool-result parts are placed before text parts
-// (providers require tool-result immediately after tool-use).
+// Tool-role messages are treated as user-role for merging purposes. A merged
+// message that carries tool-result parts keeps the tool role and places those
+// parts first (providers require tool-result immediately after tool-use).
 func mergeConsecutiveRoles(msgs []Message) []Message {
 	if len(msgs) == 0 {
 		return msgs
 	}
 	var result []Message
 	for _, msg := range msgs {
-		effectiveRole := msg.Role
-		if effectiveRole == RoleTool {
-			effectiveRole = RoleUser
-		}
-
-		if len(result) > 0 {
-			lastRole := result[len(result)-1].Role
-			if lastRole == RoleTool {
-				lastRole = RoleUser
-			}
-			if lastRole == effectiveRole {
-				// Merge: tool-result parts first, then others
-				merged := append(result[len(result)-1].Content, msg.Content...)
-				var toolResults, others []Part
-				for _, p := range merged {
-					if p.Type == PartToolResult {
-						toolResults = append(toolResults, p)
-					} else {
-						others = append(others, p)
-					}
+		if len(result) > 0 && mergeRole(result[len(result)-1].Role) == mergeRole(msg.Role) {
+			last := &result[len(result)-1]
+			var toolResults, others []Part
+			for _, p := range slices.Concat(last.Content, msg.Content) {
+				if p.Type == PartToolResult {
+					toolResults = append(toolResults, p)
+				} else {
+					others = append(others, p)
 				}
-				if len(toolResults) > 0 {
-					merged = append(toolResults, others...)
-				}
-				result[len(result)-1].Content = merged
-				continue
 			}
+			if len(toolResults) > 0 {
+				last.Role = RoleTool
+			}
+			last.Content = append(toolResults, others...)
+			continue
 		}
 		result = append(result, msg)
 	}
 	return result
+}
+
+// mergeRole folds the tool role into user for the purpose of detecting
+// consecutive same-role messages.
+func mergeRole(role Role) Role {
+	if role == RoleTool {
+		return RoleUser
+	}
+	return role
 }
 
 // ReorderAssistantParts sorts assistant message parts so text/reasoning

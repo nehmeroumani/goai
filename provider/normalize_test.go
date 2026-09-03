@@ -53,17 +53,43 @@ func TestNormalizeToolMessages_OrphanedToolCall(t *testing.T) {
 		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "never mind"}}},
 	}
 	result := ensureToolResultPairing(msgs)
-	// The user message after assistant should now contain a synthetic result.
-	found := false
-	for _, m := range result {
-		for _, p := range m.Content {
-			if p.Type == PartToolResult && p.ToolCallID == "tc1" && p.ToolOutput == "Tool execution aborted" {
-				found = true
-			}
-		}
+	// The synthetic result gets its own tool message between the assistant
+	// turn and the user turn; the user message is left untouched.
+	if len(result) != 4 {
+		t.Fatalf("len = %d, want 4 (user, assistant, injected tool, user)", len(result))
 	}
-	if !found {
-		t.Error("expected synthetic tool result for orphaned tc1")
+	injected := result[2]
+	if injected.Role != RoleTool || len(injected.Content) != 1 {
+		t.Fatalf("injected message = %+v, want one tool-result on a tool message", injected)
+	}
+	if p := injected.Content[0]; p.Type != PartToolResult || p.ToolCallID != "tc1" || p.ToolOutput != "Tool execution aborted" {
+		t.Errorf("injected part = %+v", p)
+	}
+	if user := result[3]; user.Role != RoleUser || len(user.Content) != 1 || user.Content[0].Text != "never mind" {
+		t.Errorf("user message = %+v, want the original text only", user)
+	}
+}
+
+func TestNormalizeToolMessages_OrphanBeforeUserTurnKeepsToolRole(t *testing.T) {
+	// End to end: the injected tool message and the following user turn merge
+	// into one message that keeps the tool role, so providers that read tool
+	// results only from tool messages still see the synthetic result.
+	msgs := []Message{
+		{Role: RoleAssistant, Content: []Part{
+			{Type: PartToolCall, ToolCallID: "tc1", ToolName: "do_thing"},
+		}},
+		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "never mind"}}},
+	}
+	result := NormalizeToolMessages(msgs)
+	if len(result) != 2 {
+		t.Fatalf("len = %d, want 2 (assistant, merged tool)", len(result))
+	}
+	merged := result[1]
+	if merged.Role != RoleTool {
+		t.Errorf("merged role = %s, want tool", merged.Role)
+	}
+	if len(merged.Content) != 2 || merged.Content[0].Type != PartToolResult || merged.Content[1].Text != "never mind" {
+		t.Errorf("merged content = %+v, want [tool-result, text]", merged.Content)
 	}
 }
 
@@ -81,17 +107,17 @@ func TestNormalizeToolMessages_PartialMatch(t *testing.T) {
 		{Role: RoleAssistant, Content: []Part{{Type: PartText, Text: "done"}}},
 	}
 	result := ensureToolResultPairing(msgs)
-	// tc2 should get a synthetic result injected into the tool message.
-	foundTc2 := false
-	for _, m := range result {
-		for _, p := range m.Content {
-			if p.Type == PartToolResult && p.ToolCallID == "tc2" && p.ToolOutput == "Tool execution aborted" {
-				foundTc2 = true
-			}
-		}
+	// tc2's synthetic result is appended to the existing tool message, after
+	// tc1's real result, rather than inserted as a new message.
+	if len(result) != 4 {
+		t.Fatalf("len = %d, want 4 (no message inserted)", len(result))
 	}
-	if !foundTc2 {
-		t.Error("expected synthetic tool result for orphaned tc2")
+	toolMsg := result[2]
+	if toolMsg.Role != RoleTool || len(toolMsg.Content) != 2 {
+		t.Fatalf("tool message = %+v, want two tool-results", toolMsg)
+	}
+	if p := toolMsg.Content[1]; p.ToolCallID != "tc2" || p.ToolOutput != "Tool execution aborted" {
+		t.Errorf("appended part = %+v, want synthetic result for tc2", p)
 	}
 }
 
@@ -207,12 +233,47 @@ func TestMergeConsecutiveRoles_ToolAndUser(t *testing.T) {
 	if len(result) != 1 {
 		t.Fatalf("len = %d, want 1 (merged)", len(result))
 	}
+	if result[0].Role != RoleTool {
+		t.Errorf("merged role = %s, want tool", result[0].Role)
+	}
 	// Tool-result parts should come before text parts.
 	if result[0].Content[0].Type != PartToolResult {
 		t.Errorf("first part type = %s, want tool-result", result[0].Content[0].Type)
 	}
 	if result[0].Content[1].Type != PartText {
 		t.Errorf("second part type = %s, want text", result[0].Content[1].Type)
+	}
+}
+
+func TestMergeConsecutiveRoles_UserThenToolKeepsToolRole(t *testing.T) {
+	// A user turn followed by a tool message merges the other way round, but
+	// the tool-result still decides the role and still comes first.
+	msgs := []Message{
+		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "note"}}},
+		{Role: RoleTool, Content: []Part{
+			{Type: PartToolResult, ToolCallID: "tc1", ToolOutput: "result"},
+		}},
+	}
+	result := mergeConsecutiveRoles(msgs)
+	if len(result) != 1 {
+		t.Fatalf("len = %d, want 1 (merged)", len(result))
+	}
+	if result[0].Role != RoleTool {
+		t.Errorf("merged role = %s, want tool", result[0].Role)
+	}
+	if result[0].Content[0].Type != PartToolResult || result[0].Content[1].Text != "note" {
+		t.Errorf("merged content = %+v, want [tool-result, text]", result[0].Content)
+	}
+}
+
+func TestMergeConsecutiveRoles_UserTextOnlyKeepsUserRole(t *testing.T) {
+	msgs := []Message{
+		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "one"}}},
+		{Role: RoleUser, Content: []Part{{Type: PartText, Text: "two"}}},
+	}
+	result := mergeConsecutiveRoles(msgs)
+	if len(result) != 1 || result[0].Role != RoleUser || len(result[0].Content) != 2 {
+		t.Fatalf("result = %+v, want one user message with two parts", result)
 	}
 }
 
