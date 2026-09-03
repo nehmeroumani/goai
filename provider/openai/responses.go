@@ -325,15 +325,26 @@ func convertToResponsesInput(msgs []provider.Message) []map[string]any {
 				"content": partsToText(msg.Content),
 			})
 
-		case provider.RoleTool:
-			for _, part := range msg.Content {
-				if part.Type == provider.PartToolResult {
-					result = append(result, map[string]any{
-						"type":    "function_call_output",
-						"call_id": part.ToolCallID,
-						"output":  part.ToolOutput,
-					})
-				}
+		case provider.RoleTool, provider.RoleUser:
+			// function_call_output items come first: the API requires each
+			// function_call to be followed by its output. NormalizeToolMessages
+			// keeps results on tool-role messages but may fold a user turn's
+			// text into one; hand-built transcripts may also put a result on a
+			// user message. Both shapes are accepted rather than dropping data.
+			outputs := functionCallOutputItems(msg.Content)
+			result = append(result, outputs...)
+			contentItems := userContentItems(msg.Content)
+			if len(contentItems) == 0 && len(outputs) == 0 && msg.Role == provider.RoleUser {
+				contentItems = []map[string]any{{
+					"type": "input_text",
+					"text": partsToText(msg.Content),
+				}}
+			}
+			if len(contentItems) > 0 {
+				result = append(result, map[string]any{
+					"role":    "user",
+					"content": contentItems,
+				})
 			}
 
 		case provider.RoleAssistant:
@@ -390,52 +401,62 @@ func convertToResponsesInput(msgs []provider.Message) []map[string]any {
 			}
 
 			result = append(result, items...)
-
-		case provider.RoleUser:
-			var contentItems []map[string]any
-			for _, part := range msg.Content {
-				switch part.Type {
-				case provider.PartText:
-					if part.Text != "" {
-						contentItems = append(contentItems, map[string]any{
-							"type": "input_text",
-							"text": part.Text,
-						})
-					}
-				case provider.PartImage:
-					contentItems = append(contentItems, map[string]any{
-						"type":      "input_image",
-						"image_url": part.URL,
-					})
-				case provider.PartFile:
-					item := map[string]any{
-						"type": "input_file",
-					}
-					if part.RemoteRef != nil {
-						item["file_id"] = part.RemoteRef.ID
-					} else {
-						item["file_data"] = part.URL
-					}
-					if part.Filename != "" {
-						item["filename"] = part.Filename
-					}
-					contentItems = append(contentItems, item)
-				}
-			}
-			if len(contentItems) == 0 {
-				contentItems = []map[string]any{{
-					"type": "input_text",
-					"text": partsToText(msg.Content),
-				}}
-			}
-			result = append(result, map[string]any{
-				"role":    "user",
-				"content": contentItems,
-			})
 		}
 	}
 
 	return result
+}
+
+// functionCallOutputItems converts the tool-result parts of a message into
+// Responses API function_call_output items.
+func functionCallOutputItems(parts []provider.Part) []map[string]any {
+	var items []map[string]any
+	for _, part := range parts {
+		if part.Type == provider.PartToolResult {
+			items = append(items, map[string]any{
+				"type":    "function_call_output",
+				"call_id": part.ToolCallID,
+				"output":  part.ToolOutput,
+			})
+		}
+	}
+	return items
+}
+
+// userContentItems converts the text, image and file parts of a message into
+// the content items of a Responses API user message.
+func userContentItems(parts []provider.Part) []map[string]any {
+	var contentItems []map[string]any
+	for _, part := range parts {
+		switch part.Type {
+		case provider.PartText:
+			if part.Text != "" {
+				contentItems = append(contentItems, map[string]any{
+					"type": "input_text",
+					"text": part.Text,
+				})
+			}
+		case provider.PartImage:
+			contentItems = append(contentItems, map[string]any{
+				"type":      "input_image",
+				"image_url": part.URL,
+			})
+		case provider.PartFile:
+			item := map[string]any{
+				"type": "input_file",
+			}
+			if part.RemoteRef != nil {
+				item["file_id"] = part.RemoteRef.ID
+			} else {
+				item["file_data"] = part.URL
+			}
+			if part.Filename != "" {
+				item["filename"] = part.Filename
+			}
+			contentItems = append(contentItems, item)
+		}
+	}
+	return contentItems
 }
 
 func convertAutoContinuationInput(msgs []provider.Message) []map[string]any {

@@ -1086,6 +1086,54 @@ func TestConvertToResponsesInput(t *testing.T) {
 	}
 }
 
+func TestConvertToResponsesInput_ToolResultOnUserMessage(t *testing.T) {
+	// A hand-built transcript may carry a tool result on a user message. Those
+	// parts must still become function_call_output items, or the Responses API
+	// returns "No tool output found for function call".
+	result := convertToResponsesInput([]provider.Message{
+		{Role: provider.RoleAssistant, Content: []provider.Part{
+			{Type: provider.PartToolCall, ToolCallID: "call_1", ToolName: "fn", ToolInput: json.RawMessage(`{}`)},
+		}},
+		{Role: provider.RoleUser, Content: []provider.Part{
+			{Type: provider.PartToolResult, ToolCallID: "call_1", ToolOutput: "Tool execution aborted"},
+			{Type: provider.PartText, Text: "continue"},
+		}},
+	})
+	if len(result) != 3 {
+		t.Fatalf("input = %#v, want function_call, function_call_output, user", result)
+	}
+	if result[0]["type"] != "function_call" || result[0]["call_id"] != "call_1" {
+		t.Errorf("result[0] = %#v, want function_call call_1", result[0])
+	}
+	if result[1]["type"] != "function_call_output" || result[1]["call_id"] != "call_1" {
+		t.Errorf("result[1] = %#v, want function_call_output call_1", result[1])
+	}
+	if result[2]["role"] != "user" {
+		t.Errorf("result[2] = %#v, want the leftover user text", result[2])
+	}
+}
+
+func TestConvertToResponsesInput_ToolMessageMergedWithUserText(t *testing.T) {
+	// By default NormalizeToolMessages merges a tool message with the user
+	// turn that follows it, keeping the tool role, so a tool result and user
+	// text can share one RoleTool message. The text must survive as a user item.
+	result := convertToResponsesInput([]provider.Message{
+		{Role: provider.RoleTool, Content: []provider.Part{
+			{Type: provider.PartToolResult, ToolCallID: "call_1", ToolOutput: "done"},
+			{Type: provider.PartText, Text: "and then this"},
+		}},
+	})
+	if len(result) != 2 {
+		t.Fatalf("input = %#v, want function_call_output then user", result)
+	}
+	if result[0]["type"] != "function_call_output" || result[0]["call_id"] != "call_1" {
+		t.Errorf("result[0] = %#v, want function_call_output call_1", result[0])
+	}
+	if result[1]["role"] != "user" {
+		t.Errorf("result[1] = %#v, want the leftover user text", result[1])
+	}
+}
+
 func TestConvertToResponsesInput_UserWithImage(t *testing.T) {
 	msgs := []provider.Message{
 		{Role: provider.RoleUser, Content: []provider.Part{
